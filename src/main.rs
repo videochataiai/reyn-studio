@@ -3,6 +3,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod fonts;
+mod icons;
 mod theme;
 
 fn main() -> eframe::Result<()> {
@@ -20,6 +22,7 @@ fn main() -> eframe::Result<()> {
         "Reyn Studio",
         options,
         Box::new(|cc| {
+            fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(app::ReynApp::default()))
         }),
