@@ -1,6 +1,7 @@
 //! Reyn Studio shell — matches the 3D Volumetric Analysis mockup. (egui 0.35 API.)
 use crate::icons::{self, Icon};
 use crate::theme::*;
+use crate::{flow, viewport};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText,
     Sense, Stroke, Vec2,
@@ -19,7 +20,9 @@ pub struct ReynApp {
     opacity: f32,
     shadows: bool,
     streamlines: bool,
-    spin: f32,
+    cam: viewport::Camera,
+    particles: Vec<flow::Particle>,
+    seed: u64,
 }
 
 impl Default for ReynApp {
@@ -28,20 +31,39 @@ impl Default for ReynApp {
             nav: Nav::Metrics, volumetric: true,
             slice: [true, false, false], slice_pos: [0.50, 0.0, 0.0],
             density_lo: 0.85, density_hi: 1.0, opacity: 0.75,
-            shadows: true, streamlines: false, spin: 0.0,
+            shadows: true, streamlines: false,
+            cam: viewport::Camera::default(),
+            particles: flow::generate(6000, 1),
+            seed: 1,
         }
     }
 }
 
 impl eframe::App for ReynApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.spin += ui.input(|i| i.stable_dt).min(0.05);
+        if ui.input(|i| i.key_pressed(egui::Key::G)) {
+            self.seed = self.seed.wrapping_add(1);
+            self.particles = flow::generate(6000, self.seed);
+        }
         self.top_bar(ui);
         self.left_sidebar(ui);
         self.right_controls(ui);
         self.viewport(ui);
         ui.ctx().request_repaint();
     }
+}
+
+/// Live diagnostics derived from the current field: (helicity, enstrophy, q, count).
+fn diagnostics(ps: &[flow::Particle]) -> (f32, f32, f32, usize) {
+    if ps.is_empty() { return (0.0, 0.0, 0.0, 0); }
+    let n = ps.len() as f32;
+    let mut hel = 0.0; let mut ens = 0.0; let mut q = 0.0;
+    for p in ps {
+        hel += p.vort * p.speed;
+        ens += p.vort * p.vort;
+        q += 0.5 * (p.speed * p.speed - p.vort * p.vort);
+    }
+    (hel / n * 0.1, ens / n, q / n, ps.len())
 }
 
 fn caps(text: &str) -> RichText {
@@ -107,12 +129,13 @@ impl ReynApp {
                     .corner_radius(CornerRadius::same(4)).inner_margin(Margin::same(16))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        let (hel, ens, q, count) = diagnostics(&self.particles);
                         ui.label(caps("Voxel Diagnostics"));
                         ui.add_space(12.0);
-                        diag(ui, "Helicity", "4.2e-3", BRAND);
-                        diag(ui, "Enstrophy Vol.", "1.8e-2", BRAND);
-                        diag(ui, "Q-Criterion", "0.85", GOLD);
-                        diag(ui, "Voxel Count", "16.8M", TEXT);
+                        diag(ui, "Helicity", &format!("{:.1e}", hel), BRAND);
+                        diag(ui, "Enstrophy Vol.", &format!("{:.2e}", ens), BRAND);
+                        diag(ui, "Q-Criterion", &format!("{:.2}", q), GOLD);
+                        diag(ui, "Voxel Count", &format!("{:.1}K", count as f32 / 1000.0), TEXT);
                     });
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -195,31 +218,46 @@ impl ReynApp {
             .frame(Frame::NONE.fill(Color32::from_rgb(0x0e, 0x0a, 0x07)))
             .show(ui, |ui| {
                 let rect = ui.max_rect();
-                let p = ui.painter();
-                // 40px tech grid (signature texture)
-                let grid = Stroke::new(1.0, OUTLINE_VARIANT.gamma_multiply(0.35));
-                let step = 40.0;
-                let mut x = rect.min.x;
-                while x < rect.max.x { p.line_segment([egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)], grid); x += step; }
-                let mut y = rect.min.y;
-                while y < rect.max.y { p.line_segment([egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)], grid); y += step; }
+                {
+                    let p = ui.painter_at(rect);
+                    let grid = Stroke::new(1.0, OUTLINE_VARIANT.gamma_multiply(0.3));
+                    let step = 40.0;
+                    let mut x = rect.min.x;
+                    while x < rect.max.x { p.line_segment([egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)], grid); x += step; }
+                    let mut y = rect.min.y;
+                    while y < rect.max.y { p.line_segment([egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)], grid); y += step; }
+                }
 
-                // camera overlay chip
-                let chip = Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(258.0, 30.0));
+                if self.nav == Nav::Metrics {
+                    let opts = viewport::ViewOpts {
+                        opacity: self.opacity,
+                        density_lo: self.density_lo,
+                        slice_x: if self.slice[0] { Some(self.slice_pos[0]) } else { None },
+                        streamlines: self.streamlines,
+                    };
+                    viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
+                }
+
+                let p = ui.painter_at(rect);
+                // camera chip
+                let chip = Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(262.0, 30.0));
                 p.rect_filled(chip, CornerRadius::same(3), SURFACE);
                 p.rect_stroke(chip, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Inside);
                 p.text(chip.left_center() + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER,
                     "Camera: Perspective  |  FOV: 45°", FontId::monospace(12.0), TEXT_DIM);
 
-                // placeholder cube (until the wgpu flow render lands)
-                let c = rect.center();
-                let r = rect.height().min(rect.width()) * 0.16;
-                let a = self.spin * 0.4;
-                let cube = Rect::from_center_size(c, Vec2::splat(r * 2.0));
-                let _ = a;
-                icons::draw(p, cube, Icon::Cube, EMBER.gamma_multiply(0.85));
-                p.text(c + Vec2::new(0.0, r + 26.0), Align2::CENTER_CENTER,
-                    "wgpu 3D flow viewport — next step", FontId::proportional(14.0), TEXT_MUTE);
+                if self.nav == Nav::Metrics {
+                    p.text(rect.center_bottom() - Vec2::new(0.0, 22.0), Align2::CENTER_CENTER,
+                        "drag to orbit  ·  scroll to zoom  ·  G to regenerate", FontId::proportional(12.5), TEXT_MUTE);
+                } else {
+                    let name = match self.nav {
+                        Nav::Models => "Model Library", Nav::FlowPainter => "Flow Painter",
+                        Nav::Settings => "Settings", Nav::Metrics => "",
+                    };
+                    p.text(rect.center(), Align2::CENTER_CENTER, name, FontId::proportional(22.0), TEXT_DIM);
+                    p.text(rect.center() + Vec2::new(0.0, 30.0), Align2::CENTER_CENTER,
+                        "wired next — the 3D viewport is live under Metrics (3D)", FontId::proportional(13.0), TEXT_MUTE);
+                }
             });
     }
 }
