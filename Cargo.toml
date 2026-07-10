@@ -1,0 +1,17 @@
+[package]
+name = "reyn-studio"
+version = "0.1.0"
+edition = "2021"
+description = "Reyn Studio — fully-native (egui + wgpu) neural-CFD workbench, linked to a Python inference engine"
+
+[dependencies]
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.35"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.dev]
+opt-level = 1          # keep the 3D viewport smooth even in debug builds
+
+[profile.release]
+opt-level = 3
+lto = "thin"
