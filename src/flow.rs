@@ -73,6 +73,14 @@ pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
 
     let target = 8000usize;
     let stride = (((nx * ny * nz) as f32 / target as f32).cbrt().floor() as usize).max(1);
+    // per-sample jitter breaks the visible lattice so it reads as a field
+    let cell = 2.0 / (nx.max(2) - 1) as f32 * stride as f32;
+    let hash = |a: usize, b: usize, c: usize, salt: u32| -> f32 {
+        let mut h = (a as u32).wrapping_mul(73856093) ^ (b as u32).wrapping_mul(19349663)
+            ^ (c as u32).wrapping_mul(83492791) ^ salt.wrapping_mul(2654435761);
+        h ^= h >> 13; h = h.wrapping_mul(0x5bd1e995); h ^= h >> 15;
+        (h as f32 / u32::MAX as f32) - 0.5
+    };
     let mut raw: Vec<([f32; 3], f32, f32)> = Vec::new();
     let (mut maxv, mut maxs) = (1e-6f32, 1e-6f32);
     let mut i = 1;
@@ -90,9 +98,9 @@ pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
                 maxv = maxv.max(mag);
                 maxs = maxs.max(sp);
                 let pos = [
-                    i as f32 / (nx - 1) as f32 * 2.0 - 1.0,
-                    j as f32 / (ny - 1) as f32 * 2.0 - 1.0,
-                    k as f32 / (nz - 1) as f32 * 2.0 - 1.0,
+                    (i as f32 / (nx - 1) as f32 * 2.0 - 1.0) + hash(i, j, k, 1) * 0.9 * cell,
+                    (j as f32 / (ny - 1) as f32 * 2.0 - 1.0) + hash(i, j, k, 2) * 0.9 * cell,
+                    (k as f32 / (nz - 1) as f32 * 2.0 - 1.0) + hash(i, j, k, 3) * 0.9 * cell,
                 ];
                 raw.push((pos, wx.signum() * mag, sp));
                 k += stride;

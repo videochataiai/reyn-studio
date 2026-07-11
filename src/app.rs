@@ -145,11 +145,20 @@ impl ReynApp {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Project Alpha").size(21.0).strong().color(TEXT));
                 ui.label(mono("Neural CFD v2.4", TEXT_MUTE).size(12.0));
-                ui.label(mono(&format!("{} · {} models",
-                    self.current_model.trim_end_matches(".pth"), self.models.len()), BRAND).size(11.0));
+                let stem = std::path::Path::new(&self.current_model).file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or(&self.current_model);
+                ui.label(mono(&format!("{} · {} models", stem, self.models.len()), BRAND).size(11.0));
                 ui.add_space(18.0);
 
-                action_button(ui, Some(Icon::Upload), "Import Model", SURFACE_HIGH, TEXT, Some(OUTLINE), 40.0, ui.available_width());
+                if action_button(ui, Some(Icon::Upload), "Import Model", SURFACE_HIGH, TEXT, Some(OUTLINE), 40.0, ui.available_width()) {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("checkpoint", &["pth"])
+                        .set_directory(engine::research_dir())
+                        .pick_file()
+                    {
+                        self.load_model(path.to_string_lossy().into_owned());
+                    }
+                }
                 ui.add_space(18.0);
 
                 if nav_row(ui, Icon::Orbit, "Models", self.nav == Nav::Models) { self.nav = Nav::Models; }
@@ -246,6 +255,16 @@ impl ReynApp {
             });
     }
 
+    fn load_model(&mut self, path: String) {
+        self.current_model = path;
+        self.seed = self.seed.wrapping_add(1);
+        if self.engine_ok {
+            let _ = self.engine.tx.send(engine::Cmd::Predict { model: self.current_model.clone(), seed: self.seed });
+            self.engine_status = "● predicting…".into();
+        }
+        self.nav = Nav::Metrics;
+    }
+
     fn viewport(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(Color32::from_rgb(0x0e, 0x0a, 0x07)))
@@ -272,12 +291,16 @@ impl ReynApp {
                 }
 
                 let p = ui.painter_at(rect);
-                // camera chip
-                let chip = Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(262.0, 30.0));
+                // camera chip — live azimuth / elevation / zoom
+                let cam_text = format!("Perspective  ·  az {:>3.0}°  el {:>3.0}°  ·  zoom {:.2}×",
+                    self.cam.yaw.to_degrees().rem_euclid(360.0),
+                    self.cam.pitch.to_degrees(),
+                    viewport::Camera::default().dist / self.cam.dist);
+                let cg = p.layout_no_wrap(cam_text, FontId::monospace(12.0), TEXT_DIM);
+                let chip = Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(cg.size().x + 24.0, 30.0));
                 p.rect_filled(chip, CornerRadius::same(3), SURFACE);
                 p.rect_stroke(chip, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Inside);
-                p.text(chip.left_center() + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER,
-                    "Camera: Perspective  |  FOV: 45°", FontId::monospace(12.0), TEXT_DIM);
+                p.galley(egui::pos2(chip.min.x + 12.0, chip.center().y - cg.size().y / 2.0), cg, TEXT_DIM);
 
                 // engine status pill (top-right)
                 let scol = if self.engine_ok { SUCCESS } else { EMBER };

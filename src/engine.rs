@@ -31,7 +31,7 @@ pub struct EngineHandle {
     pub rx: Receiver<Msg>,
 }
 
-fn research_dir() -> String {
+pub fn research_dir() -> String {
     std::env::var("REYN_RESEARCH_DIR")
         .unwrap_or_else(|_| "/Users/hamza/Documents/Pioneer RI/reyn-research".to_string())
 }
