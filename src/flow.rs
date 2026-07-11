@@ -60,3 +60,48 @@ pub fn generate(n: usize, seed: u64) -> Vec<Particle> {
     }
     out
 }
+
+/// Convert a real engine velocity field `[3, N, N, N]` (row-major, C first) into
+/// render particles: sample voxels, take the vorticity (curl) for signed colour,
+/// speed for brightness, position normalized to [-1, 1]. This is the real model
+/// output driving the viewport.
+pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
+    if shape.len() != 4 || shape[0] != 3 { return Vec::new(); }
+    let (nx, ny, nz) = (shape[1], shape[2], shape[3]);
+    if data.len() < 3 * nx * ny * nz { return Vec::new(); }
+    let at = |c: usize, i: usize, j: usize, k: usize| data[((c * nx + i) * ny + j) * nz + k];
+
+    let target = 8000usize;
+    let stride = (((nx * ny * nz) as f32 / target as f32).cbrt().floor() as usize).max(1);
+    let mut raw: Vec<([f32; 3], f32, f32)> = Vec::new();
+    let (mut maxv, mut maxs) = (1e-6f32, 1e-6f32);
+    let mut i = 1;
+    while i < nx - 1 {
+        let mut j = 1;
+        while j < ny - 1 {
+            let mut k = 1;
+            while k < nz - 1 {
+                let wx = (at(2, i, j + 1, k) - at(2, i, j - 1, k)) - (at(1, i, j, k + 1) - at(1, i, j, k - 1));
+                let wy = (at(0, i, j, k + 1) - at(0, i, j, k - 1)) - (at(2, i + 1, j, k) - at(2, i - 1, j, k));
+                let wz = (at(1, i + 1, j, k) - at(1, i - 1, j, k)) - (at(0, i, j + 1, k) - at(0, i, j - 1, k));
+                let mag = (wx * wx + wy * wy + wz * wz).sqrt();
+                let (u, v, w) = (at(0, i, j, k), at(1, i, j, k), at(2, i, j, k));
+                let sp = (u * u + v * v + w * w).sqrt();
+                maxv = maxv.max(mag);
+                maxs = maxs.max(sp);
+                let pos = [
+                    i as f32 / (nx - 1) as f32 * 2.0 - 1.0,
+                    j as f32 / (ny - 1) as f32 * 2.0 - 1.0,
+                    k as f32 / (nz - 1) as f32 * 2.0 - 1.0,
+                ];
+                raw.push((pos, wx.signum() * mag, sp));
+                k += stride;
+            }
+            j += stride;
+        }
+        i += stride;
+    }
+    raw.into_iter().map(|(pos, vort, sp)| Particle {
+        pos, vort: (vort / maxv).clamp(-1.0, 1.0), speed: (sp / maxs).clamp(0.0, 1.0),
+    }).collect()
+}

@@ -1,7 +1,7 @@
 //! Reyn Studio shell — matches the 3D Volumetric Analysis mockup. (egui 0.35 API.)
 use crate::icons::{self, Icon};
 use crate::theme::*;
-use crate::{flow, viewport};
+use crate::{engine, flow, viewport};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText,
     Sense, Stroke, Vec2,
@@ -23,27 +23,58 @@ pub struct ReynApp {
     cam: viewport::Camera,
     particles: Vec<flow::Particle>,
     seed: u64,
+    engine: engine::EngineHandle,
+    engine_status: String,
+    engine_ok: bool,
+    current_model: String,
+    models: Vec<String>,
 }
 
 impl Default for ReynApp {
     fn default() -> Self {
+        let engine = engine::EngineHandle::spawn();
+        let current_model = "flow3d_obs_v1.pth".to_string();
+        let _ = engine.tx.send(engine::Cmd::ListModels);
+        let _ = engine.tx.send(engine::Cmd::Predict { model: current_model.clone(), seed: 1 });
         Self {
             nav: Nav::Metrics, volumetric: true,
             slice: [true, false, false], slice_pos: [0.50, 0.0, 0.0],
             density_lo: 0.85, density_hi: 1.0, opacity: 0.75,
             shadows: true, streamlines: false,
             cam: viewport::Camera::default(),
-            particles: flow::generate(6000, 1),
+            particles: flow::generate(6000, 1), // procedural until the model field arrives
             seed: 1,
+            engine, engine_status: "starting engine…".into(), engine_ok: false, current_model,
+            models: Vec::new(),
         }
     }
 }
 
 impl eframe::App for ReynApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // drain engine messages (non-blocking)
+        while let Ok(msg) = self.engine.rx.try_recv() {
+            match msg {
+                engine::Msg::Status(s) => { self.engine_status = s; self.engine_ok = true; }
+                engine::Msg::Models(m) => { self.models = m; }
+                engine::Msg::Field(f) => {
+                    let ps = flow::from_field(&f.shape, &f.data);
+                    if !ps.is_empty() { self.particles = ps; }
+                    let n = f.shape.get(1).copied().unwrap_or(0);
+                    self.engine_status = format!("● model field {n}³ · {}", f.scenario);
+                    self.engine_ok = true;
+                }
+                engine::Msg::Error(e) => { self.engine_status = format!("○ {e}"); self.engine_ok = false; }
+            }
+        }
         if ui.input(|i| i.key_pressed(egui::Key::G)) {
             self.seed = self.seed.wrapping_add(1);
-            self.particles = flow::generate(6000, self.seed);
+            if self.engine_ok {
+                let _ = self.engine.tx.send(engine::Cmd::Predict { model: self.current_model.clone(), seed: self.seed });
+                self.engine_status = "● predicting…".into();
+            } else {
+                self.particles = flow::generate(6000, self.seed);
+            }
         }
         self.top_bar(ui);
         self.left_sidebar(ui);
@@ -114,6 +145,8 @@ impl ReynApp {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Project Alpha").size(21.0).strong().color(TEXT));
                 ui.label(mono("Neural CFD v2.4", TEXT_MUTE).size(12.0));
+                ui.label(mono(&format!("{} · {} models",
+                    self.current_model.trim_end_matches(".pth"), self.models.len()), BRAND).size(11.0));
                 ui.add_space(18.0);
 
                 action_button(ui, Some(Icon::Upload), "Import Model", SURFACE_HIGH, TEXT, Some(OUTLINE), 40.0, ui.available_width());
@@ -245,6 +278,15 @@ impl ReynApp {
                 p.rect_stroke(chip, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Inside);
                 p.text(chip.left_center() + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER,
                     "Camera: Perspective  |  FOV: 45°", FontId::monospace(12.0), TEXT_DIM);
+
+                // engine status pill (top-right)
+                let scol = if self.engine_ok { SUCCESS } else { EMBER };
+                let galley = p.layout_no_wrap(self.engine_status.clone(), FontId::monospace(11.5), scol);
+                let pw = galley.size().x + 24.0;
+                let pill = Rect::from_min_size(egui::pos2(rect.max.x - pw - 16.0, rect.min.y + 16.0), Vec2::new(pw, 28.0));
+                p.rect_filled(pill, CornerRadius::same(3), SURFACE);
+                p.rect_stroke(pill, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Inside);
+                p.galley(egui::pos2(pill.min.x + 12.0, pill.center().y - galley.size().y / 2.0), galley, scol);
 
                 if self.nav == Nav::Metrics {
                     p.text(rect.center_bottom() - Vec2::new(0.0, 22.0), Align2::CENTER_CENTER,
