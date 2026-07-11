@@ -13,8 +13,10 @@ impl Default for Camera {
 pub struct ViewOpts {
     pub opacity: f32,
     pub density_lo: f32,
-    pub slice_x: Option<f32>,
+    pub slice: [Option<f32>; 3], // clip plane per axis when enabled
     pub streamlines: bool,
+    pub shadows: bool,
+    pub mode2d: bool,
 }
 
 fn colormap(vort: f32, alpha: f32) -> Color32 {
@@ -33,7 +35,7 @@ fn colormap(vort: f32, alpha: f32) -> Color32 {
 
 pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, particles: &[Particle]) {
     let resp = ui.interact(rect, ui.id().with("viewport3d"), Sense::drag());
-    if resp.dragged() {
+    if resp.dragged() && !opts.mode2d {
         let d = resp.drag_delta();
         cam.yaw += d.x * 0.008;
         cam.pitch = (cam.pitch + d.y * 0.008).clamp(-1.45, 1.45);
@@ -47,41 +49,56 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, pa
     let center = rect.center();
     let scale = rect.height().min(rect.width()) * 0.44;
     let focal = 2.7_f32;
+    let zoom = Camera::default().dist / cam.dist;
     let (cy, sy) = (cam.yaw.cos(), cam.yaw.sin());
     let (cp, sp) = (cam.pitch.cos(), cam.pitch.sin());
+    let mode2d = opts.mode2d;
     let project = |v: [f32; 3]| -> (Pos2, f32) {
-        let x = v[0] * cy - v[2] * sy;
-        let z = v[0] * sy + v[2] * cy;
-        let y = v[1] * cp - z * sp;
-        let zc = v[1] * sp + z * cp + cam.dist;
-        let f = focal / zc.max(0.1);
-        (Pos2::new(center.x + x * f * scale, center.y - y * f * scale), zc)
+        if mode2d {
+            // orthographic top-down 2D field (x-y plane), depth from z
+            (Pos2::new(center.x + v[0] * scale * zoom, center.y - v[1] * scale * zoom), 1.0 - v[2])
+        } else {
+            let x = v[0] * cy - v[2] * sy;
+            let z = v[0] * sy + v[2] * cy;
+            let y = v[1] * cp - z * sp;
+            let zc = v[1] * sp + z * cp + cam.dist;
+            let f = focal / zc.max(0.1);
+            (Pos2::new(center.x + x * f * scale, center.y - y * f * scale), zc)
+        }
     };
 
-    // domain bounding box
-    let cs = [
-        [-1., -1., -1.], [1., -1., -1.], [1., 1., -1.], [-1., 1., -1.],
-        [-1., -1., 1.], [1., -1., 1.], [1., 1., 1.], [-1., 1., 1.],
-    ];
-    let edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)];
-    let box_stroke = Stroke::new(1.0, OUTLINE_VARIANT.gamma_multiply(0.9));
-    for (a, b) in edges {
-        p.line_segment([project(cs[a]).0, project(cs[b]).0], box_stroke);
+    // domain bounding box (3D only)
+    if !mode2d {
+        let cs = [
+            [-1., -1., -1.], [1., -1., -1.], [1., 1., -1.], [-1., 1., -1.],
+            [-1., -1., 1.], [1., -1., 1.], [1., 1., 1.], [-1., 1., 1.],
+        ];
+        let edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)];
+        let box_stroke = Stroke::new(1.0, OUTLINE_VARIANT.gamma_multiply(0.9));
+        for (a, b) in edges {
+            p.line_segment([project(cs[a]).0, project(cs[b]).0], box_stroke);
+        }
     }
 
     let thr = (opts.density_lo - 0.5).max(0.0); // density -> |vort| threshold
     let mut drawn: Vec<(f32, Pos2, Color32, f32)> = Vec::with_capacity(particles.len());
     for pt in particles {
         if pt.vort.abs() < thr { continue; }
-        if let Some(sx) = opts.slice_x {
-            if pt.pos[0] < sx * 2.0 - 1.0 { continue; }
+        let mut clipped = false;
+        for a in 0..3 {
+            if let Some(pos) = opts.slice[a] {
+                if pt.pos[a] < pos * 2.0 - 1.0 { clipped = true; break; }
+            }
         }
+        if clipped { continue; }
         let (s, depth) = project(pt.pos);
         if !rect.expand(40.0).contains(s) { continue; }
-        let fade = (2.2 / depth).clamp(0.15, 1.0);
-        let a = opts.opacity * fade * (0.35 + 0.65 * pt.speed);
+        let fade = if mode2d { 1.0 } else { (2.2 / depth).clamp(0.15, 1.0) };
+        // volumetric shadows: darken particles deeper in the volume
+        let shadow = if opts.shadows && !mode2d { 0.45 + 0.55 * fade } else { 1.0 };
+        let a = opts.opacity * fade * (0.35 + 0.65 * pt.speed) * shadow;
         let col = colormap(pt.vort, a);
-        let r = (fade * 3.0).clamp(1.2, 3.4);
+        let r = if mode2d { (3.0 * zoom).clamp(1.5, 4.0) } else { (fade * 3.0).clamp(1.2, 3.4) };
         drawn.push((depth, s, col, r));
     }
     drawn.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));

@@ -28,6 +28,8 @@ pub struct ReynApp {
     engine_ok: bool,
     current_model: String,
     models: Vec<String>,
+    live: bool,
+    live_timer: f32,
 }
 
 impl Default for ReynApp {
@@ -45,7 +47,7 @@ impl Default for ReynApp {
             particles: flow::generate(6000, 1), // procedural until the model field arrives
             seed: 1,
             engine, engine_status: "starting engine…".into(), engine_ok: false, current_model,
-            models: Vec::new(),
+            models: Vec::new(), live: false, live_timer: 0.0,
         }
     }
 }
@@ -67,14 +69,10 @@ impl eframe::App for ReynApp {
                 engine::Msg::Error(e) => { self.engine_status = format!("○ {e}"); self.engine_ok = false; }
             }
         }
-        if ui.input(|i| i.key_pressed(egui::Key::G)) {
-            self.seed = self.seed.wrapping_add(1);
-            if self.engine_ok {
-                let _ = self.engine.tx.send(engine::Cmd::Predict { model: self.current_model.clone(), seed: self.seed });
-                self.engine_status = "● predicting…".into();
-            } else {
-                self.particles = flow::generate(6000, self.seed);
-            }
+        if ui.input(|i| i.key_pressed(egui::Key::G)) { self.regenerate(); }
+        if self.live {
+            self.live_timer += ui.input(|i| i.stable_dt);
+            if self.live_timer > 2.5 { self.live_timer = 0.0; self.regenerate(); }
         }
         self.top_bar(ui);
         self.left_sidebar(ui);
@@ -112,15 +110,38 @@ impl ReynApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("Reyn Studio").size(18.0).strong().color(BRAND));
-                    ui.add_space(30.0);
-                    for m in ["File", "Edit", "View", "Simulation", "Window"] {
-                        let active = m == "View";
-                        ui.label(RichText::new(m).size(13.5)
-                            .color(if active { TEXT } else { TEXT_DIM }));
-                        ui.add_space(18.0);
-                    }
+                    ui.add_space(24.0);
+                    ui.menu_button(RichText::new("File").size(13.5).color(TEXT_DIM), |ui| {
+                        if ui.button("Import Model…").clicked() { self.import_model(); }
+                        if ui.button("Export Calculations…").clicked() { self.export(); }
+                        ui.separator();
+                        if ui.button("Quit").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                    });
+                    ui.menu_button(RichText::new("Edit").size(13.5).color(TEXT_DIM), |ui| {
+                        if ui.button("Reset Controls").clicked() { self.reset_controls(); }
+                    });
+                    ui.menu_button(RichText::new("View").size(13.5).color(TEXT_DIM), |ui| {
+                        if ui.button("Reset Camera").clicked() { self.cam = viewport::Camera::default(); }
+                        if ui.button(if self.volumetric { "Switch to 2D" } else { "Switch to 3D" }).clicked() {
+                            self.volumetric = !self.volumetric;
+                        }
+                    });
+                    ui.menu_button(RichText::new("Simulation").size(13.5).color(TEXT_DIM), |ui| {
+                        if ui.button("Regenerate Field").clicked() { self.regenerate(); }
+                        if ui.button(if self.live { "Stop Live Session" } else { "Start Live Session" }).clicked() {
+                            self.live = !self.live;
+                        }
+                    });
+                    ui.menu_button(RichText::new("Window").size(13.5).color(TEXT_DIM), |ui| {
+                        if ui.button("Minimize").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
+                    });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if action_button(ui, Some(Icon::Play), "Live Session", BRAND, ON_EMBER, None, 34.0, 132.0) {}
+                        let live_icon = if self.live { None } else { Some(Icon::Play) };
+                        let live_label = if self.live { "◉  LIVE" } else { "Live Session" };
+                        let live_fill = if self.live { EMBER } else { BRAND };
+                        if action_button(ui, live_icon, live_label, live_fill, ON_EMBER, None, 34.0, 132.0) {
+                            self.live = !self.live;
+                        }
                         ui.add_space(14.0);
                         // 2D | 3D VOLUMETRIC segmented toggle (left-to-right order)
                         Frame::NONE.fill(SURFACE_HIGH).corner_radius(CornerRadius::same(3))
@@ -151,13 +172,7 @@ impl ReynApp {
                 ui.add_space(18.0);
 
                 if action_button(ui, Some(Icon::Upload), "Import Model", SURFACE_HIGH, TEXT, Some(OUTLINE), 40.0, ui.available_width()) {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("checkpoint", &["pth"])
-                        .set_directory(engine::research_dir())
-                        .pick_file()
-                    {
-                        self.load_model(path.to_string_lossy().into_owned());
-                    }
+                    self.import_model();
                 }
                 ui.add_space(18.0);
 
@@ -182,8 +197,10 @@ impl ReynApp {
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                     ui.add_space(2.0);
-                    foot_link(ui, Icon::Heart, "Support");
-                    foot_link(ui, Icon::Book, "Docs");
+                    if foot_link(ui, Icon::Heart, "Support") { open_url("mailto:support@reyn.studio"); }
+                    if foot_link(ui, Icon::Book, "Docs") {
+                        open_url(concat!("file://", env!("CARGO_MANIFEST_DIR"), "/PRD.md"));
+                    }
                 });
             });
     }
@@ -250,9 +267,57 @@ impl ReynApp {
                 });
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    action_button(ui, Some(Icon::Download), "EXPORT CALCULATIONS", GOLD, ON_EMBER, None, 44.0, ui.available_width());
+                    if action_button(ui, Some(Icon::Download), "EXPORT CALCULATIONS", GOLD, ON_EMBER, None, 44.0, ui.available_width()) {
+                        self.export();
+                    }
                 });
             });
+    }
+
+    fn regenerate(&mut self) {
+        self.seed = self.seed.wrapping_add(1);
+        if self.engine_ok {
+            let _ = self.engine.tx.send(engine::Cmd::Predict { model: self.current_model.clone(), seed: self.seed });
+            self.engine_status = "● predicting…".into();
+        } else {
+            self.particles = flow::generate(6000, self.seed);
+        }
+    }
+
+    fn import_model(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("checkpoint", &["pth"])
+            .set_directory(engine::research_dir())
+            .pick_file()
+        {
+            self.load_model(path.to_string_lossy().into_owned());
+        }
+    }
+
+    fn export(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("reyn_diagnostics.csv")
+            .save_file()
+        {
+            let (hel, ens, q, count) = diagnostics(&self.particles);
+            let csv = format!(
+                "metric,value\nmodel,{}\nsamples,{}\nhelicity,{:.6e}\nenstrophy,{:.6e}\n\
+                 q_criterion,{:.6}\ndensity_lo,{:.3}\nopacity,{:.3}\n",
+                self.current_model, count, hel, ens, q, self.density_lo, self.opacity);
+            let _ = std::fs::write(&path, csv);
+            self.engine_status = format!("● exported {}",
+                path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
+        }
+    }
+
+    fn reset_controls(&mut self) {
+        self.slice = [true, false, false];
+        self.slice_pos = [0.5, 0.0, 0.0];
+        self.density_lo = 0.85;
+        self.opacity = 0.75;
+        self.shadows = true;
+        self.streamlines = false;
     }
 
     fn load_model(&mut self, path: String) {
@@ -284,8 +349,14 @@ impl ReynApp {
                     let opts = viewport::ViewOpts {
                         opacity: self.opacity,
                         density_lo: self.density_lo,
-                        slice_x: if self.slice[0] { Some(self.slice_pos[0]) } else { None },
+                        slice: [
+                            if self.slice[0] { Some(self.slice_pos[0]) } else { None },
+                            if self.slice[1] { Some(self.slice_pos[1]) } else { None },
+                            if self.slice[2] { Some(self.slice_pos[2]) } else { None },
+                        ],
                         streamlines: self.streamlines,
+                        shadows: self.shadows,
+                        mode2d: !self.volumetric,
                     };
                     viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
                 }
@@ -348,13 +419,23 @@ fn nav_row(ui: &mut egui::Ui, icon: Icon, label: &str, active: bool) -> bool {
     resp.clicked()
 }
 
-fn foot_link(ui: &mut egui::Ui, icon: Icon, label: &str) {
+fn foot_link(ui: &mut egui::Ui, icon: Icon, label: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
     let fg = if resp.hovered() { TEXT } else { TEXT_DIM };
     let p = ui.painter();
     let ir = Rect::from_min_size(rect.min + Vec2::new(2.0, 7.0), Vec2::splat(16.0));
     icons::draw(p, ir, icon, fg);
     p.text(rect.min + Vec2::new(28.0, 15.0), Align2::LEFT_CENTER, label, FontId::proportional(13.5), fg);
+    resp.clicked()
+}
+
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/C", "start", url]).spawn();
 }
 
 /// Centered icon+label button. `border` gives a ghost style.
