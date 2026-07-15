@@ -14,15 +14,45 @@ pub struct Field {
     pub scenario: String,
 }
 
+/// A 2D field for the pressure-recovery view: AI velocity + recovered pressure
+/// (`ai` = `[3,N,N]` u,v,p), optional solver `truth` (same layout), and the
+/// verification numbers (semigroup self-consistency, RelL2 vs truth, persistence).
+pub struct Field2D {
+    pub n: usize,
+    pub ai: Vec<f32>,
+    pub truth: Option<Vec<f32>>,
+    pub horizon: u32,
+    pub dt_frame: f32,
+    pub peak_p: f32,
+    pub low_p: f32,
+    pub semigroup: Option<f32>,
+    pub rel_l2: Option<f32>,
+    pub persist: Option<f32>,
+    pub p_residual: f32,
+    pub p_iters: u32,
+    pub p_method: String,
+    pub scenario: String,
+}
+
 pub enum Cmd {
     ListModels,
     Predict { model: String, seed: u64 },
+    Predict2D {
+        model: String,
+        steps: u32,
+        seed: u64,
+        want_truth: bool,
+        method: String,   // "spectral" | "fd"
+        tolerance: f32,    // FD stop tolerance
+        boundary: String,  // "periodic" | "dirichlet"
+    },
 }
 
 pub enum Msg {
     Status(String),
     Models(Vec<String>),
     Field(Field),
+    Field2D(Field2D),
     Error(String),
 }
 
@@ -73,6 +103,41 @@ fn worker(cmd_rx: Receiver<Cmd>, msg_tx: Sender<Msg>) {
                     let data: Vec<f32> = payload.chunks_exact(4)
                         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
                     Msg::Field(Field { shape, data, scenario: j["scenario"].as_str().unwrap_or("").into() })
+                })
+            }
+            Cmd::Predict2D { model, steps, seed, want_truth, method, tolerance, boundary } => {
+                let req = format!(
+                    r#"{{"op":"predict2d","model":"{model}","steps":{steps},"seed":{seed},"want_truth":{want_truth},"method":"{method}","tolerance":{tolerance},"boundary":"{boundary}","max_iter":600}}"#);
+                request(&mut conn, req).map(|(j, payload)| {
+                    if !j["ok"].as_bool().unwrap_or(false) {
+                        return Msg::Error(j["error"].as_str().unwrap_or("predict2d failed").into());
+                    }
+                    let n = j["shape"][1].as_u64().unwrap_or(0) as usize;
+                    let all: Vec<f32> = payload.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                    let plane = n * n;
+                    let ai = all.get(..3 * plane).map(<[f32]>::to_vec).unwrap_or_default();
+                    let has_truth = j["has_truth"].as_bool().unwrap_or(false);
+                    let truth = if has_truth && all.len() >= 6 * plane {
+                        Some(all[3 * plane..6 * plane].to_vec())
+                    } else {
+                        None
+                    };
+                    let f = |k: &str| j[k].as_f64().map(|v| v as f32);
+                    Msg::Field2D(Field2D {
+                        n, ai, truth,
+                        horizon: j["horizon"].as_u64().unwrap_or(0) as u32,
+                        dt_frame: f("dt_frame").unwrap_or(0.04),
+                        peak_p: f("peak_p").unwrap_or(0.0),
+                        low_p: f("low_p").unwrap_or(0.0),
+                        semigroup: f("semigroup"),
+                        rel_l2: f("rel_l2"),
+                        persist: f("persist"),
+                        p_residual: f("p_residual").unwrap_or(0.0),
+                        p_iters: j["p_iters"].as_u64().unwrap_or(0) as u32,
+                        p_method: j["method"].as_str().unwrap_or("spectral").into(),
+                        scenario: j["scenario"].as_str().unwrap_or("").into(),
+                    })
                 })
             }
         };
@@ -152,6 +217,30 @@ mod tests {
             }
             Some(Msg::Error(e)) => panic!("engine error: {e}"),
             _ => panic!("timed out waiting for the model field"),
+        }
+    }
+
+    /// N3 bridge test: a 2D prediction with truth overlay returns AI + truth
+    /// planes, a sane RelL2 vs truth, and a semigroup self-consistency number.
+    #[test]
+    fn predict2d_round_trip() {
+        let h = EngineHandle::spawn();
+        h.tx.send(Cmd::Predict2D { model: "obstacle_v2_shapes.pth".into(), steps: 8, seed: 1,
+            want_truth: true, method: "spectral".into(), tolerance: 1e-5, boundary: "periodic".into() }).unwrap();
+        match wait_for(&h, |m| matches!(m, Msg::Field2D(_) | Msg::Error(_)), 60) {
+            Some(Msg::Field2D(f)) => {
+                assert_eq!(f.n, 128);
+                assert_eq!(f.ai.len(), 3 * 128 * 128);
+                let truth = f.truth.expect("want_truth but no truth returned");
+                assert_eq!(truth.len(), 3 * 128 * 128);
+                let rel = f.rel_l2.expect("no rel_l2");
+                assert!(rel < 0.1, "held-out RelL2 unexpectedly high: {rel}");
+                assert!(rel < f.persist.unwrap(), "AI should beat persistence");
+                assert!(f.semigroup.is_some(), "even horizon should yield a semigroup number");
+                assert!(f.p_residual < 1e-3, "spectral recovery residual too high: {}", f.p_residual);
+            }
+            Some(Msg::Error(e)) => panic!("engine error: {e}"),
+            _ => panic!("timed out waiting for the 2D field"),
         }
     }
 }

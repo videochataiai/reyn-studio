@@ -1,14 +1,20 @@
 //! Reyn Studio shell — matches the 3D Volumetric Analysis mockup. (egui 0.35 API.)
+use crate::field2d::{self, FieldVar};
 use crate::icons::{self, Icon};
 use crate::theme::*;
-use crate::{engine, flow, viewport};
+use crate::{engine, flow, gpu, viewport};
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText,
     Sense, Stroke, Vec2,
 };
 
 #[derive(PartialEq, Clone, Copy)]
-enum Nav { Models, FlowPainter, Metrics, Settings }
+enum Nav { Models, FlowPainter, Fields2D, Metrics, Settings }
+
+#[derive(PartialEq, Clone, Copy)]
+enum PMethod { Spectral, Fd }
+#[derive(PartialEq, Clone, Copy)]
+enum PBoundary { Periodic, Dirichlet }
 
 pub struct ReynApp {
     nav: Nav,
@@ -30,6 +36,27 @@ pub struct ReynApp {
     models: Vec<String>,
     live: bool,
     live_timer: f32,
+    gpu_ready: bool,
+    render_volume: bool,
+    volume_data: std::sync::Arc<Vec<u8>>,
+    volume_dims: [u32; 3],
+    volume_version: u64,
+    // N3 — 2D pressure-recovery view
+    f2d: Option<engine::Field2D>,
+    f2d_var: FieldVar,
+    f2d_horizon: u32,
+    f2d_truth: bool,
+    f2d_model: String,
+    f2d_pending: bool,
+    f2d_dirty: bool,
+    f2d_req_at: Option<std::time::Instant>,
+    f2d_latency_ms: u32,
+    f2d_gen: u64,
+    f2d_tex: Vec<egui::TextureHandle>,
+    f2d_sig: u64,
+    f2d_method: PMethod,
+    f2d_tol_exp: i32, // FD tolerance = 10^-exp
+    f2d_boundary: PBoundary,
 }
 
 impl Default for ReynApp {
@@ -38,6 +65,7 @@ impl Default for ReynApp {
         let current_model = "flow3d_obs_v1.pth".to_string();
         let _ = engine.tx.send(engine::Cmd::ListModels);
         let _ = engine.tx.send(engine::Cmd::Predict { model: current_model.clone(), seed: 1 });
+        let (vol, vdims) = flow::procedural_volume(48, 1); // placeholder until a field arrives
         Self {
             nav: Nav::Metrics, volumetric: true,
             slice: [true, false, false], slice_pos: [0.50, 0.0, 0.0],
@@ -47,8 +75,28 @@ impl Default for ReynApp {
             particles: flow::generate(6000, 1), // procedural until the model field arrives
             seed: 1,
             engine, engine_status: "starting engine…".into(), engine_ok: false, current_model,
-            models: Vec::new(), live: false, live_timer: 0.0,
+            models: Vec::new(), live: false, live_timer: 0.0, gpu_ready: false,
+            render_volume: false,
+            volume_data: std::sync::Arc::new(vol), volume_dims: vdims, volume_version: 1,
+            f2d: None, f2d_var: FieldVar::Vorticity, f2d_horizon: 8, f2d_truth: false,
+            f2d_model: "obstacle_v2_shapes.pth".into(),
+            f2d_pending: false, f2d_dirty: false, f2d_req_at: None, f2d_latency_ms: 0,
+            f2d_gen: 0, f2d_tex: Vec::new(), f2d_sig: u64::MAX,
+            f2d_method: PMethod::Spectral, f2d_tol_exp: 5, f2d_boundary: PBoundary::Periodic,
         }
+    }
+}
+
+impl ReynApp {
+    /// Build the app and register the native wgpu bloom renderer (N2). Falls
+    /// back to the CPU glow if the wgpu backend is somehow unavailable.
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+        if let Some(rs) = cc.wgpu_render_state.as_ref() {
+            gpu::install(rs);
+            app.gpu_ready = true;
+        }
+        app
     }
 }
 
@@ -62,11 +110,26 @@ impl eframe::App for ReynApp {
                 engine::Msg::Field(f) => {
                     let ps = flow::from_field(&f.shape, &f.data);
                     if !ps.is_empty() { self.particles = ps; }
+                    if let Some((vol, dims)) = flow::vorticity_volume(&f.shape, &f.data) {
+                        self.volume_data = std::sync::Arc::new(vol);
+                        self.volume_dims = dims;
+                        self.volume_version = self.volume_version.wrapping_add(1);
+                    }
                     let n = f.shape.get(1).copied().unwrap_or(0);
                     self.engine_status = format!("● model field {n}³ · {}", f.scenario);
                     self.engine_ok = true;
                 }
-                engine::Msg::Error(e) => { self.engine_status = format!("○ {e}"); self.engine_ok = false; }
+                engine::Msg::Field2D(f) => {
+                    if let Some(t) = self.f2d_req_at.take() {
+                        self.f2d_latency_ms = t.elapsed().as_millis() as u32;
+                    }
+                    self.f2d = Some(f);
+                    self.f2d_gen = self.f2d_gen.wrapping_add(1);
+                    self.f2d_pending = false;
+                    self.engine_ok = true;
+                    if self.f2d_dirty { self.f2d_dirty = false; self.request_2d(); }
+                }
+                engine::Msg::Error(e) => { self.engine_status = format!("○ {e}"); self.engine_ok = false; self.f2d_pending = false; }
             }
         }
         if ui.input(|i| i.key_pressed(egui::Key::G)) { self.regenerate(); }
@@ -178,6 +241,10 @@ impl ReynApp {
 
                 if nav_row(ui, Icon::Orbit, "Models", self.nav == Nav::Models) { self.nav = Nav::Models; }
                 if nav_row(ui, Icon::Brush, "Flow Painter", self.nav == Nav::FlowPainter) { self.nav = Nav::FlowPainter; }
+                if nav_row(ui, Icon::Layers, "Fields (2D)", self.nav == Nav::Fields2D) {
+                    self.nav = Nav::Fields2D;
+                    if self.f2d.is_none() && !self.f2d_pending { self.request_2d(); }
+                }
                 if nav_row(ui, Icon::Chart, "Metrics (3D)", self.nav == Nav::Metrics) { self.nav = Nav::Metrics; }
                 if nav_row(ui, Icon::Gear, "Settings", self.nav == Nav::Settings) { self.nav = Nav::Settings; }
 
@@ -210,6 +277,7 @@ impl ReynApp {
             .frame(Frame::NONE.fill(BG).inner_margin(Margin::same(24))
                 .stroke(Stroke::new(1.0, OUTLINE_VARIANT)))
             .show(ui, |ui| {
+                if self.nav == Nav::Fields2D { self.controls_2d(ui); return; }
                 ui.spacing_mut().slider_width = 120.0;
                 ui.label(RichText::new("3D Controls").size(20.0).strong().color(TEXT));
                 ui.add_space(20.0);
@@ -264,6 +332,9 @@ impl ReynApp {
                     ui.add_space(8.0);
                     ui.checkbox(&mut self.shadows, RichText::new("Volumetric Shadows").color(TEXT_DIM));
                     ui.checkbox(&mut self.streamlines, RichText::new("Show Streamlines").color(TEXT_DIM));
+                    ui.add_enabled_ui(self.volumetric, |ui| {
+                        ui.checkbox(&mut self.render_volume, RichText::new("Volume Raymarch").color(TEXT_DIM));
+                    });
                 });
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -281,7 +352,49 @@ impl ReynApp {
             self.engine_status = "● predicting…".into();
         } else {
             self.particles = flow::generate(6000, self.seed);
+            let (vol, dims) = flow::procedural_volume(48, self.seed);
+            self.volume_data = std::sync::Arc::new(vol);
+            self.volume_dims = dims;
+            self.volume_version = self.volume_version.wrapping_add(1);
         }
+    }
+
+    /// Request a 2D prediction, coalesced to one in-flight request (TimeJump can
+    /// fire many per second while dragging; stale ones are dropped, the newest
+    /// re-fires when the current result lands).
+    fn request_2d(&mut self) {
+        if !self.engine_ok { return; }
+        if self.f2d_pending { self.f2d_dirty = true; return; }
+        let _ = self.engine.tx.send(engine::Cmd::Predict2D {
+            model: self.f2d_model.clone(),
+            steps: self.f2d_horizon,
+            seed: 1,
+            want_truth: self.f2d_truth,
+            method: match self.f2d_method { PMethod::Spectral => "spectral", PMethod::Fd => "fd" }.into(),
+            tolerance: 10f32.powi(-self.f2d_tol_exp),
+            boundary: match self.f2d_boundary { PBoundary::Periodic => "periodic", PBoundary::Dirichlet => "dirichlet" }.into(),
+        });
+        self.f2d_pending = true;
+        self.f2d_req_at = Some(std::time::Instant::now());
+    }
+
+    /// Rebuild the colormapped textures only when the field, variable, or overlay
+    /// changed (not every frame).
+    fn ensure_f2d_textures(&mut self, ctx: &egui::Context) {
+        let Some(f) = &self.f2d else { return };
+        let var_id = match self.f2d_var { FieldVar::Velocity => 0, FieldVar::Vorticity => 1, FieldVar::Pressure => 2 };
+        let sig = self.f2d_gen.wrapping_mul(131) ^ (var_id << 1) ^ ((self.f2d_truth as u64) << 4);
+        if sig == self.f2d_sig && !self.f2d_tex.is_empty() { return; }
+        let opts = egui::TextureOptions::NEAREST;
+        let mut tex = vec![ctx.load_texture("f2d.ai", field2d::image(f, &f.ai, self.f2d_var), opts)];
+        if self.f2d_truth {
+            if let Some(truth) = &f.truth {
+                tex.push(ctx.load_texture("f2d.truth", field2d::image(f, truth, self.f2d_var), opts));
+                tex.push(ctx.load_texture("f2d.err", field2d::error_image(f, &f.ai, truth, self.f2d_var), opts));
+            }
+        }
+        self.f2d_tex = tex;
+        self.f2d_sig = sig;
     }
 
     fn import_model(&mut self) {
@@ -349,6 +462,7 @@ impl ReynApp {
                     let opts = viewport::ViewOpts {
                         opacity: self.opacity,
                         density_lo: self.density_lo,
+                        density_hi: self.density_hi,
                         slice: [
                             if self.slice[0] { Some(self.slice_pos[0]) } else { None },
                             if self.slice[1] { Some(self.slice_pos[1]) } else { None },
@@ -357,21 +471,33 @@ impl ReynApp {
                         streamlines: self.streamlines,
                         shadows: self.shadows,
                         mode2d: !self.volumetric,
+                        gpu: self.gpu_ready,
+                        volume_mode: self.render_volume && self.volumetric,
+                        volume: Some(gpu::VolumeData {
+                            data: self.volume_data.clone(),
+                            dims: self.volume_dims,
+                            version: self.volume_version,
+                        }),
                     };
                     viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
                 }
+                if self.nav == Nav::Fields2D {
+                    self.field2d_view(ui, rect);
+                }
 
                 let p = ui.painter_at(rect);
-                // camera chip — live azimuth / elevation / zoom
-                let cam_text = format!("Perspective  ·  az {:>3.0}°  el {:>3.0}°  ·  zoom {:.2}×",
-                    self.cam.yaw.to_degrees().rem_euclid(360.0),
-                    self.cam.pitch.to_degrees(),
-                    viewport::Camera::default().dist / self.cam.dist);
-                let cg = p.layout_no_wrap(cam_text, FontId::monospace(12.0), TEXT_DIM);
-                let chip = Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(cg.size().x + 24.0, 30.0));
-                p.rect_filled(chip, CornerRadius::same(3), SURFACE);
-                p.rect_stroke(chip, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Inside);
-                p.galley(egui::pos2(chip.min.x + 12.0, chip.center().y - cg.size().y / 2.0), cg, TEXT_DIM);
+                // camera chip — live azimuth / elevation / zoom (3D only)
+                if self.nav == Nav::Metrics {
+                    let cam_text = format!("Perspective  ·  az {:>3.0}°  el {:>3.0}°  ·  zoom {:.2}×",
+                        self.cam.yaw.to_degrees().rem_euclid(360.0),
+                        self.cam.pitch.to_degrees(),
+                        viewport::Camera::default().dist / self.cam.dist);
+                    let cg = p.layout_no_wrap(cam_text, FontId::monospace(12.0), TEXT_DIM);
+                    let chip = Rect::from_min_size(rect.min + Vec2::new(16.0, 16.0), Vec2::new(cg.size().x + 24.0, 30.0));
+                    p.rect_filled(chip, CornerRadius::same(3), SURFACE);
+                    p.rect_stroke(chip, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Inside);
+                    p.galley(egui::pos2(chip.min.x + 12.0, chip.center().y - cg.size().y / 2.0), cg, TEXT_DIM);
+                }
 
                 // engine status pill (top-right)
                 let scol = if self.engine_ok { SUCCESS } else { EMBER };
@@ -385,16 +511,207 @@ impl ReynApp {
                 if self.nav == Nav::Metrics {
                     p.text(rect.center_bottom() - Vec2::new(0.0, 22.0), Align2::CENTER_CENTER,
                         "drag to orbit  ·  scroll to zoom  ·  G to regenerate", FontId::proportional(12.5), TEXT_MUTE);
-                } else {
+                } else if self.nav != Nav::Fields2D {
                     let name = match self.nav {
                         Nav::Models => "Model Library", Nav::FlowPainter => "Flow Painter",
-                        Nav::Settings => "Settings", Nav::Metrics => "",
+                        Nav::Settings => "Settings", _ => "",
                     };
                     p.text(rect.center(), Align2::CENTER_CENTER, name, FontId::proportional(22.0), TEXT_DIM);
                     p.text(rect.center() + Vec2::new(0.0, 30.0), Align2::CENTER_CENTER,
                         "wired next — the 3D viewport is live under Metrics (3D)", FontId::proportional(13.0), TEXT_MUTE);
                 }
             });
+    }
+
+    /// Central 2D field render: the AI field (and, under Truth Overlay, the
+    /// solver truth + error) as colormapped images.
+    fn field2d_view(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        self.ensure_f2d_textures(ui.ctx());
+        let p = ui.painter_at(rect);
+        if self.f2d_tex.is_empty() {
+            let t = if self.f2d_pending { "predicting…" } else { "no field" };
+            p.text(rect.center(), Align2::CENTER_CENTER, t, FontId::proportional(15.0), TEXT_MUTE);
+            return;
+        }
+        let pad = 30.0;
+        let avail = Rect::from_min_max(rect.min + Vec2::splat(pad), rect.max - Vec2::new(pad, pad + 22.0));
+        let n = self.f2d_tex.len();
+        let gap = 16.0;
+        let cell_w = (avail.width() - gap * (n as f32 - 1.0)) / n as f32;
+        let side = cell_w.min(avail.height());
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let titles = ["AI prediction", "Solver truth", "|error|"];
+        for (k, tex) in self.f2d_tex.iter().enumerate() {
+            let x0 = avail.min.x + k as f32 * (cell_w + gap) + (cell_w - side) / 2.0;
+            let y0 = avail.min.y + (avail.height() - side) / 2.0;
+            let r = Rect::from_min_size(egui::pos2(x0, y0), Vec2::splat(side));
+            p.image(tex.id(), r, uv, Color32::WHITE);
+            p.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, OUTLINE_VARIANT), egui::StrokeKind::Outside);
+            if n > 1 {
+                p.text(egui::pos2(r.center().x, r.max.y + 12.0), Align2::CENTER_CENTER,
+                    titles[k.min(2)], FontId::proportional(12.0), TEXT_DIM);
+            }
+        }
+        if let Some(f) = self.f2d.as_ref() {
+            let cap = format!("{}  ·  {}  ·  t = {:.2}s ({} steps)",
+                f.scenario, self.f2d_var.label(), f.horizon as f32 * f.dt_frame, f.horizon);
+            p.text(rect.center_bottom() - Vec2::new(0.0, 14.0), Align2::CENTER_CENTER,
+                cap, FontId::proportional(12.5), TEXT_MUTE);
+        }
+    }
+
+    fn controls_2d(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Pressure Recovery (2D)").size(20.0).strong().color(TEXT));
+        ui.add_space(8.0);
+        // model selector — the obstacle-family 2D checkpoints (all work with predict2d)
+        let stem = |m: &str| m.trim_end_matches(".pth").to_string();
+        let models: Vec<String> = self.models.iter().filter(|m| m.starts_with("obstacle")).cloned().collect();
+        let mut pick = self.f2d_model.clone();
+        egui::ComboBox::from_id_salt("f2d.model")
+            .selected_text(RichText::new(stem(&pick)).color(BRAND).size(12.5))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for m in &models {
+                    ui.selectable_value(&mut pick, m.clone(), stem(m));
+                }
+            });
+        if pick != self.f2d_model {
+            self.f2d_model = pick;
+            self.f2d = None;
+            self.f2d_tex.clear();
+            self.f2d_sig = u64::MAX;
+            self.request_2d();
+        }
+        ui.add_space(18.0);
+
+        ui.label(caps("Field Variable"));
+        ui.add_space(8.0);
+        Frame::NONE.fill(SURFACE_HIGH).corner_radius(CornerRadius::same(3))
+            .stroke(Stroke::new(1.0, OUTLINE_VARIANT)).inner_margin(3)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for v in [FieldVar::Velocity, FieldVar::Vorticity, FieldVar::Pressure] {
+                        if seg(ui, v.label(), self.f2d_var == v) { self.f2d_var = v; }
+                    }
+                });
+            });
+
+        ui.add_space(16.0);
+        ui.label(caps("TimeJump"));
+        ui.add_space(8.0);
+        let dt = self.f2d.as_ref().map(|f| f.dt_frame).unwrap_or(0.04);
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Horizon").color(TEXT_DIM));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(mono(&format!("t = {:.2}s · {} steps", self.f2d_horizon as f32 * dt, self.f2d_horizon), EMBER).size(12.0));
+                });
+            });
+            ui.add_space(6.0);
+            ui.spacing_mut().slider_width = ui.available_width() - 8.0;
+            let resp = ui.add(egui::Slider::new(&mut self.f2d_horizon, 1..=32).show_value(false).trailing_fill(true));
+            if resp.changed() { self.request_2d(); }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let (hud, col) = if self.f2d_pending {
+                    ("● predicting…".to_string(), EMBER)
+                } else {
+                    (format!("◌ {} ms", self.f2d_latency_ms), TEXT_MUTE)
+                };
+                ui.label(mono(&hud, col).size(11.0));
+                if self.f2d_horizon > 16 {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(mono("beyond trained horizon", GOLD).size(11.0));
+                    });
+                }
+            });
+        });
+
+        ui.add_space(16.0);
+        ui.label(caps("Trust Meter"));
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            match self.f2d.as_ref().and_then(|f| f.semigroup) {
+                Some(s) => {
+                    let pct = (1.0 - s).clamp(0.0, 1.0) * 100.0;
+                    let col = if pct >= 98.0 { SUCCESS } else if pct >= 90.0 { GOLD } else { EMBER };
+                    diag(ui, "Self-consistency", &format!("{:.1}%", pct), col);
+                    ui.label(RichText::new("semigroup: predict h  vs  h/2 then h/2").size(10.5).color(TEXT_MUTE));
+                }
+                None => { diag(ui, "Self-consistency", "— (odd h)", TEXT_MUTE); }
+            }
+        });
+
+        ui.add_space(16.0);
+        ui.label(caps("Truth Overlay"));
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            if ui.checkbox(&mut self.f2d_truth, RichText::new("Compare to solver truth").color(TEXT_DIM)).changed() {
+                self.request_2d();
+            }
+            if self.f2d_truth {
+                if let Some((rel, per)) = self.f2d.as_ref().and_then(|f| f.rel_l2.zip(f.persist)) {
+                    ui.add_space(6.0);
+                    diag(ui, "RelL2 vs truth", &format!("{:.4}", rel), if rel < per { SUCCESS } else { EMBER });
+                    diag(ui, "Persistence floor", &format!("{:.4}", per), TEXT_DIM);
+                    let x = per / rel.max(1e-6);
+                    diag(ui, "Beats persistence", &format!("{:.1}×", x), if x > 1.0 { SUCCESS } else { EMBER });
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+        ui.label(caps("Pressure Recovery"));
+        ui.add_space(8.0);
+        let mut recompute = false;
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if seg(ui, "Spectral", self.f2d_method == PMethod::Spectral) && self.f2d_method != PMethod::Spectral {
+                    self.f2d_method = PMethod::Spectral; recompute = true;
+                }
+                if seg(ui, "FD (iterative)", self.f2d_method == PMethod::Fd) && self.f2d_method != PMethod::Fd {
+                    self.f2d_method = PMethod::Fd; recompute = true;
+                }
+            });
+            if self.f2d_method == PMethod::Fd {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Tolerance").color(TEXT_DIM).size(12.5));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(mono(&format!("1e-{}", self.f2d_tol_exp), EMBER).size(12.0));
+                    });
+                });
+                ui.spacing_mut().slider_width = ui.available_width() - 8.0;
+                if ui.add(egui::Slider::new(&mut self.f2d_tol_exp, 2..=8).show_value(false).trailing_fill(true)).changed() {
+                    recompute = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if seg(ui, "Periodic", self.f2d_boundary == PBoundary::Periodic) && self.f2d_boundary != PBoundary::Periodic {
+                        self.f2d_boundary = PBoundary::Periodic; recompute = true;
+                    }
+                    if seg(ui, "Dirichlet", self.f2d_boundary == PBoundary::Dirichlet) && self.f2d_boundary != PBoundary::Dirichlet {
+                        self.f2d_boundary = PBoundary::Dirichlet; recompute = true;
+                    }
+                });
+            }
+            ui.add_space(10.0);
+            if action_button(ui, None, "RECOMPUTE PRESSURE", SURFACE_HIGH, TEXT, Some(OUTLINE), 32.0, ui.available_width()) {
+                recompute = true;
+            }
+            if let Some(f) = self.f2d.as_ref() {
+                ui.add_space(10.0);
+                let good = f.p_residual < 1e-3;
+                diag(ui, &format!("Recovery error · {}", f.p_method), &format!("{:.1e}", f.p_residual),
+                    if good { SUCCESS } else { GOLD });
+                if f.p_iters > 0 { diag(ui, "CG iterations", &format!("{}", f.p_iters), TEXT_DIM); }
+                diag(ui, "Peak / Low", &format!("{:.2} / {:.2}", f.peak_p, f.low_p), BRAND);
+            }
+        });
+        if recompute { self.request_2d(); }
     }
 }
 

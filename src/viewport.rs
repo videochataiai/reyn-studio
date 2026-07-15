@@ -1,9 +1,13 @@
-//! Interactive 3D flow viewport (egui painter projection). Mouse-drag orbits,
-//! scroll zooms, and every 3D control (opacity, density, slice, streamlines)
-//! drives the render. GPU-bloom upgrade (Bevy/wgpu) is a later swap; this works now.
+//! Interactive 3D flow viewport. Mouse-drag orbits, scroll zooms, and every 3D
+//! control (opacity, density, slice, streamlines) drives the render. The
+//! particles are projected here on the CPU, then handed to the native wgpu
+//! bloom renderer (`gpu.rs`, N2) which lights the vortex cores with a real HDR
+//! + bloom pass. A CPU halo+core fallback keeps the viewport working if wgpu is
+//! ever unavailable.
 use crate::flow::Particle;
+use crate::gpu::{self, GpuInstance, SegInstance};
 use crate::theme::*;
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke};
 
 pub struct Camera { pub yaw: f32, pub pitch: f32, pub dist: f32 }
 impl Default for Camera {
@@ -13,24 +17,36 @@ impl Default for Camera {
 pub struct ViewOpts {
     pub opacity: f32,
     pub density_lo: f32,
+    pub density_hi: f32,
     pub slice: [Option<f32>; 3], // clip plane per axis when enabled
     pub streamlines: bool,
     pub shadows: bool,
     pub mode2d: bool,
+    pub gpu: bool, // route particles through the native wgpu bloom pass
+    pub volume_mode: bool, // GPU volume raymarch instead of point sprites
+    pub volume: Option<gpu::VolumeData>, // the |ω| scalar field for the raymarch
 }
 
-fn colormap(vort: f32, alpha: f32) -> Color32 {
-    // blue (neg) -> dark -> ember -> gold (pos)
+/// blue (neg) -> dark -> ember -> gold (pos), returned as linear-ish rgb 0..1.
+fn colormap_rgb(vort: f32) -> [f32; 3] {
     let t = vort.clamp(-1.0, 1.0);
-    let (r, g, b) = if t < 0.0 {
-        let k = -t; // 0..1
-        (0.10 + 0.44 * (1.0 - k), 0.40 + 0.4 * (1.0 - k), 0.55 + 0.45 * k)
+    if t < 0.0 {
+        let k = -t;
+        [0.10 + 0.44 * (1.0 - k), 0.40 + 0.4 * (1.0 - k), 0.55 + 0.45 * k]
     } else {
-        // dark ember -> ember -> gold
-        (0.55 + 0.42 * t, 0.28 + 0.18 * t, 0.05 + 0.02 * t)
-    };
-    Color32::from_rgba_unmultiplied((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8,
-        (alpha.clamp(0.0, 1.0) * 255.0) as u8)
+        [0.55 + 0.42 * t, 0.28 + 0.18 * t, 0.05 + 0.02 * t]
+    }
+}
+
+/// A projected particle carrying everything both the GPU and CPU paths need.
+struct Proj {
+    screen: Pos2,
+    ndc: [f32; 2],
+    depth: f32,
+    r_pts: f32,
+    base: [f32; 3],
+    weight: f32,
+    gain: f32,
 }
 
 pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, particles: &[Particle]) {
@@ -45,6 +61,24 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, pa
         if sc != 0.0 { cam.dist = (cam.dist * (1.0 - sc * 0.0018)).clamp(2.4, 9.5); }
     }
 
+    // Volume raymarch mode: hand the whole 3D field to the GPU and return. The
+    // orbit camera becomes a ray origin looking at the domain origin.
+    if opts.gpu && opts.volume_mode && !opts.mode2d {
+        let eye = [
+            cam.dist * cam.pitch.cos() * cam.yaw.sin(),
+            cam.dist * cam.pitch.sin(),
+            cam.dist * cam.pitch.cos() * cam.yaw.cos(),
+        ];
+        let slice_c = [
+            opts.slice[0].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
+            opts.slice[1].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
+            opts.slice[2].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
+        ];
+        gpu::add_volume(ui, rect, eye, 0.55, opts.density_lo, opts.density_hi,
+            slice_c, opts.shadows, opts.volume.clone());
+        return;
+    }
+
     let p = ui.painter_at(rect);
     let center = rect.center();
     let scale = rect.height().min(rect.width()) * 0.44;
@@ -55,7 +89,6 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, pa
     let mode2d = opts.mode2d;
     let project = |v: [f32; 3]| -> (Pos2, f32) {
         if mode2d {
-            // orthographic top-down 2D field (x-y plane), depth from z
             (Pos2::new(center.x + v[0] * scale * zoom, center.y - v[1] * scale * zoom), 1.0 - v[2])
         } else {
             let x = v[0] * cy - v[2] * sy;
@@ -80,8 +113,9 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, pa
         }
     }
 
+    // project + cull + slice-clip every particle once
     let thr = (opts.density_lo - 0.5).max(0.0); // density -> |vort| threshold
-    let mut drawn: Vec<(f32, Pos2, Color32, f32)> = Vec::with_capacity(particles.len());
+    let mut proj: Vec<Proj> = Vec::with_capacity(particles.len());
     for pt in particles {
         if pt.vort.abs() < thr { continue; }
         let mut clipped = false;
@@ -92,51 +126,105 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cam: &mut Camera, opts: &ViewOpts, pa
         }
         if clipped { continue; }
         let (s, depth) = project(pt.pos);
-        if !rect.expand(40.0).contains(s) { continue; }
+        if !rect.expand(60.0).contains(s) { continue; }
         let fade = if mode2d { 1.0 } else { (2.2 / depth).clamp(0.15, 1.0) };
-        // volumetric shadows: darken particles deeper in the volume
         let shadow = if opts.shadows && !mode2d { 0.45 + 0.55 * fade } else { 1.0 };
-        let a = opts.opacity * fade * (0.35 + 0.65 * pt.speed) * shadow;
-        let col = colormap(pt.vort, a);
-        let r = if mode2d { (3.0 * zoom).clamp(1.5, 4.0) } else { (fade * 3.0).clamp(1.2, 3.4) };
-        drawn.push((depth, s, col, r));
-    }
-    drawn.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (_, pos, col, r) in &drawn {
-        // faint halo + bright core = soft glow without GPU blending
-        let halo = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), col.a() / 3);
-        p.circle_filled(*pos, r * 2.1, halo);
-        p.circle_filled(*pos, *r, *col);
+        let weight = opts.opacity * fade * (0.35 + 0.65 * pt.speed) * shadow;
+        let r_pts = if mode2d { (3.0 * zoom).clamp(1.5, 4.0) } else { (fade * 3.0).clamp(1.2, 3.4) };
+        // HDR gain: push the fast, high-vorticity cores above 1.0 so they bloom
+        let hot = (pt.speed * (0.45 + 0.55 * pt.vort.abs())).clamp(0.0, 1.4);
+        let gain = 0.75 + 2.4 * hot;
+        let ndc = [
+            (s.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+            1.0 - (s.y - rect.min.y) / rect.height() * 2.0,
+        ];
+        proj.push(Proj { screen: s, ndc, depth, r_pts, base: colormap_rgb(pt.vort), weight, gain });
     }
 
-    if opts.streamlines {
-        draw_streamlines(&p, &project, particles, cam.dist);
+    if opts.gpu {
+        let ppp = ui.ctx().pixels_per_point();
+        let instances: Vec<GpuInstance> = proj.iter().map(|q| GpuInstance {
+            pos: q.ndc,
+            radius_px: q.r_pts * ppp,
+            weight: q.weight,
+            color: [q.base[0] * q.gain, q.base[1] * q.gain, q.base[2] * q.gain, 1.0],
+        }).collect();
+        let segments = if opts.streamlines {
+            streamline_segments(&project, particles, rect, ppp)
+        } else {
+            Vec::new()
+        };
+        gpu::add_flow(ui, rect, instances, segments);
+    } else {
+        // CPU fallback: depth-sorted faint halo + bright core (soft glow, no GPU)
+        proj.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
+        for q in &proj {
+            let col = Color32::from_rgba_unmultiplied(
+                (q.base[0] * 255.0) as u8, (q.base[1] * 255.0) as u8, (q.base[2] * 255.0) as u8,
+                (q.weight.clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let halo = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), col.a() / 3);
+            p.circle_filled(q.screen, q.r_pts * 2.1, halo);
+            p.circle_filled(q.screen, q.r_pts, col);
+        }
+        if opts.streamlines {
+            for poly in streamline_polys(&project, particles) {
+                p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
+            }
+        }
     }
 }
 
-fn draw_streamlines(
-    p: &egui::Painter,
+/// Project a few streamlines (seeded from strong-vorticity particles, advected
+/// through the ABC field) to screen polylines. Shared by the CPU (egui lines)
+/// and GPU (glowing ribbons) paths.
+fn streamline_polys(
     project: &impl Fn([f32; 3]) -> (Pos2, f32),
     particles: &[Particle],
-    _dist: f32,
-) {
-    // a few streamlines seeded from strong-vorticity particles
+) -> Vec<Vec<Pos2>> {
     let seeds: Vec<[f32; 3]> = particles.iter()
         .filter(|q| q.vort.abs() > 0.6)
         .take(40)
         .map(|q| q.pos)
         .collect();
+    let mut polys = Vec::with_capacity(seeds.len());
     for s in seeds {
         let mut pos = s;
         let mut poly = Vec::with_capacity(24);
         for _ in 0..24 {
             poly.push(project(pos).0);
-            // ABC advection in normalized space
             let (x, y, z) = (pos[0] * std::f32::consts::PI, pos[1] * std::f32::consts::PI, pos[2] * std::f32::consts::PI);
             let v = [(z.sin() + y.cos()), (x.sin() + z.cos()), (y.sin() + x.cos())];
             for k in 0..3 { pos[k] = (pos[k] + v[k] * 0.02).clamp(-1.0, 1.0); }
         }
-        p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
+        polys.push(poly);
     }
-    let _ = Vec2::ZERO;
+    polys
+}
+
+/// The same streamlines as GPU ribbon segments (NDC endpoints, HDR gold so they
+/// bloom into glowing tubes).
+fn streamline_segments(
+    project: &impl Fn([f32; 3]) -> (Pos2, f32),
+    particles: &[Particle],
+    rect: Rect,
+    ppp: f32,
+) -> Vec<SegInstance> {
+    let to_ndc = |s: Pos2| [
+        (s.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+        1.0 - (s.y - rect.min.y) / rect.height() * 2.0,
+    ];
+    let mut segs = Vec::new();
+    for poly in streamline_polys(project, particles) {
+        for w in poly.windows(2) {
+            segs.push(SegInstance {
+                p0: to_ndc(w[0]),
+                p1: to_ndc(w[1]),
+                width_px: 1.6 * ppp,
+                _pad: 0.0,
+                color: [1.5, 1.0, 0.35, 1.0], // gold, HDR
+            });
+        }
+    }
+    segs
 }

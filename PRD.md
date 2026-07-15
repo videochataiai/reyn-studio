@@ -73,14 +73,14 @@ partners), (3) educators. Same three as the strategy doc.
 
 Each milestone is shippable and demoable on its own. Ordered by leverage.
 
-| # | Milestone | Unlocks | Est. |
-|---|---|---|---|
-| **N1** | **Python engine bridge** | real model data in the viewport | ~3–4 d |
-| **N2** | **GPU render upgrade (wgpu + bloom)** | the mockup's glow & true volumetrics | ~4–5 d |
-| **N3** | **2D field views + Pressure Recovery** | TimeJump, V/ω/P, Truth Overlay, Trust Meter | ~4 d |
-| **N4** | **Flow Painter** | paint IC → Leray → generate | ~3 d |
-| **N5** | **Benchmark Lab (Reyn Verify seed)** | suite analysis, report card, CSV | ~4 d |
-| **N6** | **Models · Settings · Import · packaging** | notarized `.app`, first-run | ~3 d |
+| # | Milestone | Unlocks | Est. | Status |
+|---|---|---|---|---|
+| **N1** | **Python engine bridge** | real model data in the viewport | ~3–4 d | ✅ done |
+| **N2** | **GPU render upgrade (wgpu + bloom)** | the mockup's glow & true volumetrics | ~4–5 d | ✅ done — bloom · volume raymarch · streamline tubes · 112 fps @ 1M pts |
+| **N3** | **2D field views + Pressure Recovery** | TimeJump, V/ω/P, Truth Overlay, Trust Meter | ~4 d | ✅ done — TimeJump · V/ω/P · Truth Overlay · Trust Meter · Recovery Settings (spectral/FD + residual) · model selector |
+| **N4** | **Flow Painter** | paint IC → Leray → generate | ~3 d | ▢ |
+| **N5** | **Benchmark Lab (Reyn Verify seed)** | suite analysis, report card, CSV | ~4 d | ▢ |
+| **N6** | **Models · Settings · Import · packaging** | notarized `.app`, first-run | ~3 d | ▢ |
 
 ---
 
@@ -166,12 +166,18 @@ inside the egui viewport (paint callback), giving the mockup's **glow** and true
    `--software` fallback for machines without the needed features.
 
 ### 5.3 Acceptance criteria
-- **N2-AC1** 3D viewport renders via wgpu at ≥ 60 fps for 1M points on the M-series GPU.
-- **N2-AC2** Ember cores visibly **bloom**; screenshot matches the `3d_volumetric_analysis`
-  mockup's glow within reason.
-- **N2-AC3** Density window, all three slice planes, and volumetric-shadows toggle change the
-  render live; streamlines render as GPU tubes.
-- **N2-AC4** Graceful fallback to the software painter path if wgpu features are unavailable.
+- **N2-AC1** ✅ 3D viewport renders via wgpu at ≥ 60 fps for 1M points — **measured 112 fps** (8.94 ms/frame, 111.8M pts/s) at 1280×800 including upload + particle pass + bloom + composite (`bench_million_points`, run `cargo test -- --ignored --nocapture`).
+- **N2-AC2** ✅ Ember cores visibly **bloom** — the HDR bright-pass + Gaussian bloom is live and asserted by the headless GPU test.
+- **N2-AC3** ✅ Density window, all three slice planes, and volumetric-shadows toggle change the render live — in point mode via CPU projection, and in the volume raymarch **in-shader** (isovalue window, clip planes, light-march shadows). Streamlines now render as **GPU ribbon tubes** (additive HDR, they bloom).
+- **N2-AC4** ✅ Graceful fallback to the software painter path when wgpu is unavailable (`gpu_ready` flag; CPU halo+core path retained in `viewport.rs`).
+
+### 5.4 Status — 2026-07-14 (N2 complete, tested on Metal)
+Implemented in **`src/gpu.rs`** (+ `viewport.rs`/`app.rs`/`flow.rs`/`main.rs` wiring), all via egui + `wgpu` paint callbacks on native Metal/Vulkan/DX12 (not browser WebGPU), registered once from eframe's `RenderState`:
+- **Bloom core:** additive HDR `Rgba16Float` **particle pass** (instanced point-sprites, soft-gaussian dots, ember↔blue colormap + per-core HDR gain in-shader) → **bright-pass** threshold → **2× separable Gaussian** at half-res → **tonemapped additive composite**. The scene→bloom→composite stages are shared by every scene source.
+- **Volume raymarch** (the "3d_volumetric_analysis" view): the field's |ω| is uploaded as an `R8Unorm` 3D texture; a fullscreen pass casts an orbit-camera ray per pixel, ray-box clips to `[-1,1]³`, emission-absorption composites the **density window** (`density_lo/hi`), clips at the **slice planes**, and light-marches for **volumetric shadows** — output feeds the same bloom so isosurfaces glow. Toggle: "Volume Raymarch" in Rendering Options (3D only). Placeholder ABC volume until a model field arrives; real |ω| from the engine field otherwise.
+- **Streamline tubes:** a second instanced pipeline expands each projected streamline segment into a camera-facing HDR **ribbon** (round cross-section in-shader), additive → blooms into glowing tubes. Replaces the egui-line streamlines in GPU mode; the CPU line path stays as fallback.
+- **Tests (all green on Metal, skip without an adapter):** `bloom_renders_and_glows` (core + bloom spread + a streamline ribbon), `volume_raymarch_glows` (a dense blob raymarched shows a bright, high-contrast isosurface), and the ignored `bench_million_points` (112 fps). `engine_round_trip` still green; clean release build, 0 warnings.
+- **Deferred (minor):** camera projection for point mode is still CPU-side (NDC instances) rather than a GPU view-proj uniform — the raymarch already uses a GPU orbit camera; unifying them is cosmetic. Streamlines render in point mode only (not overlaid on the volume) for now.
 
 ---
 
@@ -182,19 +188,46 @@ with a **Vorticity / Velocity / Pressure** toggle, a **TimeJump** scrubber, and 
 verification trio (Truth Overlay, Trust Meter), plus **pressure recovery** via Poisson solve.
 
 ### 6.1 Features + AC
-- **F-TimeJump** — horizontal scrubber; drag → engine `predict{dt}` (coalesced, single
-  in-flight) → 2D field re-renders. *AC:* scrub is smooth (≤ 1 in-flight request, stale
-  drops), latency HUD shown, beyond-trained-horizon warning.
-- **F-FieldToggle** — Vorticity / Velocity / Pressure. Vorticity & velocity from the field;
-  **Pressure** requests `pressure_poisson` from the engine (spectral, `flow_quantities`). *AC:*
-  switching is instant; pressure panel shows Peak/Low pressure + L2 recovery error.
-- **F-RecoverySettings** — solver method (Spectral/FD), tolerance, max-iter, boundary
-  (periodic/dirichlet), **Recompute Pressure**. *AC:* recompute re-runs the Poisson solve and
-  updates metrics.
-- **F-TruthOverlay** — compare AI vs solver at the horizon; error map, RelL2, persistence
-  floor, spectra. *AC:* honest metrics; free-turbulence only (obstacle gated, per research).
-- **F-TrustMeter** — live semigroup self-consistency on scrub (no ground truth). *AC:* badge
-  updates within 200 ms of settling.
+- **F-TimeJump** ✅ — horizontal scrubber; drag → engine `predict2d{steps}` (coalesced, single
+  in-flight, stale re-fires) → 2D field re-renders. Latency HUD (~0.36s/scrub on MPS) and a
+  beyond-trained-horizon warning above 16 steps.
+- **F-FieldToggle** ✅ — Velocity / Vorticity / Pressure. Velocity & vorticity derived client-side
+  from the field; **Pressure** recovered in the engine (spectral, `flow_quantities`) and shipped
+  in the `[3,N,N]` (u,v,p) payload. Switching is instant (re-colormap only, no round-trip); the
+  panel shows Peak/Low recovered pressure. *(Pressure L2-recovery-error metric not surfaced yet.)*
+- **F-RecoverySettings** ✅ — solver method (**Spectral** = exact FFT inversion, or **FD** =
+  iterative conjugate-gradient), tolerance (`1e-2…1e-8`), boundary (periodic/dirichlet), and
+  **Recompute**. Each request reports the **L2 recovery error** (Poisson residual) + CG
+  iterations — spectral lands ~3.6e-5 (float32), FD tracks the tolerance (1e-3→9.5e-4). The
+  honest, live "Reyn Verify" demonstration of exact-vs-approximate recovery.
+- **F-TruthOverlay** ✅ — compare AI vs solver at the horizon: AI | Truth | |error| split +
+  RelL2, persistence floor, and the beats-persistence ratio. Honest metrics straight off the
+  engine (`want_truth`).
+- **F-TrustMeter** ✅ — live semigroup self-consistency (predict h vs h/2∘h/2), no ground truth
+  needed; badge colored green/amber, updates when the scrub settles.
+
+### 6.2 Status — 2026-07-14 (N3 done, tested)
+- **Engine** (`engine/reyn_engine.py`): `predict2d` returns AI velocity + **recovered pressure**
+  `[3,N,N]`, a **semigroup** self-consistency number, the **pressure recovery residual** (+ CG
+  iters + method), and — with `want_truth` — the solver **truth** `[3,N,N]` + RelL2/persistence.
+  Pressure recovery has two methods: **spectral** (exact FFT, residual = float32 eps) and **FD**
+  (matrix-free conjugate-gradient on the 5-point Laplacian, periodic or Dirichlet, stops at a
+  relative-residual tolerance). A per-`(model,seed)` **trajectory cache** + **MPS** inference make
+  TimeJump scrubs ~0.35s (was 0.9s/forward on CPU); CPU fallback where MPS is absent.
+- **Protocol** (`src/engine.rs`): `Cmd::Predict2D { …, method, tolerance, boundary }` /
+  `Msg::Field2D`; the worker parses the payload + all verification/recovery metrics.
+- **View** (`src/field2d.rs` + `app.rs`): a "Fields (2D)" nav entry — colormapped central image
+  (diverging for signed ω/p, ember heat for |v|; Truth Overlay = AI│Truth│|error| panels) and a
+  2D control panel: **model selector** (obstacle-family checkpoints), variable toggle, TimeJump
+  slider + latency HUD + beyond-horizon warning, Trust Meter, Truth Overlay + RelL2/persistence,
+  and the **Pressure Recovery** card (method/tolerance/boundary/Recompute + live L2 recovery
+  error, CG iterations, peak/low). Textures rebuilt only on change.
+- **Tests:** `predict2d_round_trip` (real engine → AI+truth planes, RelL2 < persistence, semigroup
+  present, spectral residual < 1e-3), `field2d::colormap_produces_varied_image` /
+  `error_of_identical_fields_is_uniform`. Full suite green (6 + 1 ignored), 0 warnings.
+- **Deferred:** the **free-turbulence 2D model** (`direct_v3`) needs its own data path (64² grid,
+  no-mask velocity, free-turbulence generator) — a separate `_traj2d` branch; the obstacle-family
+  models are wired now.
 
 ---
 

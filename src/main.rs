@@ -4,8 +4,10 @@
 
 mod app;
 mod engine;
+mod field2d;
 mod flow;
 mod fonts;
+mod gpu;
 mod icons;
 mod theme;
 mod viewport;
@@ -27,7 +29,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app::ReynApp::default()))
+            Ok(Box::new(app::ReynApp::new(cc)))
         }),
     )
 }
