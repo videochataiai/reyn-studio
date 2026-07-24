@@ -1,348 +1,678 @@
-# Reyn Studio — Native App PRD (continuation)
+# Reyn Studio — Canonical Product Requirements
 
-*Fully-native (Rust · egui · wgpu/Metal) neural-CFD workbench, linked to the PyTorch
-models through a Python engine. This document is the forward plan: where we are, the
-target architecture, and every step to get there. Companion to
-`reyn-research/product/01_PRD_DESKTOP_APP.md` (the retired PySide6 plan).*
+**Status:** canonical implementation contract  
+**Current-state baseline:** 2026-07-23  
+**Applies to:** Reyn Studio native app, Python engine integration, project schema, evidence, packaging, and product UX  
+**Companion evidence:** [`docs/CFD_APP_LANDSCAPE.md`](docs/CFD_APP_LANDSCAPE.md)
 
----
+This document is the product authority for Reyn Studio. It replaces screen-led milestone notes
+as the forward implementation contract while preserving the verified native-track history.
+Detailed vendor comparisons, source links, and the dated bibliography remain in the companion
+landscape report; they are evidence for this PRD, not duplicated requirements.
 
-## 0. Status — what already works (as of commit `97e4e76`)
-
-- **Native shell** (`egui 0.35` + `eframe`, `wgpu` renderer = native Metal): top menu bar
-  with 2D/3D toggle + Live Session, left project rail (Import Model, nav, Voxel
-  Diagnostics), right 3D-controls panel (slicing planes, isosurface density, opacity,
-  shadows, streamlines, export). Themed with the precision-instrument ember palette.
-- **Typography + icons**: bundled **Inter** (UI) + **JetBrains Mono** (data); hand-drawn
-  vector icon set (`icons.rs`) — no icon-font dependency.
-- **Interactive 3D viewport** (`viewport.rs` + `flow.rs`): 6000-particle ABC/Beltrami
-  vortex field, **mouse-orbit + scroll-zoom + `G` regenerate**, depth-sorted halo+core
-  glow. Every control drives it (opacity→alpha, density→|ω| threshold, slice-X→clip,
-  streamlines→integrated lines). **Live** Voxel Diagnostics computed from the field.
-- **Nav switching** works; non-3D views are honest placeholders.
-
-**The seam that matters:** `flow::generate()` produces the field the viewport renders.
-Replacing that procedural field with the Python engine's real predicted field is the
-next milestone (N1) and turns this from a beautiful demo into the actual product.
+Supporting current-state references: [`README.md`](README.md) and [`PRODUCT.md`](PRODUCT.md).
 
 ---
 
-## 1. Product definition
+## 1. Product vision and position
 
-**What it is.** A local-first desktop workbench for 2D/3D incompressible flow with
-pluggable neural flow-map surrogates, that shows its error bars. Native Rust UI + native
-GPU rendering; the trained PyTorch models run in a Python engine the app talks to.
+Reyn Studio is a **local-first neural-CFD scientific instrument** for creating, interrogating,
+comparing, and preserving defensible incompressible-flow predictions. A native Rust/egui/wgpu
+application provides responsive 2D/3D interaction; a Python sidecar runs PyTorch models,
+reference solvers, and scientific derivations behind an engine boundary.
 
-**Why native (recap of the decision).** The models are PyTorch → Python stays the AI
-engine. The *app* is Rust + `wgpu` (native Metal, **not** browser WebGPU) for maximum
-UI/render performance and a small fast binary. Inference sits behind one `Engine` trait,
-so the Python sidecar can later be swapped for a fully-native ONNX/ExecuTorch backend
-with zero UI change.
+Reyn is not a general-purpose replacement for Fluent, STAR-CCM+, COMSOL, SimScale, OpenFOAM, or
+SU2. Its wedge is narrower and more defensible:
 
-**Users.** (1) physics-ML researchers, (2) simulation/V&V team leads (Reyn Verify design
-partners), (3) educators. Same three as the strategy doc.
+- make neural-flow model applicability and limitations legible;
+- put prediction, numerical reference, derivation, provenance, and integrity evidence in one
+  coherent workflow;
+- preserve the exact relationship between source, contract, run, and evidence;
+- remain useful locally and offline, including read-only review when compute dependencies fail.
+
+The product promise is: **a technical user can move from a source or checkpoint to an
+evidence-complete result and explain what produced every important number.**
+
+### 1.1 Product principles
+
+1. **Evidence before spectacle.** Visualization exists to measure, compare, and decide.
+2. **Honest by construction.** Unknown, unsupported, recovered, derived, and independently
+   checked states remain distinct.
+3. **Durable engineering objects.** Screens never substitute for project, case, run, and
+   evidence lineage.
+4. **Fast expert interaction.** The shell stays responsive; long engine work is asynchronous.
+5. **Progressive disclosure.** Broad capability is organized into coherent journeys, not exposed
+   as every possible control at once.
+6. **Local ownership.** Core creation, execution, export, and review require no cloud account.
+
+### 1.2 Non-goals
+
+- Full multiphysics breadth, a universal materials/boundary-condition editor, or arbitrary CFD
+  setup beyond supported model/reference contracts.
+- A full direct or parametric CAD kernel.
+- A universal high-fidelity mesher or solver.
+- In-product model training before independent split lineage, qualification, and applicability
+  evidence are durable.
+- Mandatory cloud storage, collaboration, or remote execution.
+- A black-box confidence score that conflates consistency, verification, validation, and accuracy.
+- Feature-count parity with incumbents or permanent exposure of every expert control.
 
 ---
 
-## 2. Target architecture
+## 2. Audiences and jobs
 
+These segments are confirmed by the existing product definition. They are target users, not yet
+claims of commercial validation.
+
+### 2.1 B2B
+
+**Physics-ML and surrogate-model teams**
+
+- Qualify a checkpoint against an independent protocol and a meaningful baseline.
+- Find failure regimes and the worst seed/horizon/variable without rebuilding analysis scripts.
+- Export reproducible evidence for model release, review, and downstream decisions.
+
+**Simulation, verification, and validation leads**
+
+- Determine whether a prediction is applicable to the declared geometry, regime, and horizon.
+- Separate model output, solver reference, recovered quantities, and derived quantities.
+- Audit source, settings, model, runtime, warnings, lineage, integrity, and signer authenticity.
+
+**Design partners evaluating fast flow prediction**
+
+- Import supported geometry, review preprocessing and model support, run quickly, and inspect
+  engineering-relevant fields and surface behavior.
+- Compare selected surrogate results with reference evidence without treating the surrogate as a
+  general CFD solver.
+
+### 2.2 B2C / individual technical users
+
+**Independent physics-ML researchers**
+
+- Explore checkpoints and initial conditions locally, including confidential or unpublished work.
+- Compare model behavior, reference fields, spectra, pressure recovery, and self-consistency.
+
+**Educators and advanced learners**
+
+- Build intuition with Flow Painter and calibrated 2D/3D views.
+- See the difference between a prediction, numerical reference, derivation, verification,
+  validation, integrity hash, and signature.
+
+Individual use does not mean a simplified toy mode. Defaults should make the first valid path
+clear; contextual inspectors reveal expert depth when the user asks for it.
+
+---
+
+## 3. Premium scientific-instrument direction
+
+The design ambition is award-level product quality, but **premium means disciplined hierarchy,
+interaction quality, precision, and grounded evidence—not luxury decoration**.
+
+### 3.1 Required visual and interaction character
+
+- Warm-dark, low-chrome native workspace; Inter for interface text and JetBrains Mono for
+  measurements, identifiers, timestamps, and tabular data.
+- Tonal surfaces, 1 px separators, 2–4 px radii, restrained spacing, and a clear 40 px layout
+  rhythm. Use hierarchy and negative space before adding containers.
+- Ember marks the next primary action. Gold, blue, green, and red retain consistent scientific
+  or status meanings. Color is never the only carrier of status.
+- Shared calibrated scales, explicit units, source labels, keyboard focus, and numeric values.
+- Motion communicates state or continuity, respects reduced-motion settings, and never delays
+  scientific work.
+- Dense information is acceptable when grouped by task, aligned, comparable, and scannable.
+- Every loading, unavailable, stale, blocked, waived, failed, and read-only state is designed.
+
+### 3.2 Anti-patterns
+
+- **No visible “Support” button** in the persistent app chrome. Documentation, diagnostics,
+  feedback, and contact routes belong under Help/About or a contextual failure state.
+- No cheap generic SaaS chrome: no fake account/avatar, pricing/upgrade furniture, oversized KPI
+  cards, interchangeable card grids, or dashboard filler.
+- No decorative sci-fi: no cyber-blue control room, glassmorphism, blur orbs, ornamental grids,
+  unexplained glow, or animated “AI” decoration.
+- No incumbent ribbon clone, giant universal simulation tree, or app-to-app workflow fragmentation.
+- No feature clutter. “Most features” means the needed capability exists in the right workflow,
+  with safe defaults and progressive disclosure—not that all controls are simultaneously visible.
+- No glow on annotations, evidence states, or text. Render bloom may communicate field intensity
+  in the scientific viewport; it must not imply confidence or validity.
+- No fake users, online state, projects, checksums, signatures, results, or enabled dead controls.
+
+### 3.3 Progressive-disclosure model
+
+1. **Journey level:** start from a project/case intent such as Geometry, Painted IC, or Model
+   qualification.
+2. **Stage level:** show Source → Contract → Discretization → Run → Evidence readiness.
+3. **Task level:** show only controls required for the active stage and supported contract.
+4. **Inspector level:** reveal methods, tolerances, metadata, derivations, and expert diagnostics
+   beside the object they affect.
+5. **Artifact level:** provide the complete manifest and verification details in evidence exports.
+
+Defaults may accelerate setup, but units, transforms, support assumptions, and derivations must
+remain inspectable and consequential confirmations must never be silent.
+
+---
+
+## 4. Current implementation truth
+
+This section is historical grounding, not permission to infer unlisted features.
+
+### 4.1 Verified native-track milestone history
+
+| Milestone | Preserved status | Verified delivered scope | Explicit remainder |
+|---|---|---|---|
+| N1 — Python engine bridge | Done for the product unlock | Rust app spawns and communicates with the Python engine; real model fields can enter the native workflow; engine failure is handled without making the shell unusable. | Current transport is length-prefixed/framed loopback TCP with binary payloads. Shared memory and the original `<20 ms at 128³` transport gate are not complete. |
+| N2 — GPU rendering | Done | Native wgpu particle and volume paths, HDR/bloom, slicing, shadows, streamline tubes, and software fallback. The recorded 1M-point benchmark is 112 fps on the tested Metal setup. | Point/volume camera-path unification and some overlays remain refinements, not release blockers. |
+| N3 — 2D fields and pressure recovery | Done | TimeJump, velocity/vorticity/recovered-pressure views, shared scales, probes, field insights, pressure-recovery methods/residuals, model-vs-reference overlay, persistence baseline, and semigroup consistency. | Free-turbulence `direct_v3` needs its distinct data path; recovered-pressure error is not physical validation. |
+| N4 — Flow Painter | Done | Brush, symmetries, presets, native divergence-free projection, diagnostics, and prediction handoff. | A solver reference for painted ICs remains deferred until viscosity/regime are explicit. |
+| N5.1 — Benchmark suite | Done | Seed × horizon suite, persistence comparison, CSV, and deterministic canonical JSON with SHA-256 integrity. | SHA-256 is not a signature. |
+| N5.2 — coherent evidence slice | Done, milestone still partial | Exact stream classification; legacy provenance findings; selected-cell velocity, vorticity, recovered-pressure, error, and spatial-divergence evidence with source/unit/method metadata and shared calibrated scales (`N5X-INSP-01` passed); energy spectra; legacy, mask-conditioned, and fixed-body-v2 benchmark contracts. Deterministic PNG/PDF reports derive from the same run/model/protocol/hash-linked canonical JSON (`N5X-EXPORT-01` passed). The signing slice now implements detached Ed25519 signatures over the raw canonical-payload SHA-256, explicit key ID/public-key fingerprint/signature bytes/verification state, portable offline CLI verification, revocation-aware trust, deterministic JSON/PNG/PDF sidecar lineage, append-only project evidence, and non-secret provider tests. | `N5X-SIGN-01` remains open until the production macOS Keychain/user-presence path is safely exercised on a supported app build; the canonical report remains explicitly `UNSIGNED` and authenticity lives in its derived sidecar. The overlap analysis is not yet integrated with an archived candidate artifact, so `N5X-VV-01` and `N5X-VV-02` also remain open. |
+| External engineering case | Implementation complete; interactive release smoke pending | The landing action imports STL into **Project → Case Setup → Run → Results → Evidence**. Source bytes/hash, units, topology, transform, voxel adequacy, named waivers, model support, and the operating point gate execution. Results carry physical-reference `Cp`, pressure and viscous fluid traction, integrated force/moment coefficients, velocity/vorticity volume evidence, hotspots, CAD-linked sections, immutable field/scalar evidence, variant lineage, and FEA-load CSV provenance. | This remains managed tessellated import, not embedded/associative CAD. Pressure is recovered from predicted velocity; no structural stress or independent spatial error is shown without a reference. `N5X-CAD-01`–`04`, `N5X-PHYS-01`, and the full first-user path still require an interactive packaged-app smoke before release status is marked passed. |
+| N6 | Partial; release gate open | `N6-MODEL-01`, `N6-MODEL-02`, and `N6-PROJ-01` through `N6-PROJ-07` passed. The case-centered IA candidate and shared-unit parent/current variant comparison are implemented; procedural 3D, Flow Painter, standalone 2D, and Benchmark Lab now remain permanently available behind the persisted Developer-mode Research Sandbox. External engineering field blobs reopen from content-addressed project evidence. | `N6-SET-01` remains open for production Keychain/user-presence exercise. `N6-IA-01` and `N6-COMP-01` remain release candidates until the interactive acceptance path is exercised. Packaging, notarization, clean-machine, and offline gates remain open. |
+
+Closeout verification on 2026-07-24: **89 Rust correctness tests passed** (the explicit GPU
+performance benchmark remains ignored by default), **27 Python engine tests passed**,
+`cargo fmt` completed cleanly, and the optimized release build passed. The Rust suite includes the
+real Python-sidecar CAD round trip, geometry-linked engineering-section extraction/scaling, and
+the persisted-project, immutable-rerun, migration, and navigation gates.
+
+### 4.2 Scientific and technical caveats that must remain explicit
+
+- **CAD:** current capability is STL import plus deterministic model-specific preprocessing. It
+  is neither embedded CAD nor an associative CAD link.
+- **Pressure coefficient:** an external engineering case shows physical-reference
+  \(C_p=(p_{\mathrm{recovered}}-p_\infty)/(0.5\rho_\infty V_\infty^2)\) only after
+  \(p_\infty,\rho_\infty,V_\infty\), units, and transform are recorded. Its pressure source
+  remains recovered from model-predicted velocity, not an independent reference. Legacy sandbox
+  views continue to say recovered pressure rather than `Cp`.
+- **Surface loads:** pressure plus Newtonian viscous traction is integrated over the diffuse
+  immersed interface. These model-derived fluid loads can be exported with run/source provenance
+  for downstream mapping; they are not structural stress or independently validated loads.
+- **Internal/HVAC:** the internal-flow contract is reference-only and execution-blocked until a
+  compatible solver/model implements inlet, outlet, wall, material, and conservation semantics.
+- **Transport:** framed loopback TCP is current. Named shared memory is a planned,
+  benchmark-justified optimization.
+- **Integrity:** a canonical SHA-256 digest detects modification. It does not establish signer
+  identity or authenticity.
+- **Reference language:** a named numerical solver output is a **solver reference**, not
+  automatically physical truth. “Truth Overlay” is a legacy UI label and should become
+  “Reference overlay” unless the source is a documented analytical exact result.
+- **Evidence meanings:** semigroup self-consistency is not accuracy; validation/checkpoint-
+  selection data is not independent test data; exact RNG-stream non-collision is not field-space
+  non-overlap; recovered pressure is not an independently measured pressure field.
+
+---
+
+## 5. Canonical product object model
+
+```text
+Project
+├── Source[]
+│   ├── GeometrySource revisions
+│   ├── ModelSource revisions
+│   └── ReferenceSource revisions
+├── Case[]
+│   ├── active source revisions
+│   ├── supported physics/model contract
+│   ├── discretization record
+│   ├── output/view definitions
+│   └── Run[]  (immutable attempts)
+│       └── EvidenceArtifact[]  (immutable or explicitly derived)
+├── BenchmarkProtocol[]
+└── ProjectEvent[]
 ```
-┌──────────────────────────── reyn-studio (Rust) ────────────────────────────┐
-│  ui/            egui panels: top bar, rail, controls, per-view content      │
-│  render/        wgpu render passes (volume/points/isosurface) in egui       │
-│                 paint-callbacks; HDR + bloom post                           │
-│  engine/        Engine trait  +  PythonSidecar backend (spawn, IPC, shmem)  │
-│  domain/        Field, Camera, ModelCard, BenchmarkResult, flow gen         │
-└───────────────────────────────────┬─────────────────────────────────────────┘
-                         control socket (JSON, length-prefixed)
-                         + shared memory ring (zero-copy field arrays)
-┌───────────────────────────────────┴──────── reyn-engine (Python) ───────────┐
-│  loads reyn-research code: contract.py, spectral_solver(_3d), models,        │
-│  obstacle solvers, flow_quantities. Serves: load_model, predict, roll_solver │
-│  paint→leray, pressure_poisson, run_benchmark. Emits fields into shmem.      │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
 
-**Module plan (Rust, `src/`):** current `app.rs`/`theme.rs`/`fonts.rs`/`icons.rs`/
-`flow.rs`/`viewport.rs` grow into `ui/` (one file per view), `render/` (wgpu), `engine/`
-(IPC), `domain/`. Refactor happens in N2.
+The user-facing shorthand is **Project → Case → immutable Run → Evidence**.
 
----
+- **Project:** portable container for sources, cases, protocols, events, and evidence links.
+- **Case:** reusable intent and supported setup. Editing a case creates a new revision and marks
+  dependent stages stale; it does not rewrite completed runs.
+- **Run:** immutable execution attempt containing exact inputs, versions, device, outputs, logs,
+  warnings, stop reason, and parent lineage.
+- **Evidence:** content-addressed comparison, report, field, scalar, derivation, integrity, or
+  signature artifact linked to the run(s) that produced it.
 
-## 3. Milestones (native track: N1–N6)
+Minimum manifest fields:
 
-Each milestone is shippable and demoable on its own. Ordered by leverage.
+- stable IDs; schema version; UTC creation, modification, and run timestamps;
+- source filename/URI hint, byte size, SHA-256, import time, units, frame, revision, and exact
+  transform;
+- app, engine, model, solver, and converter names, versions, and hashes;
+- exact contract, settings, seeds, device, parent revision/run, runtime, and stop reason;
+- warnings, waivers, missing dependencies, derivation method/version, and output hashes;
+- integrity digest and, when present, a distinct authenticity signature record.
 
-| # | Milestone | Unlocks | Est. | Status |
-|---|---|---|---|---|
-| **N1** | **Python engine bridge** | real model data in the viewport | ~3–4 d | ✅ done |
-| **N2** | **GPU render upgrade (wgpu + bloom)** | the mockup's glow & true volumetrics | ~4–5 d | ✅ done — bloom · volume raymarch · streamline tubes · 112 fps @ 1M pts |
-| **N3** | **2D field views + Pressure Recovery** | TimeJump, V/ω/P, Truth Overlay, Trust Meter | ~4 d | ✅ done — TimeJump · V/ω/P · Truth Overlay · Trust Meter · Recovery Settings (spectral/FD + residual) · model selector |
-| **N4** | **Flow Painter** | paint IC → Leray → generate | ~3 d | ▢ |
-| **N5** | **Benchmark Lab (Reyn Verify seed)** | suite analysis, report card, CSV | ~4 d | ▢ |
-| **N6** | **Models · Settings · Import · packaging** | notarized `.app`, first-run | ~3 d | ▢ |
+Lifecycle states are **Draft, Ready, Running, Complete, Stale, Failed,** and
+**Evidence-locked**. State is calculated from dependencies and evidence, not decorative color.
 
 ---
 
-## 4. N1 — Python engine bridge  *(the unlock)*
+## 6. Primary user journeys
 
-**Goal:** the 3D viewport renders a **real field from a real model**, not the procedural
-ABC field. Load `flow3d_obs_v1.pth` (or `obstacle_v2_shapes` for 2D), predict, stream the
-velocity field into the viewport.
+### J1 — Imported geometry to defensible prediction
 
-### 4.1 IPC contract (spec)
-- **Transport.** Rust spawns `python -m reyn_engine` as a child; a **control channel** on a
-  localhost TCP port (or Unix socket) carries **length-prefixed JSON** requests/responses;
-  **bulk field arrays** go through a **named shared-memory segment** (`multiprocessing.shared_memory`
-  on Python, `memmap`/`shared_memory` crate on Rust) — zero-copy.
-- **Handshake.** On spawn: engine prints `READY {port, shmem_name, shmem_bytes}` on stdout;
-  Rust connects. Heartbeat every 2 s; if 3 missed → mark engine "disconnected", banner in UI.
-- **Requests** (JSON): `list_models`, `load_model{path}`, `predict{model_id, dt, ic_id}`,
-  `roll_solver{steps, scenario, nu, ...}`, `regen_ic{seed, scenario}`.
-- **Responses.** Small metadata in JSON (`{shape:[C,D,H,W], dtype, offset, valid_report}`);
-  the array itself already written to the shmem segment at `offset`. Rust reads the slice,
-  uploads to the GPU.
-- **Errors.** Every response is `{ok:true,...}` or `{ok:false, error}`; Rust surfaces
-  `error` as a toast; never panics on engine failure (the app must stay usable with the
-  engine down — "solver/AI unavailable" state).
+Create/open project → **New External-Flow Analysis / Import Geometry** → review source/hash, units,
+defects, transform, voxel adequacy, and model support → set the operating point → confirm the
+locked contract → create an immutable run → inspect applicability, `Cp`, fluid loads,
+force/moment coefficients, hotspots, wake indicators, and source-labeled 3D/2D evidence → compare
+a parented variant or export mapped FEA loads and run-linked evidence.
 
-### 4.2 Steps
-1. `reyn-engine/` package in the app repo (or a subdir of reyn-research). `pyproject` pins
-   torch + the reyn-research modules (path dep). Entry `__main__.py`.
-2. Implement the server: stdin/stdout handshake, JSON control loop, one shmem ring buffer
-   (double-buffered so a new frame can write while Rust reads the last).
-3. `load_model` → `contract.EddyCheckpointAdapter`; return the validation report (green/amber).
-4. `predict`/`roll_solver` → write the `[C,D,H,W]` (3D) or `[C,H,W]` (2D) field into shmem.
-5. Rust `engine/mod.rs`: `trait Engine { fn load_model; fn predict; fn latest_field; }` +
-   `PythonSidecar` impl (spawn, connect, shmem map, request/response, heartbeat).
-6. Rust `domain/field.rs`: `Field { channels, dims, data: Vec<f32> }`; convert engine field →
-   particles/voxels for the viewport (sample the field, compute |ω| for color).
-7. Wire: `Import Model` button → file dialog (`rfd` crate) → `load_model`; Model Card dialog
-   shows the validation report (reuse the green/amber provenance logic).
-8. Replace `flow::generate` call in `app.rs` with `engine.latest_field()` when a model is
-   loaded; keep procedural fallback when the engine is down.
+**Success:** another user can inspect every transformation and assumption, reproduce into a new
+run when dependencies exist, or understand precisely why reproduction is unavailable.
 
-### 4.3 Acceptance criteria
-- **N1-AC1** Launch app → engine spawns → `list_models` populates the Models view within 2 s.
-- **N1-AC2** Load `flow3d_obs_v1.pth` → viewport shows the **model's** vortex field; the Model
-  Card shows the validation status (amber for the current one). Voxel Diagnostics reflect it.
-- **N1-AC3** Kill the Python process manually → app shows a "engine disconnected" banner and
-  stays interactive (procedural field), reconnects when relaunched. No crash.
-- **N1-AC4** A 128³ field crosses the boundary in < 20 ms (shared-memory, measured).
+### J2 — Qualify a neural flow model
+
+Import checkpoint → structured validation → model card → choose independent benchmark protocol →
+run suite → inspect worst cell/variable, field-space provenance, divergence, and spectra → lock
+report → optionally sign with an organization key.
+
+**Success:** every CLEAN/FLAGGED/UNKNOWN statement names the exact check; checkpoint-selection
+data is never presented as independent test evidence.
+
+### J3 — Developer Research Sandbox
+
+Enable **Settings → Developer → Research Sandbox** → use procedural 3D, Flow Painter, standalone
+2D fields, or Benchmark Lab → keep every sandbox output visibly separate from engineering case
+results and evidence.
+
+**Success:** “no independent reference” stays visible; adding a reference creates linked evidence
+or a new run and never rewrites the original prediction.
+
+### J4 — Compare a small design family
+
+Create case variant or geometry revision → change only declared inputs → review inherited/stale
+stages → run bounded variants → compare quantities, error/consistency, runtime, and applicability
+on shared scales → open any aggregate point as its immutable run.
+
+### J5 — Review or reproduce evidence
+
+Open portable project/evidence bundle → verify schema, hashes, optional signature, and dependency
+status → inspect read-only if dependencies are missing → rerun into a new immutable run when
+available → compare against declared tolerances.
 
 ---
 
-## 5. N2 — GPU render upgrade (wgpu + bloom)
+## 7. Information architecture
 
-**Goal:** replace the egui-painter particle projection with a **native `wgpu` render pass**
-inside the egui viewport (paint callback), giving the mockup's **glow** and true volumetrics.
+The release-defining path is **Project → Case Setup → Run → Results → Evidence**:
 
-### 5.1 Design decisions
-- **egui + wgpu paint callback** (the confirmed pattern): render the 3D scene to an offscreen
-  **HDR** texture in `CallbackTrait::prepare`, composite into the panel in `paint`.
-- **Two render modes** (matches the mockup's controls):
-  - **Instanced points** (default): the field's high-|ω| samples as GPU point-sprites,
-    additive-blended, colored by the ember↔blue map. Handles millions.
-  - **Volume raymarch** (isosurface density): a 3D texture of |ω| (or Q-criterion),
-    raymarched with the Density range as the isovalue window; slicing planes = clip in the
-    shader; volumetric shadows = a second light-march.
-- **Bloom**: HDR target → bright-pass threshold → separable Gaussian blur → additive
-  composite. This is the single biggest "AAA look" lever (the ember cores glow).
-- Camera/orbit already exists → port to a view-projection matrix uniform.
-- *Alternative considered:* full **Bevy** engine via `bevy_egui`. Decision: stay with raw
-  `wgpu` in egui first (lighter, we control the pipeline); revisit Bevy only if we need its
-  ECS/asset pipeline. Documented so we don't relitigate.
+- **Project** — local/recent projects, recovery, portable bundles, and the first visible
+  **New External-Flow Analysis / Import Geometry** action.
+- **Case Setup** — Source, Preflight, Contract, Discretization, model support, waivers, and
+  operating point. Unsupported values cannot run.
+- **Results** — applicability first, then forces/moments and critical load/suction regions, then
+  geometry-linked 3D and section evidence.
+- **Evidence** — exact source/case/run/model lineage, methods, warnings, immutable field/scalar
+  artifacts, comparison links, and FEA export.
+- **Model Library** and **Settings** remain contextual product destinations.
 
-### 5.2 Steps
-1. `render/gpu.rs`: wgpu device from eframe's `RenderState`; HDR `Rgba16Float` offscreen target.
-2. Point pipeline (WGSL): instanced quads, additive blend, size attenuation, ember colormap
-   in-shader. Feed positions from the engine field (GPU buffer, updated when the field changes).
-3. Camera uniform (view-proj from `viewport::Camera`); orbit/zoom already wired.
-4. Volume pipeline (WGSL): upload |ω| as a `3d` texture; fragment raymarch with isovalue
-   window (Density), slice planes, optional shadow march.
-5. Bloom post: threshold + two-pass blur + composite passes.
-6. egui `Callback` that runs prepare/paint; the panel becomes the composited texture.
-7. Toggle: points ↔ volume driven by the existing controls; keep the painter path as a
-   `--software` fallback for machines without the needed features.
-
-### 5.3 Acceptance criteria
-- **N2-AC1** ✅ 3D viewport renders via wgpu at ≥ 60 fps for 1M points — **measured 112 fps** (8.94 ms/frame, 111.8M pts/s) at 1280×800 including upload + particle pass + bloom + composite (`bench_million_points`, run `cargo test -- --ignored --nocapture`).
-- **N2-AC2** ✅ Ember cores visibly **bloom** — the HDR bright-pass + Gaussian bloom is live and asserted by the headless GPU test.
-- **N2-AC3** ✅ Density window, all three slice planes, and volumetric-shadows toggle change the render live — in point mode via CPU projection, and in the volume raymarch **in-shader** (isovalue window, clip planes, light-march shadows). Streamlines now render as **GPU ribbon tubes** (additive HDR, they bloom).
-- **N2-AC4** ✅ Graceful fallback to the software painter path when wgpu is unavailable (`gpu_ready` flag; CPU halo+core path retained in `viewport.rs`).
-
-### 5.4 Status — 2026-07-14 (N2 complete, tested on Metal)
-Implemented in **`src/gpu.rs`** (+ `viewport.rs`/`app.rs`/`flow.rs`/`main.rs` wiring), all via egui + `wgpu` paint callbacks on native Metal/Vulkan/DX12 (not browser WebGPU), registered once from eframe's `RenderState`:
-- **Bloom core:** additive HDR `Rgba16Float` **particle pass** (instanced point-sprites, soft-gaussian dots, ember↔blue colormap + per-core HDR gain in-shader) → **bright-pass** threshold → **2× separable Gaussian** at half-res → **tonemapped additive composite**. The scene→bloom→composite stages are shared by every scene source.
-- **Volume raymarch** (the "3d_volumetric_analysis" view): the field's |ω| is uploaded as an `R8Unorm` 3D texture; a fullscreen pass casts an orbit-camera ray per pixel, ray-box clips to `[-1,1]³`, emission-absorption composites the **density window** (`density_lo/hi`), clips at the **slice planes**, and light-marches for **volumetric shadows** — output feeds the same bloom so isosurfaces glow. Toggle: "Volume Raymarch" in Rendering Options (3D only). Placeholder ABC volume until a model field arrives; real |ω| from the engine field otherwise.
-- **Streamline tubes:** a second instanced pipeline expands each projected streamline segment into a camera-facing HDR **ribbon** (round cross-section in-shader), additive → blooms into glowing tubes. Replaces the egui-line streamlines in GPU mode; the CPU line path stays as fallback.
-- **Tests (all green on Metal, skip without an adapter):** `bloom_renders_and_glows` (core + bloom spread + a streamline ribbon), `volume_raymarch_glows` (a dense blob raymarched shows a bright, high-contrast isosurface), and the ignored `bench_million_points` (112 fps). `engine_round_trip` still green; clean release build, 0 warnings.
-- **Deferred (minor):** camera projection for point mode is still CPU-side (NDC instances) rather than a GPU view-proj uniform — the raymarch already uses a GPU orbit camera; unifying them is cosmetic. Streamlines render in point mode only (not overlaid on the volume) for now.
+Procedural 3D, Flow Painter, standalone Fields (2D), and Benchmark Lab are not primary product
+destinations. They remain permanently available through **Settings → Developer → Enable Research
+Sandbox**, are hidden by default, and never present their output as an engineering case result.
+“Project Alpha,” “Live Session,” disconnected “Metrics (3D),” and disconnected “Fields (2D)”
+labels are absent from the default workflow.
 
 ---
 
-## 6. N3 — 2D field views + Pressure Recovery
+## 8. CAD taxonomy and staged strategy
 
-**Goal:** the 2D side of the workbench (the `pressure_recovery_view` mockup) — a field view
-with a **Vorticity / Velocity / Pressure** toggle, a **TimeJump** scrubber, and the
-verification trio (Truth Overlay, Trust Meter), plus **pressure recovery** via Poisson solve.
+### 8.1 Exact taxonomy
 
-### 6.1 Features + AC
-- **F-TimeJump** ✅ — horizontal scrubber; drag → engine `predict2d{steps}` (coalesced, single
-  in-flight, stale re-fires) → 2D field re-renders. Latency HUD (~0.36s/scrub on MPS) and a
-  beyond-trained-horizon warning above 16 steps.
-- **F-FieldToggle** ✅ — Velocity / Vorticity / Pressure. Velocity & vorticity derived client-side
-  from the field; **Pressure** recovered in the engine (spectral, `flow_quantities`) and shipped
-  in the `[3,N,N]` (u,v,p) payload. Switching is instant (re-colormap only, no round-trip); the
-  panel shows Peak/Low recovered pressure. *(Pressure L2-recovery-error metric not surfaced yet.)*
-- **F-RecoverySettings** ✅ — solver method (**Spectral** = exact FFT inversion, or **FD** =
-  iterative conjugate-gradient), tolerance (`1e-2…1e-8`), boundary (periodic/dirichlet), and
-  **Recompute**. Each request reports the **L2 recovery error** (Poisson residual) + CG
-  iterations — spectral lands ~3.6e-5 (float32), FD tracks the tolerance (1e-3→9.5e-4). The
-  honest, live "Reyn Verify" demonstration of exact-vs-approximate recovery.
-- **F-TruthOverlay** ✅ — compare AI vs solver at the horizon: AI | Truth | |error| split +
-  RelL2, persistence floor, and the beats-persistence ratio. Honest metrics straight off the
-  engine (`want_truth`).
-- **F-TrustMeter** ✅ — live semigroup self-consistency (predict h vs h/2∘h/2), no ground truth
-  needed; badge colored green/amber, updates when the scrub settles.
+| Term | Exact product promise |
+|---|---|
+| Embedded CAD | Geometry authoring/editing lives in Reyn and participates in its dependency graph. Reyn does not have this. |
+| Associative CAD link | Reyn retains identity to an external CAD document/revision and maps downstream assignments across changes. Reyn does not have this. |
+| Managed import/reimport | A source is copied/identified, transforms and immutable revisions are recorded, and a new import creates explicit lineage. Implemented for STL revisions; associative mapping across CAD topology changes is not. |
+| Geometry preprocessing | Analysis-specific diagnostics, repair/defeaturing, scaling, placement, tessellation, or voxelization. Reyn owns a bounded STL diagnostic/transform/voxel path and does not silently repair source geometry. |
+| Mesh-only/tessellated ingestion | Analysis begins from a surface/volume mesh created elsewhere. Current STL import is on this rung. |
 
-### 6.2 Status — 2026-07-14 (N3 done, tested)
-- **Engine** (`engine/reyn_engine.py`): `predict2d` returns AI velocity + **recovered pressure**
-  `[3,N,N]`, a **semigroup** self-consistency number, the **pressure recovery residual** (+ CG
-  iters + method), and — with `want_truth` — the solver **truth** `[3,N,N]` + RelL2/persistence.
-  Pressure recovery has two methods: **spectral** (exact FFT, residual = float32 eps) and **FD**
-  (matrix-free conjugate-gradient on the 5-point Laplacian, periodic or Dirichlet, stops at a
-  relative-residual tolerance). A per-`(model,seed)` **trajectory cache** + **MPS** inference make
-  TimeJump scrubs ~0.35s (was 0.9s/forward on CPU); CPU fallback where MPS is absent.
-- **Protocol** (`src/engine.rs`): `Cmd::Predict2D { …, method, tolerance, boundary }` /
-  `Msg::Field2D`; the worker parses the payload + all verification/recovery metrics.
-- **View** (`src/field2d.rs` + `app.rs`): a "Fields (2D)" nav entry — colormapped central image
-  (diverging for signed ω/p, ember heat for |v|; Truth Overlay = AI│Truth│|error| panels) and a
-  2D control panel: **model selector** (obstacle-family checkpoints), variable toggle, TimeJump
-  slider + latency HUD + beyond-horizon warning, Trust Meter, Truth Overlay + RelL2/persistence,
-  and the **Pressure Recovery** card (method/tolerance/boundary/Recompute + live L2 recovery
-  error, CG iterations, peak/low). Textures rebuilt only on change.
-- **Tests:** `predict2d_round_trip` (real engine → AI+truth planes, RelL2 < persistence, semigroup
-  present, spectral residual < 1e-3), `field2d::colormap_produces_varied_image` /
-  `error_of_identical_fields_is_uniform`. Full suite green (6 + 1 ignored), 0 warnings.
-- **Deferred:** the **free-turbulence 2D model** (`direct_v3`) needs its own data path (64² grid,
-  no-mask velocity, free-turbulence generator) — a separate `_traj2d` branch; the obstacle-family
-  models are wired now.
+### 8.2 Capability ladder
 
----
+**Stage 0 — current: tessellated import**
 
-## 7. N4 — Flow Painter
+- Retain STL parsing and deterministic model-specific voxelization.
+- Label it “STL import and preprocessing”; never “embedded CAD” or “associative CAD.”
 
-**Goal:** the `flow_painter` mockup — paint an initial vorticity field, project it
-divergence-free, generate a flow.
+**Stage 1 — N5.4: source-aware import and preflight — release candidate**
 
-### 7.1 Features + AC
-- **Brush** (radius, strength), left/right drag = +/− vorticity; live 2D field texture. *AC:*
-  paint is smooth at 60 fps; field updates under the cursor.
-- **Presets** — Vortex Pair, Shear Layer, Kármán Street stamp analytic fields. *AC:* each
-  stamps the documented structure.
-- **Symmetries** — horizontal/vertical/radial (fold count, center) mirror strokes live. *AC:*
-  toggling radial fold=4 produces 4-fold symmetric painting.
-- **Apply Leray Projection** — engine `paint→leray` makes it divergence-free. *AC:* Divergence
-  Check reads < 1e-12 after projection; live Total Energy / Mean Enstrophy diagnostics.
-- **Generate Flow** — commit the IC → set as the viewport's field / hand to a model. *AC:* the
-  painted IC becomes the active field in the 2D/3D view.
+- Source hash, units, frame, extents, transform preview/approval, revision, and run manifest.
+- Watertight/open/non-manifold/degenerate/component/normal diagnostics.
+- Solid fraction, boundary clearance, disconnected voxel components, cells across critical
+  thickness, target grid, and model-support checks.
+- Explicit warnings/waivers and source-aware reimport diff; no silent geometry mutation.
+
+**Stage 2 — post-N6: neutral B-rep translation — integrate**
+
+- Isolated Open CASCADE or commercial CAD SDK adapter for STEP/IGES/native translation, healing,
+  and tessellation.
+- Record translator/version/options, repair log, tolerances, tessellation settings, and output
+  hashes. Converter topology IDs cannot be the sole evidence identity.
+
+**Stage 3 — optional: source-aware CAD connector — integrate**
+
+- Pilot Onshape only with design-partner demand.
+- Pin document/version/microversion/element/configuration IDs; refresh explicitly; preserve a
+  local cached revision and mapping report.
+
+**Stage 4 — embedded editing — do not build under this PRD**
+
+Revisit only if repeated customer evidence makes geometry editing a top-three blocker and proves
+that neutral import/prep plus connectors are insufficient.
+
+Build and own the evidence boundary. Integrate translation and external reference solvers. Do not
+build a general CAD kernel, universal mesher, or universal high-fidelity solver.
+
+### 8.3 Internal/HVAC follow-on contract
+
+Internal flow is a separate product case kind after the external-flow release gate. Its contract
+must record inlet/outlet/wall assignments, fluid properties, mass-flow or pressure-drop targets,
+comfort/contaminant outputs, and an external solver-reference strategy. The current external
+fixed-body surrogate must reject this contract. Setup and evidence shells may be implemented
+before a qualified internal model, but surrogate execution stays blocked until model support,
+reference validation, and internal-flow acceptance criteria exist.
+
+The versioned reference-only schema is `internal_flow.reference_only.v1`. It carries named and
+stable region IDs; typed velocity/mass-flow/pressure/wall conditions; density, viscosity,
+temperature, and optional scalar diffusivity; pressure-drop pairs and mass-balance tolerance;
+comfort/contaminant quantity requests; and solver/configuration/mesh reference identity. The
+execution gate additionally requires a distinct compatible model ID and a qualified reference
+state. Empty future UI shells or the external-model ID can never clear that gate.
 
 ---
 
-## 8. N5 — Benchmark Lab  *(the Reyn Verify seed — Strategy v2 R2)*
+## 9. Prioritized implementation requirements
 
-**Goal:** the `benchmark_lab` mockup — a **Model Suite Analysis** that runs a model across
-seeds × horizons, does leak/provenance analysis, and emits a **signed report card**. This is
-the architectural seed of the enterprise product; keep it a headless-capable core.
+Priority meanings: **P0** blocks the named phase/release; **P1** is the next coherent capability;
+**P2** is post-v1. “Depends on” lists requirement IDs; `—` means no feature dependency.
 
-### 8.1 Features + AC
-- **Run Full Suite** — engine `run_benchmark{model, seeds, horizons}` → the RelL2
-  seed×horizon table (color-coded Excellent/Nominal/Warning/High-error). *AC:* table matches a
-  known-good run of `obstacle_eval`/`eval_3d`; status/runtime/global-RelL2 header.
-- **Leak & Provenance** — min seed-distance (L2), trajectory overlap %, spectral consistency,
-  protocol → CLEAN/flagged badge. *AC:* reproduces the seed-leak detector's verdict.
-- **Cell Inspector** — Split / Error-Map / Divergence of a chosen (seed, t, variable);
-  model-vs-truth panes + **energy spectrum** overlay. *AC:* spectra overlay correctly; error
-  map matches the compare service.
-- **Export CSV** + **signed Report Card** (JSON/PDF, hash-signed evidence artifact). *AC:* the
-  report card is machine-readable and carries a signature (the R2 wedge).
+### 9.1 Product-wide requirements
 
----
+| Requirement ID | Priority | Requirement | Depends on | Acceptance IDs |
+|---|---:|---|---|---|
+| REQ-UX-01 | P0 | Preserve the grounded premium scientific-instrument design and complete state coverage. | — | UX-AC-01 |
+| REQ-UX-02 | P0 | Organize breadth through journeys, lifecycle stages, contextual inspectors, and progressive disclosure. | REQ-UX-01 | UX-AC-02 |
+| REQ-SCI-01 | P0 | Keep prediction, reference, recovered, derived, verification, validation, consistency, provenance, integrity, and authenticity semantics distinct. | — | SCI-AC-01, SCI-AC-02, SCI-AC-03 |
+| REQ-LOCAL-01 | P0 | Core creation, run, export, reopen, and read-only review remain local-first and account-free. | — | LOCAL-AC-01 |
+| REQ-PERF-01 | P0 | Keep UI rendering/input off engine work; coalesce interactive inference and degrade gracefully. | — | PERF-AC-01 |
 
-## 9. N6 — Models · Settings · Import · packaging
+### 9.2 N5.x requirements
 
-- **Models view** — the library (cards with provenance flags), set active, delete. *AC:* mirrors
-  the engine's `list_models`; green/amber cards.
-- **Settings** — the `desktop_settings` mockup: compute device (MPS/CPU), engine path, theme,
-  telemetry off by default. *AC:* device change reloads the engine.
-- **Import Model** — `rfd` file dialog → validate → add to library. *AC:* rejects non-checkpoints
-  with a clear message.
-- **Packaging** — `cargo bundle`/`tauri`-free `.app`; bundle the Python engine (PyInstaller or a
-  pinned venv) inside the `.app`; **codesign + notarize** (needs the $99 Apple Developer account,
-  final step only). First-run downloads bundled model weights. *AC:* a notarized `.app` launches
-  on a clean Mac, engine included, no terminal.
+| Requirement ID | Priority | Requirement | Depends on | Acceptance IDs |
+|---|---:|---|---|---|
+| REQ-N5-EV-01 | P0 | Give every interactive/exported result a stable temporary run identity and complete manifest before N6 persistence. | REQ-SCI-01 | N5X-EV-01 |
+| REQ-N5-EV-02 | P0 | Expose source class and derivation method for every field/scalar. | REQ-SCI-01 | N5X-EV-02 |
+| REQ-N5-VV-01 | P0 | Finish field-space nearest-training-IC and trajectory-overlap analysis with bounded claims. | REQ-N5-EV-01 | N5X-VV-01, N5X-VV-02 |
+| REQ-N5-INSP-01 | P0 | Add variable-specific and spatial-divergence selected-cell inspection. | REQ-N5-EV-02 | N5X-INSP-01 |
+| REQ-N5-EXPORT-01 | P0 | Export portable PNG/PDF evidence from the canonical report data. | REQ-N5-EV-01 | N5X-EXPORT-01 |
+| REQ-N5-SIGN-01 | P0 | Add real organization-key signing without conflating it with SHA-256 integrity. | REQ-N5-EXPORT-01 | N5X-SIGN-01 |
+| REQ-N5-CAD-01 | P0 | Add source-aware CAD preflight, transform approval, adequacy/support gates, and waivers. | REQ-N5-EV-01 | N5X-CAD-01, N5X-CAD-02, N5X-CAD-03, N5X-CAD-04 |
+| REQ-N5-PHYS-01 | P0 | Correct pressure terminology and permit `Cp` only after physical nondimensionalization is recorded. | REQ-N5-EV-02 | N5X-PHYS-01 |
+| REQ-N5-LOAD-01 | P0 | Produce versioned pressure/viscous fluid traction, force/moment integration, hotspots, wake indicators, and mapped FEA-load export with exact reference quantities and lineage. | REQ-N5-CAD-01, REQ-N5-PHYS-01 | N5X-LOAD-01, N5X-LOAD-02, N5X-LOAD-03 |
 
----
+### 9.3 N6 requirements
 
-## 10. Cross-cutting specs
+| Requirement ID | Priority | Requirement | Depends on | Acceptance IDs |
+|---|---:|---|---|---|
+| REQ-N6-MODEL-01 | P0 | Ship a validated Model Library with compatibility, provenance, support envelope, limitations, and report links. | REQ-N5-EV-01 | N6-MODEL-01, N6-MODEL-02 |
+| REQ-N6-SET-01 | P0 | Ship settings for compute/engine, storage, privacy, appearance, and signing-key state. | REQ-N6-MODEL-01 | N6-SET-01 |
+| REQ-N6-PROJ-01 | P0 | Implement New/Open/Save/Save As/recent/autosave/crash recovery around a versioned project. | — | N6-PROJ-01 |
+| REQ-N6-PROJ-02 | P0 | Persist Project → Case → immutable Run → Evidence with calibrated views and lineage. | REQ-N6-PROJ-01, REQ-N5-EV-01 | N6-PROJ-02, N6-PROJ-03, N6-PROJ-04 |
+| REQ-N6-PROJ-03 | P0 | Support precise staleness, evidence locking, missing-dependency read-only review, and portable manifests. | REQ-N6-PROJ-02 | N6-PROJ-05, N6-PROJ-06, N6-PROJ-07 |
+| REQ-N6-COMP-01 | P0 | Compare runs/variants on shared scales and deep-link every point to immutable evidence. | REQ-N6-PROJ-02 | N6-COMP-01 |
+| REQ-N6-IA-01 | P0 | Make the external engineering case the default project path and preserve procedural 2D/3D/Painter/Benchmark workflows behind the persisted Developer Research Sandbox. | REQ-N6-PROJ-02, REQ-UX-02 | N6-IA-01 |
+| REQ-N6-PKG-01 | P0 | Ship a checksummed, codesigned, notarized standalone app with clean-machine and offline review. | REQ-N6-PROJ-03, REQ-N6-MODEL-01, REQ-N6-SET-01 | N6-PKG-01, N6-PKG-02 |
 
-### 10.1 Performance budgets
-- App cold start < 1.5 s to first frame; engine ready < 2 s.
-- 3D viewport ≥ 60 fps at 1M points (N2); field transfer < 20 ms at 128³.
-- TimeJump scrub: ≤ 1 in-flight inference, stale-drop; UI never blocks on the engine.
+### 9.4 Post-N6 requirements
 
-### 10.2 Testing
-- **Rust**: unit tests for engine framing (JSON + shmem round-trip with a mock engine),
-  colormap, camera projection; a smoke test that boots the app headless (offscreen) and asserts
-  no panic. `cargo test` in CI.
-- **Python engine**: pytest for each RPC (load/predict/leray/pressure/benchmark) against the
-  real research checkpoints; assert field shapes + validation reports.
-- **Integration**: a scripted session (load model → predict → benchmark) asserting the field and
-  the report card, run in CI on macOS.
-
-### 10.3 Threading (must-hold rule)
-The egui thread renders and handles input only. The engine client runs on a worker; requests are
-coalesced (single in-flight for scrub/predict); results delivered via a channel. No blocking
-call on the UI thread — ever.
-
-### 10.4 Design contract
-Tokens stay identical to `reyn-site`/DESIGN.md (ember warm-dark, Inter + JetBrains Mono, 2–4px
-radii, 1px borders, 40px grid). Any token change updates both.
+| Requirement ID | Priority | Requirement | Depends on | Acceptance IDs |
+|---|---:|---|---|---|
+| REQ-P-REF-01 | P1 | Add versioned supported case templates and external reference field/curve import. | REQ-N6-PROJ-03 | P-REF-01, P-VV-01 |
+| REQ-P-CAD-01 | P1 | Add source-aware geometry revisions, named regions, and STEP through an isolated translator. | REQ-N5-CAD-01, REQ-N6-PROJ-03 | P-CAD-01, P-CAD-02 |
+| REQ-P-SWEEP-01 | P1 | Add inherited case variants, bounded local sweeps, and immutable aggregate lineage. | REQ-N6-COMP-01 | P-SWEEP-01 |
+| REQ-P-API-01 | P1 | Add headless CLI/API over the same schema and deterministic local execution. | REQ-N6-PROJ-03 | P-API-01 |
+| REQ-P-REMOTE-01 | P2 | Add an optional remote/HPC backend using the same run manifest. | REQ-P-API-01 | P-REMOTE-01 |
+| REQ-P-AI-01 | P2 | Add dataset registry, immutable split lineage, qualification/calibration, and an active-learning candidate loop. | REQ-P-REF-01 | P-AI-01, P-AI-02 |
+| REQ-P-COLLAB-01 | P2 | Add signed evidence sharing before optional sync, comments, or organization policy. | REQ-N5-SIGN-01, REQ-N6-PROJ-03 | P-COLLAB-01 |
+| REQ-P-CONNECT-01 | P2 | Pilot an Onshape source-aware connector only with validated partner demand. | REQ-P-CAD-01 | P-CONNECT-01 |
+| REQ-P-INTERNAL-01 | P1 | Add an internal/HVAC contract with boundary assignments and target quantities, but keep surrogate execution blocked until a distinct qualified internal model and reference suite exist. | REQ-P-REF-01, REQ-N6-PROJ-03 | P-INTERNAL-01 |
 
 ---
 
-## 11. Every-step sequence (the build order, concretely)
+## 10. Acceptance criteria
 
-1. **N1.1** scaffold `reyn-engine` python package + `__main__` handshake.
-2. **N1.2** JSON control loop + shared-memory ring; `list_models`/`load_model`.
-3. **N1.3** Rust `engine::PythonSidecar` (spawn, connect, heartbeat, shmem map).
-4. **N1.4** `predict`/`roll_solver` → field into shmem → Rust `Field` → viewport.
-5. **N1.5** Import Model dialog + Model Card (validation report). *Ship N1.*
-6. **N2.1** wgpu offscreen HDR target + camera uniform in an egui callback.
-7. **N2.2** instanced-point pipeline (WGSL) fed by the engine field.
-8. **N2.3** bloom post (threshold + blur + composite).
-9. **N2.4** volume raymarch pipeline + slicing + shadows; wire to Density/slice controls.
-10. **N2.5** software-painter fallback path. *Ship N2.*
-11. **N3.1** 2D field renderer + Vorticity/Velocity/Pressure toggle.
-12. **N3.2** TimeJump scrubber (coalesced predict) + latency HUD.
-13. **N3.3** pressure Poisson RPC + Recovery Settings + metrics.
-14. **N3.4** Truth Overlay + Trust Meter. *Ship N3.*
-15. **N4.1** paint canvas + brush + live field texture.
-16. **N4.2** presets + symmetries.
-17. **N4.3** Leray projection RPC + diagnostics + Generate. *Ship N4.*
-18. **N5.1** `run_benchmark` RPC + seed×horizon table.
-19. **N5.2** leak/provenance panel + cell inspector + spectra.
-20. **N5.3** CSV + signed report card. *Ship N5.*
-21. **N6.1** Models library + Settings + Import polish.
-22. **N6.2** `.app` bundle + embed engine + codesign/notarize + first-run. *Ship v1.*
+Acceptance IDs are durable. Do not mark a requirement complete because UI exists; its associated
+criteria must pass with evidence from relevant automated and/or clean-machine tests.
+
+### 10.1 Product-wide
+
+- **UX-AC-01:** A design review finds no persistent Support CTA, generic SaaS/account furniture,
+  decorative sci-fi, fake state, dead controls, status-by-color-only, or evidence-obscuring
+  effects; all changed loading/error/stale/read-only states are implemented.
+- **UX-AC-02:** A first-time technical user can complete J1 or J2 from one visible next action;
+  expert metadata and controls remain reachable contextually without showing a universal control
+  wall.
+- **SCI-AC-01:** Every visible result names source class and method; solver references are not
+  labeled physical truth without an analytical/experimental basis.
+- **SCI-AC-02:** Consistency, independent error, numerical verification, validation, provenance,
+  applicability, integrity, and authenticity are distinct fields and statuses.
+- **SCI-AC-03:** Green/CLEAN/pass states state the proposition checked; missing evidence is UNKNOWN,
+  not inferred.
+- **LOCAL-AC-01:** With network disabled and no account, a supported user can open the app, create
+  or open a local project, run available local compute, export evidence, and inspect stored
+  results; missing compute dependencies degrade to explicit read-only status.
+- **PERF-AC-01:** No engine RPC blocks the UI thread; TimeJump-style work has at most one in-flight
+  request with stale-result handling; engine loss leaves navigation and stored evidence usable.
+
+### 10.2 N5.x
+
+- **N5X-EV-01:** Every run/export has a stable run UUID and unsaved-session UUID before N6. It
+  records UTC time, schema, app/engine/model versions and hashes, exact settings/seeds, device,
+  runtime, stop reason, warnings, source/derivation metadata, and artifact digests.
+- **N5X-EV-02:** Every displayed field/scalar exposes MODEL, SOLVER/ANALYTICAL/EXPERIMENTAL
+  REFERENCE, RECOVERED, or DERIVED semantics without opening a report.
+- **N5X-VV-01:** CLEAN says exactly “no collision in checked RNG streams” until field-space and
+  trajectory checks pass; unavailable data returns UNKNOWN.
+- **N5X-VV-02:** Field-space/trajectory checks record algorithm, representation, threshold,
+  candidate set, nearest matches, and reproducible inputs.
+- **N5X-INSP-01:** A selected benchmark cell can switch among supported velocity, vorticity,
+  pressure, error, and spatial-divergence views; shared scales, units, source labels, and scalar
+  summaries match exported evidence.
+- **N5X-EXPORT-01:** PNG and PDF exports are generated from the same canonical report data as JSON,
+  identify run/protocol/model/hash, preserve units/legends/warnings, and verify against golden
+  fixtures without fabricating a signature.
+- **N5X-SIGN-01:** Integrity and authenticity are separate. A signature records algorithm, key ID,
+  signed canonical-payload hash, signature bytes, and verification instructions; absent/revoked
+  keys never produce “signed.”
+- **N5X-CAD-01:** Preflight displays source/hash, declared units, extents, triangle/component and
+  defect counts, proposed transform, target grid, estimated solid voxels, clearance, critical
+  thickness/resolution, and support warnings.
+- **N5X-CAD-02:** Unknown units and auto-fit require confirmation; exact conversion and 4×4
+  transform persist in run/evidence data.
+- **N5X-CAD-03:** Empty voxelization, forbidden boundary contact, disconnected artifacts, or
+  under-resolved critical thickness blocks execution or records a named waiver.
+- **N5X-CAD-04:** The model displays supported grid/channels/geometry/physics/horizon; unsupported
+  inputs cannot receive an unqualified green state.
+- **N5X-PHYS-01:** `Cp` appears only when \(p_\infty,\rho_\infty,V_\infty\) are recorded and
+  \(C_p=(p-p_\infty)/(0.5\rho_\infty V_\infty^2)\) is computed. Otherwise UI and exports say
+  recovered pressure.
+- **N5X-LOAD-01:** The versioned result payload records pressure and viscous fluid traction,
+  area-weighted force/moment coefficients, physical forces/moments, reference quantities, units,
+  normals/integration method, residual indicators, and model applicability.
+- **N5X-LOAD-02:** Constant-pressure and analytical pressure-gradient fixtures verify closed-surface
+  cancellation, sign/direction, translation about the recorded moment origin, and physical
+  \(qA\)/\(qAL\) scaling; malformed or nonphysical contracts fail deterministically.
+- **N5X-LOAD-03:** The Results view exposes load/suction hotspots, wake indicators, CAD-linked 3D
+  and useful 2D sections. FEA CSV contains source/case/run/model IDs, transforms, units, and method
+  on every export and is explicitly labeled fluid loads rather than structural stress.
+
+### 10.3 N6
+
+- **N6-MODEL-01:** Malformed/incompatible checkpoint import leaves the active model unchanged and
+  returns structured validation.
+- **N6-MODEL-02:** Model cards distinguish metadata-backed facts from UNKNOWN legacy fields, show
+  support/limitations, and link benchmark reports by hash.
+- **N6-SET-01:** Compute changes restart/revalidate the engine without blocking the UI; storage,
+  privacy, appearance, and signing-key changes persist; telemetry is off by default.
+- **N6-PROJ-01:** New/Open/Save/Save As/autosave/recovery/recent projects work with the engine
+  unavailable.
+- **N6-PROJ-02:** Reopen restores cases, source/model hashes, immutable run history, calibrated
+  views/scales, warnings, and evidence links.
+- **N6-PROJ-03:** Input changes stale only dependent stages. Completed/locked runs are never
+  mutated.
+- **N6-PROJ-04:** Rerun creates a new ID with parent lineage; deterministic inputs reproduce
+  declared scalar values within documented tolerance or expose the difference.
+- **N6-PROJ-05:** Missing model/engine dependencies open read-only with precise status while stored
+  fields and evidence remain inspectable.
+- **N6-PROJ-06:** No machine-specific absolute path is authoritative; portable content-addressed
+  sources/artifacts are sufficient to review the project.
+- **N6-PROJ-07:** Every schema migration is versioned and tested from each shipped schema and never
+  silently drops evidence.
+- **N6-COMP-01:** Run/variant comparisons use shared units/scales and every plotted/table value
+  opens the exact immutable run and evidence.
+- **N6-IA-01:** The first visible action starts an external-flow geometry case; Setup → Run →
+  Results → Evidence is navigable in context. Research tools are hidden by default, persistently
+  enabled only from Developer settings, and “Project Alpha,” “Live Session,” disconnected
+  “Metrics (3D),” and disconnected “Fields (2D)” labels are absent from the default workflow.
+- **N6-PKG-01:** A notarized app on a clean supported Mac verifies engine/model artifacts,
+  creates/saves/reopens a project, runs one smoke case, and exports verifiable evidence without a
+  terminal.
+- **N6-PKG-02:** Offline launch/read-only review work without an account and with telemetry off.
+
+### 10.4 Post-N6
+
+- **P-REF-01:** External references record solver/source version, case/config/mesh identities,
+  units/frame transform, imported quantities, uncertainty where applicable, and conversion loss.
+- **P-VV-01:** A discretization study uses at least three levels and reports quantity/refinement;
+  visual similarity alone cannot be called grid independence.
+- **P-CAD-01:** STEP import records translator/version/options, source units, repair log,
+  tessellation settings, and output hashes.
+- **P-CAD-02:** Reimport reports preserved/changed/added/removed/ambiguous regions and blocks
+  unresolved assignments.
+- **P-SWEEP-01:** Every sweep point is an immutable run and every aggregate point deep-links to it.
+- **P-API-01:** GUI and CLI/API consume the same versioned schema and produce equivalent manifests
+  for equivalent deterministic local runs.
+- **P-REMOTE-01:** Local and remote backends consume the same manifest; remote execution cannot
+  mutate a locked run and returns content-addressed artifacts plus logs.
+- **P-AI-01:** Training, validation/checkpoint selection, independent test, and production feedback
+  are immutable separate sets.
+- **P-AI-02:** A qualified model declares intended use, support envelope, independent metrics and
+  baseline, known failures, and dataset/model fingerprints.
+- **P-COLLAB-01:** A recipient can verify and inspect a signed read-only evidence bundle without a
+  Reyn account; later sync never changes locked local evidence.
+- **P-CONNECT-01:** Onshape import pins source revision IDs, refreshes explicitly, caches locally,
+  and produces an assignment mapping report.
+- **P-INTERNAL-01:** Internal/HVAC cases record inlet/outlet/wall assignments, fluid properties,
+  targets, and reference strategy. The external fixed-body model cannot execute them; a qualified
+  internal surrogate is required before an internal run can leave blocked/unsupported state.
 
 ---
 
-## 12. Open decisions (defaults chosen; revisit only with a reason)
-- **Bevy vs raw wgpu** for the viewport → **raw wgpu** first (control, weight). Revisit at N2 end.
-- **Engine transport** → **shared memory + localhost socket** (not stdin pipes) for the field
-  throughput. Unix socket on mac/linux, TCP loopback on windows.
-- **Engine packaging** → pinned venv inside the `.app` first; PyInstaller if size matters.
-- **Fully-native inference** (drop Python) → deferred behind the `Engine` trait; exercise
-  ONNX/`ort` or ExecuTorch only when shipping a standalone max-perf binary.
+## 11. Roadmap and release gates
+
+### 11.1 N5.x — finish evidence and correct semantics
+
+1. **N5.3 Benchmark completion:** REQ-N5-VV-01, REQ-N5-INSP-01,
+   REQ-N5-EXPORT-01, and REQ-N5-SIGN-01.
+2. **N5.4 external engineering case:** REQ-N5-EV-01, REQ-N5-EV-02, REQ-N5-CAD-01,
+   REQ-N5-PHYS-01, and REQ-N5-LOAD-01.
+3. Keep physics controls locked to supported contracts; do not broaden into project management or
+   arbitrary materials/BCs.
+
+**N5 exit gate:** all N5X acceptance IDs pass; exported integrity and authenticity are distinct;
+CAD preprocessing and recovered-pressure terminology are scientifically accurate.
+
+### 11.2 N6 — durable v1 scientific instrument
+
+1. **N6.1:** validated Model Library and settings.
+2. **N6.2:** versioned Project → Case Setup → Run → Results → Evidence persistence, staleness,
+   recovery, reopen, parented variant comparison, and Developer-only Research Sandbox migration.
+3. **N6.3:** checksummed standalone packaging, codesign/notarization, clean-machine smoke path, and
+   offline read-only review.
+
+N6 is a release phase, not the former three-day placeholder/packaging estimate. Estimate it after
+a persisted-schema spike.
+
+**v1 release gate:** every P0 N6 acceptance ID passes on a clean supported Mac; no known path can
+silently mutate a completed run, lose evidence on migration, claim unsupported CAD/physics, or
+require an account for local review.
+
+### 11.3 Post-N6 order
+
+1. P1 supported case templates and external references.
+2. P1 source-aware geometry revisions, named regions, and neutral CAD translation.
+3. P1 qualified internal/HVAC contract and reference path; never route it through the external
+   fixed-body surrogate.
+4. P1 bounded sweeps and headless CLI/API over the shared schema.
+5. P2 signed evidence sharing, then optional remote/HPC execution and collaboration.
+6. P2 optional Onshape connector.
+7. P2 dataset registry, model qualification/calibration, and active-learning candidate loop.
+
+---
+
+## 12. Product and evidence metrics
+
+Primary measures:
+
+- median time from source import to first **evidence-complete run**;
+- percentage of runs with complete source/model/contract/derivation provenance;
+- percentage of CAD imports with known units and accepted transform;
+- percentage of unsupported or out-of-envelope attempts caught before inference;
+- deterministic reopen/rerun pass rate and schema-migration evidence-retention rate;
+- time to locate, inspect, and explain the worst benchmark cell;
+- percentage of reports whose integrity hash verifies and, separately, whose signature verifies;
+- crash-recovery success rate;
+- percentage of comparisons whose values deep-link to immutable run evidence;
+- distribution of CLEAN/FLAGGED/UNKNOWN outcomes with named reasons.
+
+Guardrails:
+
+- UI-thread stalls attributable to engine work;
+- crashes, corrupted projects, silent stale-state errors, and evidence-loss incidents;
+- unsupported claims found in UI/export reviews;
+- task failure caused by clutter, hidden required assumptions, or misleading status.
+
+Do not optimize for number of features, controls, solver options, generated runs, cards, or time
+spent in the app.
+
+---
+
+## 13. Open decisions
+
+Defaults are recorded so implementation does not repeatedly relitigate settled direction.
+
+1. **Project persistence format:** portable `.reynproj` bundle versus directory. Decide after the
+   N6 schema spike; both require a human-readable manifest and content-addressed artifacts.
+2. **Signing implementation:** Ed25519 signs the raw canonical-payload SHA-256; private seeds live
+   behind a non-synchronizing, this-device-only macOS Keychain provider requiring user presence;
+   sidecars carry portable public keys/fingerprints and verify offline through the Reyn CLI.
+   Revocation is fingerprint-based and supplied to verification independently. The production
+   Keychain interaction gate remains open; never reuse an integrity label.
+3. **Engine packaging:** pinned embedded environment first; compare PyInstaller only on measured
+   size/startup/compatibility evidence.
+4. **Bulk transport:** retain framed TCP until a 128³+ benchmark proves transfer is a material
+   bottleneck; then add shared memory behind unchanged protocol semantics.
+5. **Neutral CAD translator:** evaluate Open CASCADE versus a commercial SDK on format fidelity,
+   healing, persistent metadata, packaging, licensing, and support.
+6. **Model/reference terminology migration:** active UI uses model prediction and solver
+   reference language; preserve compatibility when interpreting legacy saved evidence fields.
+7. **Supported v1 hardware:** define macOS/hardware/model support before notarized release and
+   encode it in first-run checks and release documentation.
+
+---
+
+## 14. Agent implementation contract
+
+Any contributor changing Reyn Studio must:
+
+1. Read this PRD before editing and name the `REQ-*` and acceptance IDs being implemented.
+2. Check current/concurrent changes before editing; preserve other workers’ work.
+3. Preserve the premium scientific-instrument direction, progressive disclosure, and scientific
+   semantics in sections 3–4.
+4. Never claim embedded/associative CAD, physical `Cp`, shared-memory transport, a signature, or
+   independent validation unless its acceptance criteria pass.
+5. Never add a persistent visible Support button or generic SaaS/sci-fi chrome.
+6. Run tests relevant to the touched requirement and inspect changed UX states.
+7. Update status in this PRD only after the associated acceptance IDs actually pass; record
+   partial work as partial and do not invent completion.
+8. Use [`docs/CFD_APP_LANDSCAPE.md`](docs/CFD_APP_LANDSCAPE.md) for rationale and vendor evidence
+   rather than copying its research into this implementation contract.
+

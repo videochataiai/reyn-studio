@@ -11,9 +11,12 @@ in `payload` and its shape in the JSON. (Shared-memory transport is the planned
 optimization; loopback TCP is the correct, robust first cut — a 32^3 field is ~400 KB.)
 """
 import argparse
+import hashlib
 import json
 import math
 import os
+from pathlib import Path
+import shutil
 import socket
 import struct
 import sys
@@ -22,6 +25,11 @@ import traceback
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # CPU-fallback any MPS gap
 
 import numpy as np
+
+try:
+    from .n5_inspector import INSPECTOR_SCHEMA, inspector_payload
+except ImportError:  # Running this file directly as the sidecar entry point.
+    from n5_inspector import INSPECTOR_SCHEMA, inspector_payload
 
 
 # -- framing -----------------------------------------------------------------
@@ -93,6 +101,192 @@ def _fd_poisson(rhs, dx, periodic, tol, max_iter):
     return p, resid, iters
 
 
+SURFACE_LOAD_METHOD = "diffuse_interface_traction.v1"
+
+
+def engineering_surface_loads(
+    velocity,
+    recovered_pressure,
+    mask,
+    *,
+    reynolds,
+    char_len_solver,
+    reference_length_m,
+    velocity_mps,
+    density_kg_m3,
+    reference_pressure_pa,
+):
+    """Convert a nondimensional fixed-body result into versioned fluid loads.
+
+    The smoothed immersed mask is a diffuse surface. Its gradient supplies the
+    fluid-to-solid normal and area measure. Pressure and Newtonian viscous
+    traction are integrated in solver coordinates, then nondimensionalized by
+    q∞Lref² (force) and q∞Lref³ (moment). These are fluid loads, not structural
+    stress, and the recovered pressure remains labeled as model-derived.
+    """
+    velocity = np.asarray(velocity, dtype=np.float64)
+    pressure = np.asarray(recovered_pressure, dtype=np.float64)
+    mask = np.asarray(mask, dtype=np.float64)
+    if velocity.ndim != 4 or velocity.shape[0] != 3:
+        raise ValueError("engineering loads require velocity shaped [3,N,N,N]")
+    if pressure.shape != mask.shape or pressure.shape != velocity.shape[1:]:
+        raise ValueError("pressure, mask, and velocity grids must match")
+    if (
+        not np.all(np.isfinite(velocity))
+        or not np.all(np.isfinite(pressure))
+        or not np.all(np.isfinite(mask))
+    ):
+        raise ValueError("engineering load fields must contain only finite values")
+    reference_values = (
+        reynolds,
+        char_len_solver,
+        reference_length_m,
+        velocity_mps,
+        density_kg_m3,
+        reference_pressure_pa,
+    )
+    if any(not math.isfinite(float(value)) for value in reference_values):
+        raise ValueError("engineering reference quantities must be finite")
+    if min(
+        reynolds,
+        char_len_solver,
+        reference_length_m,
+        velocity_mps,
+        density_kg_m3,
+    ) <= 0.0:
+        raise ValueError("engineering reference quantities must be positive")
+
+    n = mask.shape[0]
+    dx = 2.0 * math.pi / n
+
+    def derivative(field, axis):
+        return (np.roll(field, -1, axis=axis) - np.roll(field, 1, axis=axis)) / (
+            2.0 * dx
+        )
+
+    grad_mask = np.stack([derivative(mask, axis) for axis in range(3)], axis=0)
+    surface_density = np.linalg.norm(grad_mask, axis=0)
+    normals = grad_mask / np.maximum(surface_density[None], 1e-12)
+    grad_velocity = np.empty((3, 3, n, n, n), dtype=np.float64)
+    for component in range(3):
+        for axis in range(3):
+            grad_velocity[component, axis] = derivative(
+                velocity[component], axis
+            )
+    strain = grad_velocity + np.swapaxes(grad_velocity, 0, 1)
+    nu_solver = char_len_solver / reynolds
+    pressure_traction = pressure[None] * normals
+    viscous_traction = -nu_solver * np.einsum(
+        "abijk,bijk->aijk", strain, normals
+    )
+    traction_normalized = pressure_traction + viscous_traction
+    area_weight = surface_density * dx**3
+
+    force_pressure = np.sum(
+        pressure_traction * area_weight[None], axis=(1, 2, 3)
+    )
+    force_viscous = np.sum(
+        viscous_traction * area_weight[None], axis=(1, 2, 3)
+    )
+    force = force_pressure + force_viscous
+    grid = (np.arange(n, dtype=np.float64) + 0.5) * dx
+    coordinates = np.stack(
+        np.meshgrid(grid, grid, grid, indexing="ij"), axis=0
+    )
+    area_sum = max(float(area_weight.sum()), 1e-12)
+    center = np.sum(
+        coordinates * area_weight[None], axis=(1, 2, 3)
+    ) / area_sum
+    arm = coordinates - center[:, None, None, None]
+    moment_density = np.cross(
+        np.moveaxis(arm, 0, -1),
+        np.moveaxis(traction_normalized, 0, -1),
+    )
+    moment = np.sum(
+        np.moveaxis(moment_density, -1, 0) * area_weight[None],
+        axis=(1, 2, 3),
+    )
+    force_coefficients = force / (0.5 * char_len_solver**2)
+    moment_coefficients = moment / (0.5 * char_len_solver**3)
+
+    dynamic_pressure = 0.5 * density_kg_m3 * velocity_mps**2
+    pressure_delta_pa = pressure * density_kg_m3 * velocity_mps**2
+    cp = pressure_delta_pa / dynamic_pressure
+    pressure_pa = (
+        reference_pressure_pa
+        + pressure_delta_pa
+    )
+    traction_pa = traction_normalized * density_kg_m3 * velocity_mps**2
+    force_newtons = (
+        force_coefficients * dynamic_pressure * reference_length_m**2
+    )
+    moment_newton_meters = (
+        moment_coefficients * dynamic_pressure * reference_length_m**3
+    )
+    surface_area_m2 = (
+        area_sum * (reference_length_m / char_len_solver) ** 2
+    )
+
+    surface = surface_density > max(float(surface_density.max()) * 0.05, 1e-8)
+    if not np.any(surface):
+        raise ValueError("diffuse mask contains no resolvable surface")
+    surface_indices = np.argwhere(surface)
+    surface_cp = cp[surface]
+    load_hotspot = surface_indices[int(np.argmax(surface_cp))]
+    suction_hotspot = surface_indices[int(np.argmin(surface_cp))]
+    to_physical = reference_length_m / char_len_solver
+    load_hotspot_m = (
+        (load_hotspot.astype(np.float64) + 0.5) * dx - center
+    ) * to_physical
+    suction_hotspot_m = (
+        (suction_hotspot.astype(np.float64) + 0.5) * dx - center
+    ) * to_physical
+    divergence = sum(
+        derivative(velocity[axis], axis) for axis in range(3)
+    )
+    divergence_rms = float(np.sqrt(np.mean(divergence**2)))
+    speed = np.linalg.norm(velocity, axis=0)
+    body_x = float(center[0])
+    wake_region = (coordinates[0] > body_x + 0.5 * char_len_solver) & (mask < 0.1)
+    wake_deficit = np.maximum(0.0, 1.0 - speed)
+    if np.any(wake_region):
+        wake_deficit_peak = float(wake_deficit[wake_region].max())
+        wake_deficit_mean = float(wake_deficit[wake_region].mean())
+    else:
+        wake_deficit_peak = 0.0
+        wake_deficit_mean = 0.0
+    pressure_norm = float(np.linalg.norm(force_pressure))
+    total_component_norm = pressure_norm + float(np.linalg.norm(force_viscous))
+    pressure_force_fraction = (
+        pressure_norm / total_component_norm if total_component_norm > 0.0 else 0.0
+    )
+    warnings = [
+        "Pressure is recovered from the predicted velocity field; it is model-derived, not a solver reference.",
+        "Diffuse-interface tractions are fluid loads for downstream FEA mapping, not structural stress.",
+        "Reported moments use the diffuse-surface area centroid as the reference origin.",
+    ]
+    return {
+        "method": SURFACE_LOAD_METHOD,
+        "pressure_pa": pressure_pa.astype(np.float32),
+        "cp": cp.astype(np.float32),
+        "traction_pa": traction_pa.astype(np.float32),
+        "force_coefficients": force_coefficients.astype(float).tolist(),
+        "moment_coefficients": moment_coefficients.astype(float).tolist(),
+        "force_newtons": force_newtons.astype(float).tolist(),
+        "moment_newton_meters": moment_newton_meters.astype(float).tolist(),
+        "surface_area_m2": float(surface_area_m2),
+        "pressure_force_fraction": pressure_force_fraction,
+        "load_hotspot": load_hotspot_m.astype(float).tolist(),
+        "suction_hotspot": suction_hotspot_m.astype(float).tolist(),
+        "divergence_rms": divergence_rms,
+        "wake_deficit_peak": wake_deficit_peak,
+        "wake_deficit_mean": wake_deficit_mean,
+        "cp_min": float(surface_cp.min()),
+        "cp_max": float(surface_cp.max()),
+        "warnings": warnings,
+    }
+
+
 # -- model / field ops -------------------------------------------------------
 def list_checkpoints(research_dir):
     out = []
@@ -102,18 +296,737 @@ def list_checkpoints(research_dir):
     return out
 
 
+def _optional_int(value):
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_benchmark_seed(seed, training_seed):
+    """Classify an exact dataset RNG seed against the checkpoint's reserved streams."""
+    seed = int(seed)
+    if training_seed is None:
+        return "unknown"
+    if seed == training_seed:
+        return "training"
+    if seed == training_seed + 10000:
+        return "mixed_fork"
+    if seed == training_seed + 50000:
+        return "validation_selection"
+    return "fresh_test"
+
+
+def analyze_checkpoint_provenance(checkpoint, benchmark_seeds):
+    """Build an evidence-only leak/provenance verdict from checkpoint metadata.
+
+    This deliberately checks exact RNG-stream collisions. It does not claim an
+    expensive field-space nearest-neighbour comparison that was not performed.
+    """
+    train_args = checkpoint.get("train_args")
+    train_args = train_args if isinstance(train_args, dict) else {}
+    training_seed = _optional_int(train_args.get("seed"))
+    if training_seed is not None and training_seed < 0:
+        training_seed = None
+    dataset = str(train_args.get("dataset", "legacy/unknown"))
+    mixed_fork_used = dataset in ("mixed", "viscosity-fork")
+    mixed_fork_seed = training_seed + 10000 if training_seed is not None else None
+    validation_seed = training_seed + 50000 if training_seed is not None else None
+
+    seed_records = []
+    for seed in benchmark_seeds:
+        stream = classify_benchmark_seed(seed, training_seed)
+        seed_records.append({
+            "seed": int(seed),
+            "stream": stream,
+            "overlap": stream in ("training", "mixed_fork", "validation_selection"),
+        })
+
+    epoch = _optional_int(checkpoint.get("epoch"))
+    declared_epochs = _optional_int(train_args.get("epochs"))
+    role_value = checkpoint.get("checkpoint_role")
+    checkpoint_role = (
+        str(role_value) if role_value not in (None, "") else "legacy/unknown"
+    )
+    if epoch is None or declared_epochs is None:
+        final_epoch_status = "unknown"
+    elif epoch == declared_epochs:
+        if checkpoint_role == "fixed_final":
+            final_epoch_status = "fixed_final"
+        elif checkpoint_role == "best_validation":
+            final_epoch_status = "validation_selected_final_epoch"
+        else:
+            final_epoch_status = "final_epoch_role_unknown"
+    elif checkpoint_role == "best_validation":
+        final_epoch_status = "validation_selected_nonfinal"
+    elif epoch < declared_epochs:
+        final_epoch_status = "nonfinal_epoch"
+    else:
+        final_epoch_status = "epoch_out_of_contract"
+
+    source = checkpoint.get("source_fingerprint")
+    source_digest = source.get("digest") if isinstance(source, dict) else None
+    source_present = isinstance(source_digest, str) and bool(source_digest)
+    best_metric_value = checkpoint.get("best_metric")
+    best_metric = (
+        str(best_metric_value)
+        if best_metric_value not in (None, "")
+        else (
+            "not_applicable_fixed_epoch"
+            if checkpoint_role == "fixed_final"
+            else "legacy/unknown"
+        )
+    )
+    metric_lower = best_metric.lower()
+    if checkpoint_role == "fixed_final":
+        selection_stream = "fixed_epoch"
+    elif checkpoint_role == "best_validation":
+        selection_stream = "validation"
+    elif "val" in metric_lower:
+        selection_stream = "validation"
+    elif "train" in metric_lower:
+        selection_stream = "training"
+    else:
+        selection_stream = "unknown"
+
+    unknown = []
+    if training_seed is None:
+        unknown.append("training seed absent")
+    if checkpoint_role == "legacy/unknown":
+        unknown.append("checkpoint role absent")
+    if not source_present:
+        unknown.append("source fingerprint absent")
+    if (
+        best_metric == "legacy/unknown"
+        and checkpoint_role != "fixed_final"
+    ):
+        unknown.append("checkpoint selection metric absent")
+    if epoch is None or declared_epochs is None:
+        unknown.append("final epoch status unavailable")
+
+    flags = []
+    overlaps = [record for record in seed_records if record["overlap"]]
+    if overlaps:
+        streams = ", ".join(
+            f"{record['seed']}={record['stream']}" for record in overlaps
+        )
+        flags.append(f"benchmark seeds overlap reserved streams: {streams}")
+    if len({record["seed"] for record in seed_records}) != len(seed_records):
+        flags.append("benchmark seeds contain duplicates")
+    if (
+        checkpoint_role == "fixed_final"
+        and declared_epochs is not None
+        and epoch != declared_epochs
+    ):
+        flags.append("fixed_final role conflicts with checkpoint epoch")
+    if final_epoch_status == "epoch_out_of_contract":
+        flags.append("checkpoint epoch exceeds declared training epochs")
+
+    verdict = "flagged" if flags else ("unknown" if unknown else "clean")
+    overlap_pct = 100.0 * len(overlaps) / max(1, len(seed_records))
+    return {
+        "verdict": verdict,
+        "training_seed": training_seed,
+        "mixed_fork_seed": mixed_fork_seed,
+        "mixed_fork_used": mixed_fork_used,
+        "validation_seed": validation_seed,
+        "dataset": dataset,
+        "benchmark_seeds": seed_records,
+        "overlap_count": len(overlaps),
+        "overlap_pct": overlap_pct,
+        "epoch": epoch,
+        "declared_epochs": declared_epochs,
+        "checkpoint_role": checkpoint_role,
+        "final_epoch_status": final_epoch_status,
+        "selection_metric": best_metric,
+        "selection_stream": selection_stream,
+        "source_fingerprint_present": source_present,
+        "source_fingerprint_digest": source_digest if source_present else None,
+        "legacy_unknown": unknown,
+        "flags": flags,
+    }
+
+
+def radial_energy_spectrum(field):
+    """Radially averaged kinetic-energy spectrum for a `[2,N,N]` velocity field."""
+    field = np.asarray(field, dtype=np.float64)
+    if field.ndim != 3 or field.shape[0] < 2 or field.shape[1] != field.shape[2]:
+        raise ValueError("energy spectrum requires a [2,N,N] velocity field")
+    n = field.shape[-1]
+    u_hat = np.fft.fft2(field[0])
+    v_hat = np.fft.fft2(field[1])
+    energy = (np.abs(u_hat) ** 2 + np.abs(v_hat) ** 2) / (n * n)
+    kfreq = np.fft.fftfreq(n) * n
+    kx, ky = np.meshgrid(kfreq, kfreq)
+    kmag = np.sqrt(kx ** 2 + ky ** 2)
+    kbins = np.arange(0.5, n // 2 + 1, 1.0)
+    kvals = 0.5 * (kbins[1:] + kbins[:-1])
+    shell_energy, _ = np.histogram(kmag, bins=kbins, weights=energy)
+    counts, _ = np.histogram(kmag, bins=kbins)
+    spectrum = shell_energy / np.maximum(counts, 1)
+    return kvals.astype(np.float32), spectrum.astype(np.float32)
+
+
+def divergence_rms(field):
+    """Spectral RMS divergence for a periodic `[2,N,N]` velocity field."""
+    field = np.asarray(field, dtype=np.float64)
+    if field.ndim != 3 or field.shape[0] < 2 or field.shape[1] != field.shape[2]:
+        raise ValueError("divergence requires a [2,N,N] velocity field")
+    n = field.shape[-1]
+    modes = np.fft.fftfreq(n, d=1.0 / n)
+    kx = modes.reshape(1, n)
+    ky = modes.reshape(n, 1)
+    div_hat = 1j * kx * np.fft.fft2(field[0])
+    div_hat += 1j * ky * np.fft.fft2(field[1])
+    divergence = np.fft.ifft2(div_hat).real
+    return float(np.sqrt(np.mean(divergence ** 2)))
+
+
+def benchmark_cell_evidence(prediction, truth, initial):
+    """Compute the scalar maps, spectra, and calibrated metrics for one suite cell."""
+    prediction = np.asarray(prediction, dtype=np.float32)
+    truth = np.asarray(truth, dtype=np.float32)
+    initial = np.asarray(initial, dtype=np.float32)
+    if prediction.shape != truth.shape or prediction.shape != initial.shape:
+        raise ValueError("prediction, truth, and initial fields must share a shape")
+    if prediction.ndim != 3 or prediction.shape[0] != 2:
+        raise ValueError("benchmark evidence requires [2,N,N] velocity fields")
+
+    truth_norm = max(float(np.linalg.norm(truth)), 1e-12)
+    rel_l2 = float(np.linalg.norm(prediction - truth) / truth_norm)
+    persist_rel_l2 = float(np.linalg.norm(initial - truth) / truth_norm)
+    error_map = np.sqrt(np.sum((prediction - truth) ** 2, axis=0))
+    model_speed = np.sqrt(np.sum(prediction ** 2, axis=0))
+    truth_speed = np.sqrt(np.sum(truth ** 2, axis=0))
+    spectrum_k, spectrum_model = radial_energy_spectrum(prediction)
+    _, spectrum_truth = radial_energy_spectrum(truth)
+    spectrum_norm = max(float(np.linalg.norm(spectrum_truth)), 1e-20)
+    spectrum_rel_l2 = float(
+        np.linalg.norm(spectrum_model - spectrum_truth) / spectrum_norm
+    )
+    return {
+        "rel_l2": rel_l2,
+        "persist_rel_l2": persist_rel_l2,
+        "improvement_ratio": persist_rel_l2 / max(rel_l2, 1e-12),
+        "mean_abs_error": float(error_map.mean()),
+        "p95_abs_error": float(np.quantile(error_map, 0.95)),
+        "max_abs_error": float(error_map.max()),
+        "divergence_model_rms": divergence_rms(prediction),
+        "divergence_truth_rms": divergence_rms(truth),
+        "divergence_error_rms": divergence_rms(prediction - truth),
+        "spectrum_rel_l2": spectrum_rel_l2,
+        "spectrum_k": spectrum_k,
+        "spectrum_model": spectrum_model,
+        "spectrum_truth": spectrum_truth,
+        "model_speed": model_speed.astype(np.float32),
+        "truth_speed": truth_speed.astype(np.float32),
+        "error_map": error_map.astype(np.float32),
+    }
+
+
 class Engine:
-    def __init__(self, research_dir):
-        self.research_dir = research_dir
+    def __init__(self, research_dir, requested_device="auto"):
+        self.research_dir = str(Path(research_dir).expanduser().resolve())
         sys.path.insert(0, research_dir)
         os.chdir(research_dir)
         import torch  # noqa: imported lazily so startup errors are reported cleanly
         self.torch = torch
-        # inference on the GPU (Metal) when available — 5–10× faster forwards, so
-        # TimeJump scrubbing stays responsive; solver data-gen stays on CPU.
-        self.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        requested_device = str(requested_device).lower()
+        if requested_device == "auto":
+            if torch.cuda.is_available():
+                selected_device = "cuda"
+            elif torch.backends.mps.is_available():
+                selected_device = "mps"
+            else:
+                selected_device = "cpu"
+        elif requested_device == "mps":
+            if not torch.backends.mps.is_available():
+                raise RuntimeError("MPS was requested but is not available on this Mac")
+            selected_device = "mps"
+        elif requested_device == "cpu":
+            selected_device = "cpu"
+        else:
+            raise ValueError(
+                f"unsupported compute device {requested_device!r}; use auto, mps, or cpu"
+            )
+        self.device = torch.device(selected_device)
         self.cache = {}
-        self.traj2d = {}  # (model, seed) -> (y0, mask, trajectory, conditioned)
+        self.traj2d = {}  # (model, seed) -> (y0, mask, trajectory, physics context)
+        self.cad_cache = {}  # (model, mask_digest) -> developed field (post-warmup)
+
+    @property
+    def managed_model_dir(self):
+        return Path(self.research_dir) / "reyn_models"
+
+    def _model_id(self, path):
+        path = Path(path).resolve()
+        try:
+            return path.relative_to(Path(self.research_dir).resolve()).as_posix()
+        except ValueError:
+            return str(path)
+
+    @staticmethod
+    def _checkpoint_sha256(path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as checkpoint_file:
+            for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _validation(card):
+        issues = list(card.get("validation_issues") or [])
+        accepted = card.get("status") != "invalid"
+        return {
+            "accepted": accepted,
+            "status": "accepted" if accepted else "rejected",
+            "summary": card.get("status_detail") or "checkpoint validation completed",
+            "issues": issues,
+            "candidate": {
+                "name": card.get("name"),
+                "checkpoint_sha256": card.get("checkpoint_sha256"),
+            },
+        }
+
+    def checkpoint_card(self, path, *, managed=False):
+        """Read checkpoint metadata without instantiating the neural network."""
+        path = Path(path).expanduser().resolve()
+        stat = path.stat()
+        card = {
+            "id": self._model_id(path),
+            "name": path.name,
+            "managed": bool(managed),
+            "size_bytes": int(stat.st_size),
+            "modified_unix": int(stat.st_mtime),
+            "checkpoint_sha256": self._checkpoint_sha256(path),
+            "status": "invalid",
+            "status_detail": "",
+            "dimension": 0,
+            "grid": 0,
+            "in_channels": 0,
+            "out_channels": 0,
+            "max_steps": 0,
+            "epoch": 0,
+            "declared_epochs": 0,
+            "checkpoint_role": "unknown",
+            "scenario": "unknown",
+            "source_digest": None,
+            "physics_contract": "unknown",
+            "support": [],
+            "limitations": [],
+            "benchmark_report_hashes": [],
+            "unknown_fields": [],
+            "fact_sources": {},
+            "validation_issues": [],
+        }
+        issues = card["validation_issues"]
+
+        def issue(code, field, message, severity="error"):
+            issues.append(
+                {
+                    "code": code,
+                    "field": field,
+                    "message": message,
+                    "severity": severity,
+                }
+            )
+
+        def reject():
+            card["status"] = "invalid"
+            card["status_detail"] = next(
+                (
+                    validation_issue["message"]
+                    for validation_issue in issues
+                    if validation_issue["severity"] == "error"
+                ),
+                "checkpoint is incompatible",
+            )
+            return card
+
+        try:
+            try:
+                checkpoint = self.torch.load(
+                    path, map_location="cpu", weights_only=False, mmap=True
+                )
+            except TypeError:
+                checkpoint = self.torch.load(
+                    path, map_location="cpu", weights_only=False
+                )
+        except Exception as exc:
+            issue(
+                "checkpoint.unreadable",
+                "checkpoint",
+                f"unreadable checkpoint: {exc}",
+            )
+            return reject()
+
+        if not isinstance(checkpoint, dict):
+            issue(
+                "checkpoint.invalid_root",
+                "checkpoint",
+                "checkpoint root must be a mapping",
+            )
+            return reject()
+
+        config = checkpoint.get("model_config")
+        state = checkpoint.get("model_state_dict")
+        train_args = checkpoint.get("train_args")
+        missing = [
+            name
+            for name, value in (
+                ("model_config", config),
+                ("model_state_dict", state),
+                ("train_args", train_args),
+            )
+            if not isinstance(value, dict)
+        ]
+        if missing:
+            for field in missing:
+                issue(
+                    "checkpoint.missing_field",
+                    field,
+                    f"missing required {field}",
+                )
+            return reject()
+        tensors = [value for value in state.values() if hasattr(value, "dim")]
+        if not tensors:
+            issue(
+                "checkpoint.empty_state",
+                "model_state_dict",
+                "model_state_dict contains no tensors",
+            )
+            return reject()
+
+        is3d = any(value.dim() == 5 for value in tensors)
+        dimension = 3 if is3d else 2
+        in_channels = _optional_int(config.get("in_channels"))
+        out_channels = _optional_int(config.get("out_channels")) or in_channels
+        param_dim = _optional_int(config.get("param_dim")) or 0
+        grid = _optional_int(train_args.get("grid_size"))
+        max_steps = _optional_int(train_args.get("max_steps"))
+        scenario_value = train_args.get("scenario")
+        scenario = (
+            str(scenario_value)
+            if scenario_value not in (None, "")
+            else "unknown"
+        )
+        inferred_scenario = (
+            scenario
+            if scenario != "unknown"
+            else (
+                "obstacle"
+                if in_channels is not None
+                and out_channels is not None
+                and in_channels > out_channels
+                else "free"
+            )
+        )
+
+        for field, value in (
+            ("model_config.in_channels", in_channels),
+            ("model_config.out_channels", out_channels),
+            ("train_args.grid_size", grid),
+            ("train_args.max_steps", max_steps),
+        ):
+            if value is None or value <= 0:
+                issue(
+                    "contract.missing_positive_value",
+                    field,
+                    f"{field} must be a positive integer",
+                )
+        for field in ("dt", "stride", "warmup_steps"):
+            if train_args.get(field) is None:
+                issue(
+                    "runtime.missing_setting",
+                    f"train_args.{field}",
+                    f"train_args.{field} is required for local execution",
+                )
+        if inferred_scenario not in ("free", "obstacle"):
+            issue(
+                "contract.unsupported_scenario",
+                "train_args.scenario",
+                f"unsupported scenario {inferred_scenario!r}",
+            )
+
+        physics_spec = checkpoint.get("physics_spec")
+        physics_id = (
+            str(physics_spec.get("physics_id"))
+            if isinstance(physics_spec, dict) and physics_spec.get("physics_id")
+            else "legacy/unknown"
+        )
+        if is3d:
+            supported_contract = (
+                (in_channels, out_channels, param_dim) in ((3, 3, 0), (4, 3, 0))
+                and (
+                    (inferred_scenario == "free" and in_channels == 3)
+                    or (inferred_scenario == "obstacle" and in_channels == 4)
+                )
+            )
+            if train_args.get("nu") is None:
+                issue(
+                    "runtime.missing_setting",
+                    "train_args.nu",
+                    "train_args.nu is required for 3D local execution",
+                )
+        else:
+            supported_contract = (in_channels, out_channels, param_dim) in (
+                (2, 2, 0),
+                (3, 2, 0),
+                (4, 2, 1),
+            )
+            if (in_channels, out_channels, param_dim) == (4, 2, 1):
+                support = (
+                    physics_spec.get("support")
+                    if isinstance(physics_spec, dict)
+                    else None
+                )
+                nu_bounds = support.get("nu") if isinstance(support, dict) else None
+                if (
+                    physics_id != "fixed_body_brinkman.v2"
+                    or not isinstance(nu_bounds, (list, tuple))
+                    or len(nu_bounds) != 2
+                    or float(support.get("sponge_strength", 0.0)) <= 0.0
+                ):
+                    issue(
+                        "contract.missing_physics_spec",
+                        "physics_spec",
+                        "parameter-conditioned checkpoint requires fixed_body_v2 support metadata",
+                    )
+        if not supported_contract:
+            issue(
+                "contract.unsupported_channels",
+                "model_config",
+                "unsupported checkpoint contract: "
+                f"{dimension}D in={in_channels}, out={out_channels}, params={param_dim}",
+            )
+
+        source = checkpoint.get("source_fingerprint")
+        source_digest = source.get("digest") if isinstance(source, dict) else None
+        role = str(checkpoint.get("checkpoint_role") or "legacy/unknown")
+        epoch = _optional_int(checkpoint.get("epoch")) or 0
+        declared_epochs = _optional_int(train_args.get("epochs")) or 0
+        fixed_final = (
+            role == "fixed_final"
+            and declared_epochs > 0
+            and epoch == declared_epochs
+        )
+        source_present = isinstance(source_digest, str) and bool(source_digest)
+        limitations_value = checkpoint.get("limitations")
+        limitations = (
+            [str(value) for value in limitations_value if str(value).strip()]
+            if isinstance(limitations_value, (list, tuple))
+            else []
+        )
+        reports_value = checkpoint.get("benchmark_reports")
+        reports_value = (
+            reports_value if isinstance(reports_value, (list, tuple)) else []
+        )
+        report_hashes = []
+        for report in reports_value:
+            digest = report.get("sha256") if isinstance(report, dict) else report
+            digest = str(digest).lower() if digest is not None else ""
+            if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+                report_hashes.append(digest)
+            else:
+                issue(
+                    "report.invalid_hash",
+                    "benchmark_reports",
+                    "ignored benchmark report without a canonical SHA-256 hash",
+                    severity="warning",
+                )
+
+        unknown_fields = []
+        if not source_present:
+            unknown_fields.append("source_fingerprint")
+        if role == "legacy/unknown":
+            unknown_fields.append("checkpoint_role")
+        if scenario == "unknown":
+            unknown_fields.append("scenario")
+        if not limitations:
+            unknown_fields.append("limitations")
+        if not report_hashes:
+            unknown_fields.append("benchmark_reports")
+
+        support_lines = []
+        if grid and dimension:
+            support_lines.append(f"{dimension}D · {grid}^{dimension} grid")
+        if in_channels and out_channels:
+            support_lines.append(f"{in_channels} input → {out_channels} output channels")
+        if max_steps:
+            support_lines.append(f"declared horizon 1–{max_steps} steps")
+        if scenario != "unknown":
+            support_lines.append(f"declared regime: {scenario}")
+        if physics_id != "legacy/unknown":
+            support_lines.append(f"physics contract: {physics_id}")
+
+        errors = [value for value in issues if value["severity"] == "error"]
+        if errors:
+            status = "invalid"
+            status_detail = errors[0]["message"]
+        elif fixed_final and source_present:
+            status = "clean"
+            status_detail = "compatible contract · fixed final epoch · source fingerprint present"
+        else:
+            gaps = []
+            if not fixed_final:
+                gaps.append("final checkpoint role/epoch unverified")
+            if not source_present:
+                gaps.append("source fingerprint absent")
+            status = "review"
+            status_detail = "compatible contract · " + " · ".join(gaps)
+
+        card.update(
+            {
+                "status": status,
+                "status_detail": status_detail,
+                "dimension": dimension,
+                "grid": int(grid or 0),
+                "in_channels": int(in_channels or 0),
+                "out_channels": int(out_channels or 0),
+                "max_steps": int(max_steps or 0),
+                "epoch": epoch,
+                "declared_epochs": declared_epochs,
+                "checkpoint_role": role,
+                "scenario": scenario,
+                "source_digest": source_digest if source_present else None,
+                "physics_contract": physics_id,
+                "support": support_lines,
+                "limitations": limitations,
+                "benchmark_report_hashes": report_hashes,
+                "unknown_fields": unknown_fields,
+                "fact_sources": {
+                    "dimension": "inspected_state_dict",
+                    "grid": "checkpoint_metadata" if grid else "unknown",
+                    "channels": "checkpoint_metadata" if in_channels else "unknown",
+                    "horizon": "checkpoint_metadata" if max_steps else "unknown",
+                    "scenario": (
+                        "checkpoint_metadata" if scenario != "unknown" else "unknown"
+                    ),
+                },
+            }
+        )
+        return card
+
+    def list_model_cards(self):
+        root = Path(self.research_dir)
+        managed = self.managed_model_dir
+        paths = [(path, False) for path in sorted(root.glob("*.pth"))]
+        if managed.is_dir():
+            paths.extend((path, True) for path in sorted(managed.glob("*.pth")))
+        return [
+            self.checkpoint_card(path, managed=is_managed)
+            for path, is_managed in paths
+        ]
+
+    def _probe_checkpoint_compatibility(self, path):
+        """Instantiate and load weights without changing the active model/cache."""
+        cache_key = str(Path(path).expanduser().resolve())
+        try:
+            self._load(cache_key)
+        finally:
+            self.cache.pop(cache_key, None)
+
+    def import_model(self, source):
+        source = Path(source).expanduser().resolve()
+        if source.suffix.lower() != ".pth":
+            issue = {
+                "code": "checkpoint.invalid_extension",
+                "field": "path",
+                "message": "model import requires a .pth checkpoint",
+                "severity": "error",
+            }
+            return {
+                "ok": False,
+                "error": issue["message"],
+                "validation": {
+                    "accepted": False,
+                    "status": "rejected",
+                    "summary": issue["message"],
+                    "issues": [issue],
+                    "candidate": {"name": source.name, "checkpoint_sha256": None},
+                },
+            }
+        if not source.is_file():
+            issue = {
+                "code": "checkpoint.not_found",
+                "field": "path",
+                "message": f"checkpoint does not exist: {source}",
+                "severity": "error",
+            }
+            return {
+                "ok": False,
+                "error": issue["message"],
+                "validation": {
+                    "accepted": False,
+                    "status": "rejected",
+                    "summary": issue["message"],
+                    "issues": [issue],
+                    "candidate": {"name": source.name, "checkpoint_sha256": None},
+                },
+            }
+        candidate = self.checkpoint_card(source)
+        if candidate["status"] == "invalid":
+            validation = self._validation(candidate)
+            return {
+                "ok": False,
+                "error": f"checkpoint rejected: {candidate['status_detail']}",
+                "validation": validation,
+            }
+        try:
+            self._probe_checkpoint_compatibility(source)
+        except Exception as exc:
+            issue = {
+                "code": "checkpoint.load_incompatible",
+                "field": "model_state_dict",
+                "message": f"checkpoint cannot load into a supported Reyn model: {exc}",
+                "severity": "error",
+            }
+            candidate["status"] = "invalid"
+            candidate["status_detail"] = issue["message"]
+            candidate["validation_issues"].append(issue)
+            return {
+                "ok": False,
+                "error": f"checkpoint rejected: {issue['message']}",
+                "validation": self._validation(candidate),
+            }
+
+        target_dir = self.managed_model_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / source.name
+        suffix = 2
+        while target.exists():
+            target = target_dir / f"{source.stem}-{suffix}{source.suffix}"
+            suffix += 1
+        shutil.copy2(source, target)
+        imported = self.checkpoint_card(target, managed=True)
+        return {
+            "ok": True,
+            "validation": self._validation(imported),
+            "imported": imported,
+            "models": self.list_model_cards(),
+        }
+
+    def delete_model(self, model_id):
+        target = (Path(self.research_dir) / model_id).resolve()
+        managed = self.managed_model_dir.resolve()
+        if target.parent != managed or target.suffix.lower() != ".pth":
+            raise ValueError("only checkpoints imported into Reyn Studio can be deleted")
+        if not target.is_file():
+            raise ValueError(f"managed checkpoint not found: {model_id}")
+        target.unlink()
+        target_id = self._model_id(target)
+        self.cache = {
+            key: value
+            for key, value in self.cache.items()
+            if self._model_id(Path(key)) != target_id
+        }
+        self.traj2d = {
+            key: value for key, value in self.traj2d.items() if key[0] != model_id
+        }
+        self.cad_cache = {
+            key: value for key, value in self.cad_cache.items() if key[0] != model_id
+        }
+        return self.list_model_cards()
 
     def _load(self, path):
         if path in self.cache:
@@ -132,7 +1045,16 @@ class Engine:
         m.load_state_dict(ck["model_state_dict"])
         m.eval()
         m.to(self.device)
+        checkpoint_meta = {
+            "train_args": dict(ck.get("train_args") or {}),
+            "epoch": ck.get("epoch"),
+            "checkpoint_role": ck.get("checkpoint_role"),
+            "best_metric": ck.get("best_metric"),
+            "source_fingerprint": ck.get("source_fingerprint"),
+        }
         info = {"model": m, "cfg": cfg, "ta": ck["train_args"], "is3d": is3d,
+                "epoch": ck.get("epoch", 0), "checkpoint_meta": checkpoint_meta,
+                "physics_spec": ck.get("physics_spec"),
                 "scenario": ck["train_args"].get("scenario",
                     "obstacle" if cfg["in_channels"] > cfg["out_channels"] else "free")}
         self.cache[path] = info
@@ -162,17 +1084,13 @@ class Engine:
                 pred = m(model_in.to(self.device), torch.tensor([[horizon * dt_frame]], device=self.device))
             field = pred[0].cpu().contiguous().numpy().astype(np.float32)  # [3, N, N, N]
         else:
-            # 2D → return a [3, N, N] field (w-channel zero) so the client is uniform
-            from obstacle_dataset import ObstacleFlowDataset
-            N = ta["grid_size"]
-            ds = ObstacleFlowDataset(num_trajectories=1, trajectory_length=horizon + 1,
-                                     N=N, solver_dt=ta["dt"], warmup_steps=ta["warmup_steps"],
-                                     seq_len=horizon + 1, stride=ta["stride"], seed=seed + 50000)
-            y0 = ds.trajectories[0][0:1]
-            mask = ds.masks[0].unsqueeze(0)
+            # 2D → return a [3, N, N] field (w-channel zero) so the client is uniform.
+            y0, mask, _, context = self._traj2d(path, seed, horizon + 1)
             with torch.no_grad():
-                pred = m(torch.cat([y0, mask], dim=1).to(self.device),
-                         torch.tensor([[horizon * dt_frame]], device=self.device))
+                pred = self._run_model_2d(
+                    info, y0, mask, context, horizon
+                )
+            N = ta["grid_size"]
             uv = pred[0].cpu().numpy().astype(np.float32)  # [2, N, N]
             field = np.concatenate([uv, np.zeros((1, N, N), np.float32)], 0)
 
@@ -180,10 +1098,16 @@ class Engine:
                 "dims": field.ndim - 1, "horizon": horizon}
         return field, meta
 
-    def _traj2d(self, model, seed, need_len):
+    def _traj2d(self, model, seed, need_len, seed_offset=50000):
         """Cached solver trajectory for a 2D model, so TimeJump only re-runs the
-        (fast) model forward pass per horizon instead of re-solving from scratch."""
-        key = (model, seed)
+        (fast) model forward pass per horizon instead of re-solving from scratch.
+
+        Interactive TimeJump defaults to the checkpoint-selection stream
+        (`seed_offset=50000`). Benchmark callers pass zero and supply exact,
+        independently classified test seeds.
+        """
+        effective_seed = int(seed) + int(seed_offset)
+        key = (model, effective_seed)
         cached = self.traj2d.get(key)
         if cached is not None and cached[2].shape[0] >= need_len:
             return cached
@@ -194,11 +1118,100 @@ class Engine:
         length = max(need_len, 33)  # cover a full scrub after the first (slow) gen
         ds = ObstacleFlowDataset(num_trajectories=1, trajectory_length=length, N=N,
                                  solver_dt=ta["dt"], warmup_steps=ta["warmup_steps"],
-                                 seq_len=length, stride=ta["stride"], seed=seed + 50000)
-        conditioned = info["cfg"]["in_channels"] > info["cfg"]["out_channels"]
-        out = (ds.trajectories[0][0:1], ds.masks[0].unsqueeze(0), ds.trajectories[0], conditioned)
+                                 seq_len=length, stride=ta["stride"], seed=effective_seed,
+                                 return_context=True)
+        trajectory, mask, context = ds[0]
+        physics_context = {
+            key: context[key].unsqueeze(0)
+            for key in ("nu", "sponge", "u_inf", "eta")
+        }
+        out = (
+            trajectory[0:1],
+            mask.unsqueeze(0),
+            trajectory,
+            physics_context,
+        )
         self.traj2d[key] = out
         return out
+
+    def _run_model_2d(self, info, state, mask, context, horizon):
+        """Run legacy or fixed-body-v2 checkpoints through their exact contract."""
+        torch = self.torch
+        cfg = info["cfg"]
+        device = self.device
+        state = state.to(device)
+        mask = mask.to(device)
+        dt_frame = info["ta"]["dt"] * info["ta"]["stride"]
+        dt = torch.full(
+            (state.shape[0], 1),
+            float(horizon) * dt_frame,
+            device=device,
+            dtype=state.dtype,
+        )
+        in_channels = int(cfg.get("in_channels", state.shape[1]))
+        out_value = cfg.get("out_channels")
+        out_channels = state.shape[1] if out_value is None else int(out_value)
+        param_dim = int(cfg.get("param_dim") or 0)
+
+        if in_channels == state.shape[1] and param_dim == 0:
+            packed, params = state, None
+        elif (
+            in_channels == state.shape[1] + 1
+            and out_channels == state.shape[1]
+            and param_dim == 0
+        ):
+            packed, params = torch.cat([state, mask], dim=1), None
+        elif (
+            in_channels == state.shape[1] + 2
+            and out_channels == state.shape[1]
+            and param_dim == 1
+        ):
+            from flow_contract import (
+                FIXED_BODY_V2,
+                FixedBodyContext2D,
+                FlowRequest2D,
+                pack_fixed_body_v2,
+            )
+            physics_spec = info.get("physics_spec")
+            if (
+                not isinstance(physics_spec, dict)
+                or physics_spec.get("physics_id") != FIXED_BODY_V2
+            ):
+                raise ValueError(
+                    "parameter-conditioned checkpoint lacks a fixed-body-v2 physics spec"
+                )
+            support = physics_spec.get("support")
+            support = support if isinstance(support, dict) else {}
+            nu_bounds = support.get("nu")
+            if (
+                not isinstance(nu_bounds, (list, tuple))
+                or len(nu_bounds) != 2
+            ):
+                raise ValueError("fixed-body-v2 checkpoint lacks viscosity support bounds")
+            sponge_scale = float(support.get("sponge_strength", 0.0))
+            fixed_body = FixedBodyContext2D(
+                solid_fraction=mask,
+                sponge_coefficient=context["sponge"].to(device),
+                nu=context["nu"].to(device),
+                u_inf=context["u_inf"].to(device),
+                eta=context["eta"].to(device),
+            )
+            packed, params = pack_fixed_body_v2(
+                FlowRequest2D(
+                    velocity=state,
+                    dt=dt,
+                    physics_id=FIXED_BODY_V2,
+                    fixed_body=fixed_body,
+                ),
+                nu_bounds=(float(nu_bounds[0]), float(nu_bounds[1])),
+                sponge_scale=sponge_scale,
+            )
+        else:
+            raise ValueError(
+                "unsupported 2D checkpoint contract: "
+                f"in={in_channels}, out={out_channels}, params={param_dim}"
+            )
+        return info["model"](packed, dt, params=params)
 
     def recover_pressure(self, field, method, tol, max_iter, periodic):
         """Recover pressure from a velocity field and report the Poisson-solve
@@ -228,15 +1241,15 @@ class Engine:
         return p, resid, 0
 
     def predict2d(self, req):
-        """2D field for the pressure-recovery view: AI velocity + recovered
-        pressure as `[3,N,N]` (u,v,p), a semigroup self-consistency number (Trust
-        Meter), the pressure recovery residual, and — when `want_truth` — the
-        solver truth `[3,N,N]` + RelL2/persist."""
+        """2D field for the pressure-recovery view: model velocity plus recovered
+        pressure as `[3,N,N]` (u,v,p), a semigroup self-consistency number, the
+        pressure-recovery residual, and—when legacy protocol flag ``want_truth``
+        is set—the solver reference `[3,N,N]` plus RelL2/persistence."""
         torch = self.torch
         info = self._load(req["model"])
         if info["is3d"]:
             raise ValueError("predict2d requires a 2D checkpoint")
-        m, ta = info["model"], info["ta"]
+        ta = info["ta"]
         dt_frame = ta["dt"] * ta["stride"]
         horizon = int(req.get("steps", ta["max_steps"]))
         seed = int(req.get("seed", 1))
@@ -247,14 +1260,12 @@ class Engine:
         periodic = req.get("boundary", "periodic") != "dirichlet"
         from flow_quantities import pressure_from_velocity
 
-        y0, mask, traj, conditioned = self._traj2d(req["model"], seed, horizon + 1)
-        device = self.device
-        mask_d = mask.to(device)
+        y0, mask, traj, context = self._traj2d(
+            req["model"], seed, horizon + 1
+        )
 
         def run(state, h):  # forward pass on the GPU
-            s = state.to(device)
-            model_in = torch.cat([s, mask_d], dim=1) if conditioned else s
-            return m(model_in, torch.tensor([[h * dt_frame]], device=device))
+            return self._run_model_2d(info, state, mask, context, h)
 
         with torch.no_grad():
             pred_d = run(y0, horizon)  # [1,2,N,N] on device
@@ -285,15 +1296,353 @@ class Engine:
         meta["has_truth"] = False
         return ai, meta
 
+    def pressure_3d(self, field):
+        """Spectral pressure recovery in 3D: solve ∇²p = −∇·((u·∇)u) in Fourier
+        space on the periodic box (the 3D mirror of flow_quantities). `field` is
+        `[1,3,N,N,N]` on CPU; returns `[N,N,N]`."""
+        torch = self.torch
+        N = field.shape[-1]
+        dx = 2.0 * math.pi / N
+        k1 = 2.0 * math.pi * torch.fft.fftfreq(N, d=dx)
+        if N % 2 == 0:
+            k1[N // 2] = 0.0
+        kx = k1.reshape(N, 1, 1)
+        ky = k1.reshape(1, N, 1)
+        kz = k1.reshape(1, 1, N)
+        u = field[0]  # [3,N,N,N]
+        uh = torch.fft.fftn(u, dim=(-3, -2, -1))
+        grads = []
+        for kdir in (kx, ky, kz):
+            grads.append(torch.fft.ifftn(1j * kdir * uh, dim=(-3, -2, -1)).real)  # [3,N,N,N]
+        adv = sum(u[a] * grads[a] for a in range(3))  # (u·∇)u -> [3,N,N,N]
+        advh = torch.fft.fftn(adv, dim=(-3, -2, -1))
+        div_adv = 1j * kx * advh[0] + 1j * ky * advh[1] + 1j * kz * advh[2]
+        k2 = kx ** 2 + ky ** 2 + kz ** 2
+        k2 = torch.where(k2 == 0, torch.ones_like(k2), k2)
+        p_hat = div_adv / k2
+        p_hat[0, 0, 0] = 0.0
+        return torch.fft.ifftn(p_hat, dim=(-3, -2, -1)).real
 
-def serve(research_dir):
+    def predict_cad(self, req, payload):
+        """CAD flow analysis: a voxelized STL mask (`[N³]` f32 payload) becomes a
+        wind-tunnel case — smooth the mask (training masks are tanh-smoothed),
+        develop the flow with the real Brinkman solver (cached per mask), then
+        one model pass at the requested horizon. Returns `[4,N,N,N]`: velocity +
+        spectrally-recovered pressure, for the surface-load view."""
+        import hashlib
+        torch = self.torch
+        info = self._load(req["model"])
+        if not info["is3d"] or info["cfg"]["in_channels"] <= info["cfg"]["out_channels"]:
+            raise ValueError("predict_cad needs a geometry-conditioned 3D checkpoint")
+        m, ta = info["model"], info["ta"]
+        N = ta["grid_size"]
+        if len(payload) != N ** 3 * 4:
+            raise ValueError(f"mask payload is {len(payload)} bytes; model grid {N} needs {N ** 3 * 4}")
+        mask_array = np.frombuffer(payload, np.float32).reshape(N, N, N).copy()
+        if not np.all(np.isfinite(mask_array)):
+            raise ValueError("CAD mask must contain only finite values")
+        if float(mask_array.min()) < 0.0 or float(mask_array.max()) > 1.0:
+            raise ValueError("CAD mask values must lie in [0, 1]")
+        if not np.any(mask_array > 0.5):
+            raise ValueError("CAD mask contains no solid voxels")
+        mask = torch.from_numpy(mask_array)
+        # ~1.5-cell smoothing (matches make_obstacle_mask_3d's tanh edges)
+        sm = mask.reshape(1, 1, N, N, N)
+        kernel = torch.ones(1, 1, 3, 3, 3) / 27.0
+        import torch.nn.functional as tF
+        for _ in range(2):
+            sm = tF.conv3d(tF.pad(sm, (1,) * 6, mode="replicate"), kernel)
+        mask_s = sm.reshape(N, N, N).clamp(0.0, 1.0)
+
+        char_len = float(req.get("char_len", 0.6))
+        reynolds = float(req.get("reynolds", 150.0))
+        reference_length_m = float(req.get("reference_length_m", 1.0))
+        velocity_mps = float(req.get("velocity_mps", 1.0))
+        density_kg_m3 = float(req.get("density_kg_m3", 1.225))
+        reference_pressure_pa = float(req.get("reference_pressure_pa", 101325.0))
+        engineering_values = {
+            "Reynolds number": reynolds,
+            "reference length": reference_length_m,
+            "free-stream speed": velocity_mps,
+            "density": density_kg_m3,
+            "reference pressure": reference_pressure_pa,
+        }
+        if any(not math.isfinite(value) for value in engineering_values.values()):
+            raise ValueError("engineering reference quantities must be finite")
+        if min(
+            reynolds,
+            reference_length_m,
+            velocity_mps,
+            density_kg_m3,
+        ) <= 0.0:
+            raise ValueError(
+                "Reynolds number, reference length, speed, and density must be positive"
+            )
+        if not 60.0 <= reynolds <= 400.0:
+            raise ValueError(
+                f"Reynolds number {reynolds:g} lies outside the qualified 60–400 envelope"
+            )
+        nu = 1.0 * char_len / reynolds
+        horizon = int(req.get("steps", ta["max_steps"]))
+        if horizon < 1 or horizon > int(ta["max_steps"]):
+            raise ValueError(
+                f"requested horizon {horizon} lies outside model support "
+                f"1–{int(ta['max_steps'])}"
+            )
+        dt_frame = ta["dt"] * ta["stride"]
+
+        digest = (req["model"], hashlib.sha1(payload).hexdigest(), reynolds)
+        developed = self.cad_cache.get(digest)
+        if developed is None:
+            from obstacle_solver_3d import ObstacleFlowSolver3D
+            solver = ObstacleFlowSolver3D(N=N, dt=ta["dt"], nu=nu, mask=mask_s)
+            field = solver.initial_field(seed=int(req.get("seed", 7)))
+            with torch.no_grad():
+                for _ in range(ta["warmup_steps"]):
+                    field = solver.step(field)
+            developed = field.detach().clone()
+            self.cad_cache[digest] = developed
+
+        device = self.device
+        with torch.no_grad():
+            model_in = torch.cat([developed, mask_s.reshape(1, 1, N, N, N)], dim=1).to(device)
+            pred = m(model_in, torch.tensor([[horizon * dt_frame]], device=device)).cpu()
+            p = self.pressure_3d(pred)
+
+        velocity = pred[0].numpy()
+        mask_bytes = mask_s.numpy().astype(np.float32)
+        loads = engineering_surface_loads(
+            velocity,
+            p.numpy(),
+            mask_bytes,
+            reynolds=reynolds,
+            char_len_solver=char_len,
+            reference_length_m=reference_length_m,
+            velocity_mps=velocity_mps,
+            density_kg_m3=density_kg_m3,
+            reference_pressure_pa=reference_pressure_pa,
+        )
+        out = np.concatenate(
+            [
+                velocity,
+                loads["pressure_pa"][None],
+                mask_bytes[None],
+                loads["cp"][None],
+                loads["traction_pa"],
+            ],
+            axis=0,
+        ).astype(np.float32)
+        meta = {"ok": True, "request_id": str(req.get("request_id", "")),
+                "shape": [9, N, N, N], "scenario": "cad", "dims": 3,
+                "horizon": horizon, "dt_frame": dt_frame, "reynolds": reynolds,
+                "char_len": char_len, "solver_dt": float(ta["dt"]),
+                "solver_stride": int(ta["stride"]),
+                "warmup_steps": int(ta["warmup_steps"]),
+                "has_pressure": True,
+                "peak_p": float(loads["pressure_pa"].max()),
+                "low_p": float(loads["pressure_pa"].min()),
+                "force_coefficients": loads["force_coefficients"],
+                "moment_coefficients": loads["moment_coefficients"],
+                "force_newtons": loads["force_newtons"],
+                "moment_newton_meters": loads["moment_newton_meters"],
+                "surface_area_m2": loads["surface_area_m2"],
+                "pressure_force_fraction": loads["pressure_force_fraction"],
+                "load_hotspot": loads["load_hotspot"],
+                "suction_hotspot": loads["suction_hotspot"],
+                "divergence_rms": loads["divergence_rms"],
+                "wake_deficit_peak": loads["wake_deficit_peak"],
+                "wake_deficit_mean": loads["wake_deficit_mean"],
+                "load_method": loads["method"],
+                "warnings": loads["warnings"]}
+        return out.reshape(-1), meta
+
+    def run_benchmark(self, req):
+        """N5 — one 2D model × exact test seeds × horizons.
+
+        Unlike the interactive validation view, benchmark seeds are not offset
+        into the `train seed + 50000` checkpoint-selection stream.
+        """
+        torch = self.torch
+        info = self._load(req["model"])
+        if info["is3d"]:
+            raise ValueError("run_benchmark currently drives 2D checkpoints")
+        ta = info["ta"]
+        dt_frame = ta["dt"] * ta["stride"]
+        seeds = [int(s) for s in req.get("seeds", [70000, 70001, 70002])]
+        horizons = [int(h) for h in req.get("horizons", [1, 4, 8, 16])]
+        if not seeds or not horizons:
+            raise ValueError("benchmark requires at least one seed and horizon")
+        if any(seed < 0 for seed in seeds) or any(horizon < 1 for horizon in horizons):
+            raise ValueError("benchmark seeds must be nonnegative and horizons positive")
+        t0 = __import__("time").time()
+        rel, persist = [], []
+        for seed in seeds:
+            y0, mask, traj, context = self._traj2d(
+                req["model"], seed, max(horizons) + 1, seed_offset=0
+            )
+            row_r, row_p = [], []
+            with torch.no_grad():
+                for h in horizons:
+                    target = traj[h:h + 1]
+                    pred = self._run_model_2d(
+                        info, y0, mask, context, h
+                    ).cpu()
+                    row_r.append(float((torch.norm(pred - target) / (torch.norm(target) + 1e-9)).item()))
+                    row_p.append(float((torch.norm(y0 - target) / (torch.norm(target) + 1e-9)).item()))
+            rel.append(row_r)
+            persist.append(row_p)
+        flat = [x for row in rel for x in row]
+        return {"ok": True, "seeds": seeds, "horizons": horizons, "rel": rel,
+                "persist": persist, "global_rel": sum(flat) / max(1, len(flat)),
+                "runtime_s": __import__("time").time() - t0,
+                "grid": ta["grid_size"], "epoch": info.get("epoch", 0),
+                "dt_frame": dt_frame,
+                "provenance": analyze_checkpoint_provenance(
+                    info["checkpoint_meta"], seeds
+                )}
+
+    def inspect_benchmark_cell(self, req):
+        """On-demand per-variable, spatial, and spectral evidence for one cell."""
+        torch = self.torch
+        info = self._load(req["model"])
+        if info["is3d"]:
+            raise ValueError("benchmark inspector currently drives 2D checkpoints")
+        seed = int(req["seed"])
+        horizon = int(req["horizon"])
+        if seed < 0 or horizon < 1:
+            raise ValueError("inspector seed must be nonnegative and horizon positive")
+        ta = info["ta"]
+        dt_frame = ta["dt"] * ta["stride"]
+        y0, mask, traj, context = self._traj2d(
+            req["model"], seed, horizon + 1, seed_offset=0
+        )
+        with torch.no_grad():
+            pred = self._run_model_2d(
+                info, y0, mask, context, horizon
+            ).cpu()
+        truth = traj[horizon:horizon + 1]
+        evidence = benchmark_cell_evidence(
+            pred[0].numpy(), truth[0].numpy(), y0[0].numpy()
+        )
+        provenance = analyze_checkpoint_provenance(
+            info["checkpoint_meta"], [seed]
+        )
+        seed_record = provenance["benchmark_seeds"][0]
+        n = int(pred.shape[-1])
+        requested_schema = req.get("evidence_schema")
+        if requested_schema in (None, ""):
+            # Backward-compatible velocity-only payload for older native clients.
+            payload = np.concatenate([
+                evidence["model_speed"].reshape(-1),
+                evidence["truth_speed"].reshape(-1),
+                evidence["error_map"].reshape(-1),
+            ]).astype(np.float32)
+            map_meta = {"shape": [3, n, n]}
+        elif requested_schema == INSPECTOR_SCHEMA:
+            payload, map_meta = inspector_payload(
+                pred[0].numpy(), truth[0].numpy()
+            )
+        else:
+            raise ValueError(
+                f"unsupported benchmark inspector evidence schema: {requested_schema}"
+            )
+        meta = {
+            "ok": True,
+            **map_meta,
+            "seed": seed,
+            "horizon": horizon,
+            "dt_frame": dt_frame,
+            "seed_stream": seed_record["stream"],
+            "provenance_status": provenance["verdict"],
+            "rel_l2": evidence["rel_l2"],
+            "persist_rel_l2": evidence["persist_rel_l2"],
+            "improvement_ratio": evidence["improvement_ratio"],
+            "mean_abs_error": evidence["mean_abs_error"],
+            "p95_abs_error": evidence["p95_abs_error"],
+            "max_abs_error": evidence["max_abs_error"],
+            "divergence_model_rms": evidence["divergence_model_rms"],
+            "divergence_truth_rms": evidence["divergence_truth_rms"],
+            "divergence_error_rms": evidence["divergence_error_rms"],
+            "spectrum_rel_l2": evidence["spectrum_rel_l2"],
+            "spectrum_k": evidence["spectrum_k"].tolist(),
+            "spectrum_model": evidence["spectrum_model"].tolist(),
+            "spectrum_truth": evidence["spectrum_truth"].tolist(),
+        }
+        return payload, meta
+
+    def predict_ic(self, req, payload):
+        """Flow Painter: advance a USER-painted `[2,N,N]` velocity IC (carried as
+        the request payload, already divergence-free client-side) with a 2D
+        model. Mask-conditioned models get a zero mask — use a checkpoint trained
+        with --empty-fraction (the unified model) for in-distribution behaviour.
+        Stateless: the IC rides with every request, so TimeJump re-scrubs are
+        just new horizons over the same payload. A painted IC has no solver
+        reference trajectory; the semigroup number reports self-consistency,
+        not accuracy."""
+        torch = self.torch
+        info = self._load(req["model"])
+        if info["is3d"]:
+            raise ValueError("predict_ic requires a 2D checkpoint")
+        m, ta = info["model"], info["ta"]
+        N = ta["grid_size"]
+        expect = 2 * N * N * 4
+        if len(payload) != expect:
+            raise ValueError(f"IC payload is {len(payload)} bytes; model grid {N} needs {expect}")
+        ic = np.frombuffer(payload, dtype=np.float32).reshape(1, 2, N, N).copy()
+        y0 = torch.from_numpy(ic)
+        dt_frame = ta["dt"] * ta["stride"]
+        horizon = int(req.get("steps", ta["max_steps"]))
+        method = req.get("method", "spectral")
+        tol = float(req.get("tolerance", 1e-5))
+        max_iter = int(req.get("max_iter", 400))
+        periodic = req.get("boundary", "periodic") != "dirichlet"
+
+        conditioned = info["cfg"]["in_channels"] > info["cfg"]["out_channels"]
+        device = self.device
+        mask_d = torch.zeros(1, 1, N, N, device=device) if conditioned else None
+
+        def run(state, h):
+            s = state.to(device)
+            model_in = torch.cat([s, mask_d], dim=1) if conditioned else s
+            return m(model_in, torch.tensor([[h * dt_frame]], device=device))
+
+        with torch.no_grad():
+            pred_d = run(y0, horizon)
+            semi = None
+            if horizon >= 2 and horizon % 2 == 0:
+                half = horizon // 2
+                comp = run(run(y0, half), half)
+                semi = float((torch.norm(comp - pred_d) / (torch.norm(pred_d) + 1e-9)).item())
+            pred = pred_d.cpu()
+            p_ai, p_resid, p_iters = self.recover_pressure(pred, method, tol, max_iter, periodic)
+
+        ai = torch.cat([pred[0], p_ai.unsqueeze(0)], 0).numpy().astype(np.float32)
+        meta = {"ok": True, "shape": [3, N, N], "scenario": "painted", "dims": 2,
+                "horizon": horizon, "dt_frame": dt_frame,
+                "peak_p": float(p_ai.max()), "low_p": float(p_ai.min()), "semigroup": semi,
+                "p_residual": p_resid, "p_iters": p_iters, "method": method,
+                "has_truth": False}
+        return ai, meta
+
+
+def serve(research_dir, device="auto"):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     port = srv.getsockname()[1]
-    engine = Engine(research_dir)
-    print("READY " + json.dumps({"port": port}), flush=True)
+    try:
+        engine = Engine(research_dir, device)
+    except Exception as exc:
+        print("READY " + json.dumps({"error": str(exc)}), flush=True)
+        return
+    print(
+        "READY "
+        + json.dumps(
+            {"port": port, "device": str(engine.device), "research_dir": engine.research_dir}
+        ),
+        flush=True,
+    )
     # After the handshake we talk only over the socket. Silence stdout so library
     # prints (e.g. dataset generation) don't hit the closed pipe and SIGPIPE us.
     sys.stdout.flush()
@@ -302,7 +1651,7 @@ def serve(research_dir):
     conn, _ = srv.accept()
     while True:
         try:
-            obj, _ = recv(conn)
+            obj, payload = recv(conn)
         except (ConnectionError, OSError):
             break
         op = obj.get("op")
@@ -310,12 +1659,28 @@ def serve(research_dir):
             if op == "ping":
                 send(conn, {"ok": True})
             elif op == "list_models":
-                send(conn, {"ok": True, "models": list_checkpoints(research_dir)})
+                send(conn, {"ok": True, "models": engine.list_model_cards()})
+            elif op == "import_model":
+                send(conn, engine.import_model(obj.get("path", "")))
+            elif op == "delete_model":
+                models = engine.delete_model(obj.get("model", ""))
+                send(conn, {"ok": True, "deleted": obj.get("model"), "models": models})
             elif op == "predict_field":
                 field, meta = engine.predict_field(obj)
                 send(conn, meta, field.tobytes())
             elif op == "predict2d":
                 field, meta = engine.predict2d(obj)
+                send(conn, meta, field.tobytes())
+            elif op == "predict_ic":
+                field, meta = engine.predict_ic(obj, payload)
+                send(conn, meta, field.tobytes())
+            elif op == "predict_cad":
+                field, meta = engine.predict_cad(obj, payload)
+                send(conn, meta, field.tobytes())
+            elif op == "run_benchmark":
+                send(conn, engine.run_benchmark(obj))
+            elif op == "inspect_benchmark_cell":
+                field, meta = engine.inspect_benchmark_cell(obj)
                 send(conn, meta, field.tobytes())
             else:
                 send(conn, {"ok": False, "error": f"unknown op: {op}"})
@@ -326,4 +1691,6 @@ def serve(research_dir):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--research-dir", required=True)
-    serve(p.parse_args().research_dir)
+    p.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
+    args = p.parse_args()
+    serve(args.research_dir, args.device)

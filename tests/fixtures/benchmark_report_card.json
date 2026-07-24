@@ -1,0 +1,222 @@
+{
+  "authenticity": {
+    "reason": "no organization-key signature was produced",
+    "signature": null,
+    "status": "UNSIGNED"
+  },
+  "canonicalization": "SHA-256 over compact UTF-8 JSON for this object before integrity_sha256 is inserted; object keys use serde_json lexical order",
+  "epoch": 20,
+  "global_rel_l2": 0.15,
+  "grid": 32,
+  "horizons": [
+    1,
+    4
+  ],
+  "integrity_algorithm": "SHA-256",
+  "limitations": [
+    "a numerical solver output is a solver reference, not automatically physical truth",
+    "recovered pressure is density-normalized and is not physical Cp without a recorded reference state",
+    "RNG-stream non-collision is not field-space or trajectory non-overlap",
+    "consistency, provenance, integrity, authenticity, and independent accuracy/validation are separate claims"
+  ],
+  "model": "fixture.pth",
+  "model_checkpoint_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "persistence": [
+    [
+      0.4,
+      0.6
+    ]
+  ],
+  "product": "reyn-studio",
+  "protocol": "exact benchmark RNG seeds; training, mixed-fork (+10000), and validation/checkpoint-selection (+50000) streams classified from checkpoint metadata; validation is never independent test evidence",
+  "protocol_id": "reyn.benchmark.seed-horizon.v1",
+  "provenance": {
+    "benchmark_seeds": [
+      {
+        "overlap": false,
+        "seed": 70000,
+        "stream": "fresh_test"
+      }
+    ],
+    "checked_proposition": "no collision in checked RNG streams",
+    "checkpoint_epoch": 20,
+    "checkpoint_role": "legacy/unknown",
+    "dataset": "standard",
+    "declared_epochs": 20,
+    "final_epoch_status": "final_epoch_role_unknown",
+    "flags": [],
+    "legacy_unknown": [
+      "checkpoint role absent",
+      "source fingerprint absent"
+    ],
+    "mixed_fork_stream_seed": 10000,
+    "mixed_fork_used": false,
+    "overlap_count": 0,
+    "overlap_pct": 0.0,
+    "selection_metric": "val_multi_horizon_rel_l2",
+    "selection_stream": "validation",
+    "source_fingerprint_digest": null,
+    "source_fingerprint_present": false,
+    "training_stream_seed": 0,
+    "validation_checkpoint_selection_stream_seed": 50000,
+    "validation_is_independent_test": false,
+    "verdict": "clean"
+  },
+  "rel_l2": [
+    [
+      0.1,
+      0.2
+    ]
+  ],
+  "report_schema": "reyn.benchmark-report-card.v1",
+  "run_id": "61f596e7-8414-488e-b764-0a1dfe671d1a",
+  "runtime_s": 1.25,
+  "seeds": [
+    70000
+  ],
+  "selected_cell_evidence": {
+    "divergence_rms": {
+      "error": 0.0011,
+      "model": 0.001,
+      "solver_reference": 0.0001
+    },
+    "energy_spectrum": {
+      "model": [
+        2.0
+      ],
+      "relative_l2": 0.2,
+      "solver_reference": [
+        1.8
+      ],
+      "wavenumber": [
+        1.0
+      ]
+    },
+    "error_magnitude": {
+      "max": 3.0,
+      "mean": 1.0,
+      "p95": 2.0
+    },
+    "horizon": 1,
+    "improvement_ratio": 4.0,
+    "persistence_rel_l2": 0.4,
+    "provenance_checked_proposition": "no collision in checked RNG streams",
+    "provenance_status": "clean",
+    "rel_l2": 0.1,
+    "seed": 70000,
+    "seed_stream": "fresh_test",
+    "spatial_variable_evidence": {
+      "derivative": "fourier_spectral_nyquist_zero",
+      "domain": "periodic_2pi",
+      "layout": "variable,model_reference_error,y,x",
+      "maps_embedded": false,
+      "pressure": "advective_poisson_density_normalized_zero_mean",
+      "protocol_version": 2,
+      "schema": "reyn.benchmark-inspector.maps.v2",
+      "variables": [
+        {
+          "absolute_error": {
+            "max": 11.0,
+            "mean": 9.5,
+            "p95": 11.0
+          },
+          "comparison_scale": 7.0,
+          "error_scale": 11.0,
+          "key": "velocity",
+          "label": "Velocity",
+          "method": "pointwise velocity magnitude; error is the magnitude of model velocity minus solver-reference velocity",
+          "rms": {
+            "error": 9.565563,
+            "model": 1.8708287,
+            "solver_reference": 5.612486
+          },
+          "signed": false,
+          "sources": {
+            "error": "DERIVED",
+            "model": "MODEL",
+            "solver_reference": "SOLVER_REFERENCE"
+          },
+          "symbol": "|u|",
+          "unit": "solver_velocity_unit"
+        },
+        {
+          "absolute_error": {
+            "max": 23.0,
+            "mean": 21.5,
+            "p95": 23.0
+          },
+          "comparison_scale": 19.0,
+          "error_scale": 23.0,
+          "key": "vorticity",
+          "label": "Vorticity",
+          "method": "derived Fourier-spectral curl on the periodic 2pi domain",
+          "rms": {
+            "error": 21.52905,
+            "model": 13.547325,
+            "solver_reference": 17.535679
+          },
+          "signed": true,
+          "sources": {
+            "error": "DERIVED",
+            "model": "DERIVED_FROM_MODEL",
+            "solver_reference": "DERIVED_FROM_SOLVER_REFERENCE"
+          },
+          "symbol": "omega",
+          "unit": "inverse_solver_time_unit"
+        },
+        {
+          "absolute_error": {
+            "max": 35.0,
+            "mean": 33.5,
+            "p95": 35.0
+          },
+          "comparison_scale": 31.0,
+          "error_scale": 35.0,
+          "key": "pressure",
+          "label": "Recovered pressure",
+          "method": "recovered by advective Poisson; density-normalized and zero-mean",
+          "rms": {
+            "error": 33.51865,
+            "model": 25.529394,
+            "solver_reference": 29.52118
+          },
+          "signed": true,
+          "sources": {
+            "error": "DERIVED",
+            "model": "RECOVERED_FROM_MODEL",
+            "solver_reference": "RECOVERED_FROM_SOLVER_REFERENCE"
+          },
+          "symbol": "p/rho",
+          "unit": "solver_velocity_unit_squared"
+        },
+        {
+          "absolute_error": {
+            "max": 47.0,
+            "mean": 45.5,
+            "p95": 47.0
+          },
+          "comparison_scale": 43.0,
+          "error_scale": 47.0,
+          "key": "divergence",
+          "label": "Spatial divergence",
+          "method": "derived Fourier-spectral pointwise du/dx plus dv/dy",
+          "rms": {
+            "error": 45.513733,
+            "model": 37.516663,
+            "solver_reference": 41.515057
+          },
+          "signed": true,
+          "sources": {
+            "error": "DERIVED",
+            "model": "DERIVED_FROM_MODEL",
+            "solver_reference": "DERIVED_FROM_SOLVER_REFERENCE"
+          },
+          "symbol": "div u",
+          "unit": "inverse_solver_time_unit"
+        }
+      ]
+    }
+  },
+  "timestamp_unix": 42,
+  "version": "0.1.0"
+}

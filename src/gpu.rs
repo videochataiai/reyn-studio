@@ -25,9 +25,9 @@ pub struct GpuInstance {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SegInstance {
-    pub p0: [f32; 2],    // NDC endpoints
+    pub p0: [f32; 2], // NDC endpoints
     pub p1: [f32; 2],
-    pub width_px: f32,   // ribbon half-width in physical px
+    pub width_px: f32, // ribbon half-width in physical px
     pub _pad: f32,
     pub color: [f32; 4], // HDR rgb
 }
@@ -86,8 +86,14 @@ pub struct BloomRenderer {
     volume_bgl: wgpu::BindGroupLayout,
     volume_uni: wgpu::Buffer,
     vol_tex: Option<(wgpu::Texture, [u32; 3])>,
+    vol_view: Option<wgpu::TextureView>,
     volume_bg: Option<wgpu::BindGroup>,
     vol_version: u64,
+    // CAD surface-load layer: solid mask + normalized pressure (R8, 3D)
+    surf_tex: Option<(wgpu::Texture, wgpu::Texture, [u32; 3])>,
+    surf_views: Option<(wgpu::TextureView, wgpu::TextureView)>,
+    surf_version: u64,
+    dummy_views: (wgpu::TextureView, wgpu::TextureView), // keep the layout bound without CAD
 }
 
 impl BloomRenderer {
@@ -143,7 +149,12 @@ impl BloomRenderer {
         });
         let comp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("reyn.comp.bgl"),
-            entries: &[samp(0), tex(1), tex(2), uni(3, wgpu::ShaderStages::FRAGMENT)],
+            entries: &[
+                samp(0),
+                tex(1),
+                tex(2),
+                uni(3, wgpu::ShaderStages::FRAGMENT),
+            ],
         });
 
         let particle_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -231,8 +242,12 @@ impl BloomRenderer {
         let bright_pipe = fs_pipe("reyn.bright", &post_pl, &post_mod, "fs_bright", HDR, None);
         let blur_pipe = fs_pipe("reyn.blur", &post_pl, &post_mod, "fs_blur", HDR, None);
         let composite_pipe = fs_pipe(
-            "reyn.composite", &comp_pl, &comp_mod, "fs_composite",
-            surface_format, Some(ADDITIVE),
+            "reyn.composite",
+            &comp_pl,
+            &comp_mod,
+            "fs_composite",
+            surface_format,
+            Some(ADDITIVE),
         );
 
         // -- volume raymarch pipeline (3D |ω| texture -> HDR scene) -------------
@@ -252,14 +267,27 @@ impl BloomRenderer {
         };
         let volume_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("reyn.volume.bgl"),
-            entries: &[uni(0, wgpu::ShaderStages::FRAGMENT), tex3d(1), samp(2)],
+            entries: &[
+                uni(0, wgpu::ShaderStages::FRAGMENT),
+                tex3d(1),
+                samp(2),
+                tex3d(3),
+                tex3d(4),
+            ],
         });
         let volume_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("reyn.volume.pl"),
             bind_group_layouts: &[Some(&volume_bgl)],
             immediate_size: 0,
         });
-        let volume_pipe = fs_pipe("reyn.volume", &volume_pl, &volume_mod, "fs_volume", HDR, None);
+        let volume_pipe = fs_pipe(
+            "reyn.volume",
+            &volume_pl,
+            &volume_mod,
+            "fs_volume",
+            HDR,
+            None,
+        );
 
         // -- streamline ribbon pipeline (HDR additive tubes, shares particle_uni) --
         let seg_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -305,23 +333,47 @@ impl BloomRenderer {
             ..Default::default()
         });
 
-        let uni_buf = |label, size| device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let uni_buf = |label, size| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         let particle_uni = uni_buf("reyn.particle.uni", 16);
         let bright_uni = uni_buf("reyn.bright.uni", 16);
         let blur_h_uni = uni_buf("reyn.blur_h.uni", 16);
         let blur_v_uni = uni_buf("reyn.blur_v.uni", 16);
         let comp_uni = uni_buf("reyn.comp.uni", 16);
-        let volume_uni = uni_buf("reyn.volume.uni", 48);
+        let volume_uni = uni_buf("reyn.volume.uni", 64);
+
+        let dummy3d = |label: &str| {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            t.create_view(&Default::default())
+        };
+        let dummy_views = (dummy3d("reyn.dummy.mask"), dummy3d("reyn.dummy.p"));
 
         let particle_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("reyn.particle.bg"),
             layout: &particle_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: particle_uni.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: particle_uni.as_entire_binding(),
+            }],
         });
 
         let instance_cap = 8192;
@@ -340,11 +392,36 @@ impl BloomRenderer {
         });
 
         Self {
-            particle_pipe, bright_pipe, blur_pipe, composite_pipe,
-            post_bgl, comp_bgl, sampler,
-            particle_bg, particle_uni, bright_uni, blur_h_uni, blur_v_uni, comp_uni,
-            instances, instance_cap, seg_pipe, segments, seg_cap, targets: None,
-            volume_pipe, volume_bgl, volume_uni, vol_tex: None, volume_bg: None, vol_version: 0,
+            particle_pipe,
+            bright_pipe,
+            blur_pipe,
+            composite_pipe,
+            post_bgl,
+            comp_bgl,
+            sampler,
+            particle_bg,
+            particle_uni,
+            bright_uni,
+            blur_h_uni,
+            blur_v_uni,
+            comp_uni,
+            instances,
+            instance_cap,
+            seg_pipe,
+            segments,
+            seg_cap,
+            targets: None,
+            volume_pipe,
+            volume_bgl,
+            volume_uni,
+            vol_tex: None,
+            vol_view: None,
+            volume_bg: None,
+            vol_version: 0,
+            surf_tex: None,
+            surf_views: None,
+            surf_version: 0,
+            dummy_views,
         }
     }
 
@@ -354,12 +431,17 @@ impl BloomRenderer {
             device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: HDR,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 })
                 .create_view(&Default::default())
@@ -373,9 +455,18 @@ impl BloomRenderer {
                 label: Some(label),
                 layout: &self.post_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(tex) },
-                    wgpu::BindGroupEntry { binding: 2, resource: uni.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(tex),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: uni.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -386,13 +477,34 @@ impl BloomRenderer {
             label: Some("reyn.composite.bg"),
             layout: &self.comp_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&scene) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bloom_a) },
-                wgpu::BindGroupEntry { binding: 3, resource: self.comp_uni.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&scene),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&bloom_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.comp_uni.as_entire_binding(),
+                },
             ],
         });
-        Targets { size, scene, bloom_a, bloom_b, bright_bg, blur_h_bg, blur_v_bg, composite_bg }
+        Targets {
+            size,
+            scene,
+            bloom_a,
+            bloom_b,
+            bright_bg,
+            blur_h_bg,
+            blur_v_bg,
+            composite_bg,
+        }
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, size: [u32; 2]) {
@@ -402,31 +514,82 @@ impl BloomRenderer {
     }
 
     /// Shared bloom-post uniforms (bright threshold, blur dirs+texel, composite params).
-    fn write_post_uniforms(&self, queue: &wgpu::Queue, size: [u32; 2], strength: f32, exposure: f32, threshold: f32) {
+    fn write_post_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        size: [u32; 2],
+        strength: f32,
+        exposure: f32,
+        threshold: f32,
+    ) {
         let half = [size[0].div_ceil(2).max(1), size[1].div_ceil(2).max(1)];
         let htex = [1.0 / half[0] as f32, 1.0 / half[1] as f32];
-        queue.write_buffer(&self.bright_uni, 0, bytemuck::cast_slice(&[threshold, 0.0, 0.0, 0.0]));
-        queue.write_buffer(&self.blur_h_uni, 0, bytemuck::cast_slice(&[1.0, 0.0, htex[0], htex[1]]));
-        queue.write_buffer(&self.blur_v_uni, 0, bytemuck::cast_slice(&[0.0, 1.0, htex[0], htex[1]]));
-        queue.write_buffer(&self.comp_uni, 0, bytemuck::cast_slice(&[strength, exposure, 0.0, 0.0]));
+        queue.write_buffer(
+            &self.bright_uni,
+            0,
+            bytemuck::cast_slice(&[threshold, 0.0, 0.0, 0.0]),
+        );
+        queue.write_buffer(
+            &self.blur_h_uni,
+            0,
+            bytemuck::cast_slice(&[1.0, 0.0, htex[0], htex[1]]),
+        );
+        queue.write_buffer(
+            &self.blur_v_uni,
+            0,
+            bytemuck::cast_slice(&[0.0, 1.0, htex[0], htex[1]]),
+        );
+        queue.write_buffer(
+            &self.comp_uni,
+            0,
+            bytemuck::cast_slice(&[strength, exposure, 0.0, 0.0]),
+        );
     }
 
     /// Bright pass + two separable gaussian iterations (scene -> bloom_a).
     fn bloom_post(&self, encoder: &mut wgpu::CommandEncoder) {
         let t = self.targets.as_ref().unwrap();
-        fullscreen(encoder, "reyn.pass.bright", &t.bloom_a, &self.bright_pipe, &t.bright_bg);
+        fullscreen(
+            encoder,
+            "reyn.pass.bright",
+            &t.bloom_a,
+            &self.bright_pipe,
+            &t.bright_bg,
+        );
         for _ in 0..2 {
-            fullscreen(encoder, "reyn.pass.blurH", &t.bloom_b, &self.blur_pipe, &t.blur_h_bg);
-            fullscreen(encoder, "reyn.pass.blurV", &t.bloom_a, &self.blur_pipe, &t.blur_v_bg);
+            fullscreen(
+                encoder,
+                "reyn.pass.blurH",
+                &t.bloom_b,
+                &self.blur_pipe,
+                &t.blur_h_bg,
+            );
+            fullscreen(
+                encoder,
+                "reyn.pass.blurV",
+                &t.bloom_a,
+                &self.blur_pipe,
+                &t.blur_v_bg,
+            );
         }
     }
 
     /// (Re)upload the 3D scalar (|ω|) texture and rebuild its bind group.
-    fn upload_volume(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8], dims: [u32; 3]) {
+    fn upload_volume(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[u8],
+        dims: [u32; 3],
+    ) {
         if self.vol_tex.as_ref().map(|(_, d)| *d) != Some(dims) {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("reyn.volume.tex"),
-                size: wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] },
+                size: wgpu::Extent3d {
+                    width: dims[0],
+                    height: dims[1],
+                    depth_or_array_layers: dims[2],
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D3,
@@ -445,16 +608,101 @@ impl BloomRenderer {
                 bytes_per_row: Some(dims[0]),
                 rows_per_image: Some(dims[1]),
             },
-            wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] },
+            wgpu::Extent3d {
+                width: dims[0],
+                height: dims[1],
+                depth_or_array_layers: dims[2],
+            },
         );
-        let view = tex.create_view(&Default::default());
+        self.vol_view = Some(tex.create_view(&Default::default()));
+        self.rebuild_volume_bg(device);
+    }
+
+    /// (Re)upload the CAD surface layer: the solid mask and the normalized
+    /// pressure, both R8 3D textures sampled by the raymarch for load shading.
+    fn upload_surface(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mask: &[u8],
+        pressure: &[u8],
+        dims: [u32; 3],
+    ) {
+        if self.surf_tex.as_ref().map(|(_, _, d)| *d) != Some(dims) {
+            let mk = |label: &str| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: dims[0],
+                        height: dims[1],
+                        depth_or_array_layers: dims[2],
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            };
+            self.surf_tex = Some((mk("reyn.surf.mask"), mk("reyn.surf.p"), dims));
+        }
+        let (mt, pt, _) = self.surf_tex.as_ref().unwrap();
+        for (tex, bytes) in [(mt, mask), (pt, pressure)] {
+            queue.write_texture(
+                tex.as_image_copy(),
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dims[0]),
+                    rows_per_image: Some(dims[1]),
+                },
+                wgpu::Extent3d {
+                    width: dims[0],
+                    height: dims[1],
+                    depth_or_array_layers: dims[2],
+                },
+            );
+        }
+        self.surf_views = Some((
+            mt.create_view(&Default::default()),
+            pt.create_view(&Default::default()),
+        ));
+        self.rebuild_volume_bg(device);
+    }
+
+    fn rebuild_volume_bg(&mut self, device: &wgpu::Device) {
+        let Some(vol) = self.vol_view.as_ref() else {
+            return;
+        };
+        let (mv, pv) = match self.surf_views.as_ref() {
+            Some((m, p)) => (m, p),
+            None => (&self.dummy_views.0, &self.dummy_views.1),
+        };
         self.volume_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("reyn.volume.bg"),
             layout: &self.volume_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.volume_uni.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.volume_uni.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(vol),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(mv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(pv),
+                },
             ],
         }));
     }
@@ -479,7 +727,9 @@ impl CallbackTrait for FlowCallback {
         encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(r) = resources.get_mut::<BloomRenderer>() else { return Vec::new() };
+        let Some(r) = resources.get_mut::<BloomRenderer>() else {
+            return Vec::new();
+        };
         let size = [self.size_px[0].max(1), self.size_px[1].max(1)];
         r.ensure_targets(device, size);
 
@@ -512,8 +762,18 @@ impl CallbackTrait for FlowCallback {
             queue.write_buffer(&r.segments, 0, bytemuck::cast_slice(&self.segments));
         }
         let inv = [1.0 / size[0] as f32, 1.0 / size[1] as f32];
-        queue.write_buffer(&r.particle_uni, 0, bytemuck::cast_slice(&[inv[0], inv[1], 0.0, 0.0]));
-        r.write_post_uniforms(queue, size, self.bloom_strength, self.exposure, self.threshold);
+        queue.write_buffer(
+            &r.particle_uni,
+            0,
+            bytemuck::cast_slice(&[inv[0], inv[1], 0.0, 0.0]),
+        );
+        r.write_post_uniforms(
+            queue,
+            size,
+            self.bloom_strength,
+            self.exposure,
+            self.threshold,
+        );
 
         // pass 1: additive particles + streamline ribbons -> scene
         {
@@ -558,7 +818,9 @@ impl CallbackTrait for FlowCallback {
 /// 0..1 UVs map 1:1 onto the viewport-sized targets; tonemap `scene + bloom`,
 /// blend additively over the panel.
 fn composite_paint(render_pass: &mut wgpu::RenderPass<'static>, resources: &CallbackResources) {
-    let Some(r) = resources.get::<BloomRenderer>() else { return };
+    let Some(r) = resources.get::<BloomRenderer>() else {
+        return;
+    };
     let Some(t) = r.targets.as_ref() else { return };
     render_pass.set_pipeline(&r.composite_pipe);
     render_pass.set_bind_group(0, &t.composite_bg, &[]);
@@ -573,10 +835,23 @@ pub struct VolumeData {
     pub version: u64,
 }
 
+/// CAD surface-load layer for the raymarch: solid mask + pressure normalized to
+/// `[0,1]` (0.5 = zero), both `[dims]` R8 volumes.
+#[derive(Clone)]
+pub struct SurfaceData {
+    pub mask: std::sync::Arc<Vec<u8>>,
+    pub pressure: std::sync::Arc<Vec<u8>>,
+    pub dims: [u32; 3],
+    pub version: u64,
+}
+
 /// Per-frame volume raymarch (isosurface / density view). Casts a ray per pixel
 /// through the |ω| volume, emission-absorption composites the density window,
 /// clips at the slice planes, optionally light-marches for volumetric shadows,
-/// and feeds the same bloom post so the isosurfaces glow.
+/// and feeds the same bloom post so the isosurfaces glow. With a `surface`
+/// layer, rays that enter the solid shade it by display-normalized recovered
+/// pressure (red = maximum, blue = minimum), lambert-lit from the mask gradient
+/// normal.
 pub struct VolumeCallback {
     pub size_px: [u32; 2],
     pub eye: [f32; 3],
@@ -589,6 +864,7 @@ pub struct VolumeCallback {
     pub exposure: f32,
     pub threshold: f32,
     pub volume: Option<VolumeData>,
+    pub surface: Option<SurfaceData>,
 }
 
 impl CallbackTrait for VolumeCallback {
@@ -600,7 +876,9 @@ impl CallbackTrait for VolumeCallback {
         encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(r) = resources.get_mut::<BloomRenderer>() else { return Vec::new() };
+        let Some(r) = resources.get_mut::<BloomRenderer>() else {
+            return Vec::new();
+        };
         let size = [self.size_px[0].max(1), self.size_px[1].max(1)];
         r.ensure_targets(device, size);
 
@@ -610,14 +888,40 @@ impl CallbackTrait for VolumeCallback {
                 r.vol_version = v.version;
             }
         }
+        if let Some(s) = &self.surface {
+            if r.surf_version != s.version || r.surf_views.is_none() {
+                r.upload_surface(device, queue, &s.mask, &s.pressure, s.dims);
+                r.surf_version = s.version;
+            }
+        }
         let aspect = size[0] as f32 / size[1] as f32;
         let shadow = if self.shadows { 1.0 } else { 0.0 };
-        queue.write_buffer(&r.volume_uni, 0, bytemuck::cast_slice(&[
-            self.eye[0], self.eye[1], self.eye[2], self.tan_half_fov,
-            aspect, self.density_lo, self.density_hi, shadow,
-            self.slice[0], self.slice[1], self.slice[2], 0.0,
-        ]));
-        r.write_post_uniforms(queue, size, self.bloom_strength, self.exposure, self.threshold);
+        let surface_on = if self.surface.is_some() { 1.0 } else { 0.0 };
+        queue.write_buffer(
+            &r.volume_uni,
+            0,
+            bytemuck::cast_slice(&[
+                self.eye[0],
+                self.eye[1],
+                self.eye[2],
+                self.tan_half_fov,
+                aspect,
+                self.density_lo,
+                self.density_hi,
+                shadow,
+                self.slice[0],
+                self.slice[1],
+                self.slice[2],
+                surface_on,
+            ]),
+        );
+        r.write_post_uniforms(
+            queue,
+            size,
+            self.bloom_strength,
+            self.exposure,
+            self.threshold,
+        );
 
         {
             let t = r.targets.as_ref().unwrap();
@@ -649,12 +953,18 @@ impl CallbackTrait for VolumeCallback {
     }
 }
 
-fn color_attach(view: &wgpu::TextureView, clear: wgpu::Color) -> wgpu::RenderPassColorAttachment<'_> {
+fn color_attach(
+    view: &wgpu::TextureView,
+    clear: wgpu::Color,
+) -> wgpu::RenderPassColorAttachment<'_> {
     wgpu::RenderPassColorAttachment {
         view,
         depth_slice: None,
         resolve_target: None,
-        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+        ops: wgpu::Operations {
+            load: wgpu::LoadOp::Clear(clear),
+            store: wgpu::StoreOp::Store,
+        },
     }
 }
 
@@ -681,12 +991,21 @@ fn fullscreen(
 /// Register the renderer's GPU resources once, at app startup.
 pub fn install(render_state: &egui_wgpu::RenderState) {
     let renderer = BloomRenderer::new(&render_state.device, render_state.target_format);
-    render_state.renderer.write().callback_resources.insert(renderer);
+    render_state
+        .renderer
+        .write()
+        .callback_resources
+        .insert(renderer);
 }
 
 /// Queue a bloom-lit flow render for `rect` from pre-projected `instances` and
 /// streamline `segments`.
-pub fn add_flow(ui: &egui::Ui, rect: Rect, instances: Vec<GpuInstance>, segments: Vec<SegInstance>) {
+pub fn add_flow(
+    ui: &egui::Ui,
+    rect: Rect,
+    instances: Vec<GpuInstance>,
+    segments: Vec<SegInstance>,
+) {
     let ppp = ui.ctx().pixels_per_point();
     let size_px = [
         (rect.width() * ppp).round().max(1.0) as u32,
@@ -707,6 +1026,7 @@ pub fn add_flow(ui: &egui::Ui, rect: Rect, instances: Vec<GpuInstance>, segments
 /// Queue a bloom-lit **volume raymarch** for `rect`. `eye` is the camera position
 /// in domain space ([-1,1]³), `slice[a]` a clip coord in [-1,1] (or -2.0 = off).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn add_volume(
     ui: &egui::Ui,
     rect: Rect,
@@ -717,6 +1037,7 @@ pub fn add_volume(
     slice: [f32; 3],
     shadows: bool,
     volume: Option<VolumeData>,
+    surface: Option<SurfaceData>,
 ) {
     let ppp = ui.ctx().pixels_per_point();
     let size_px = [
@@ -735,6 +1056,7 @@ pub fn add_volume(
         exposure: 1.2,
         threshold: 1.0,
         volume,
+        surface,
     };
     ui.painter_at(rect)
         .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
@@ -897,11 +1219,13 @@ const VOLUME_WGSL: &str = r#"
 struct VU {
   eye_fov: vec4<f32>,   // xyz = eye (domain space), w = tan(half fov)
   params:  vec4<f32>,   // aspect, density_lo, density_hi, shadows
-  slice:   vec4<f32>,   // per-axis clip coord in [-1,1] (-2 = off), w unused
+  slice:   vec4<f32>,   // xyz = per-axis clip coord in [-1,1] (-2 = off), w = surface layer on
 };
 @group(0) @binding(0) var<uniform> V: VU;
 @group(0) @binding(1) var vol: texture_3d<f32>;
 @group(0) @binding(2) var vs: sampler;
+@group(0) @binding(3) var solid: texture_3d<f32>;   // CAD mask
+@group(0) @binding(4) var press: texture_3d<f32>;   // normalized pressure (0.5 = 0)
 
 struct FOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -917,6 +1241,19 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> FOut {
 
 fn dens(uvw: vec3<f32>) -> f32 {
   return textureSampleLevel(vol, vs, uvw, 0.0).r;
+}
+
+fn solid_at(uvw: vec3<f32>) -> f32 {
+  return textureSampleLevel(solid, vs, uvw, 0.0).r;
+}
+
+/// Recovered-pressure color map: blue (minimum) ↔ dark ↔ red (maximum).
+fn load_color(t: f32) -> vec3<f32> {
+  let dark = vec3<f32>(0.10, 0.07, 0.06);
+  let red = vec3<f32>(0.95, 0.28, 0.22);
+  let blue = vec3<f32>(0.30, 0.55, 0.95);
+  if (t >= 0.0) { return mix(dark, red, clamp(t, 0.0, 1.0)); }
+  return mix(dark, blue, clamp(-t, 0.0, 1.0));
 }
 
 @fragment
@@ -958,6 +1295,21 @@ fn fs_volume(in: FOut) -> @location(0) vec4<f32> {
         (V.slice.y > -1.5 && pw.y < V.slice.y) ||
         (V.slice.z > -1.5 && pw.z < V.slice.z)) { continue; }
     let uvw = pw * 0.5 + 0.5;
+    // CAD body: the ray hit the solid — shade it with the surface load map
+    if (V.slice.w > 0.5 && solid_at(uvw) > 0.5) {
+      let e = 1.5 / 64.0;
+      let nrm = normalize(vec3<f32>(
+        solid_at(uvw - vec3<f32>(e, 0.0, 0.0)) - solid_at(uvw + vec3<f32>(e, 0.0, 0.0)),
+        solid_at(uvw - vec3<f32>(0.0, e, 0.0)) - solid_at(uvw + vec3<f32>(0.0, e, 0.0)),
+        solid_at(uvw - vec3<f32>(0.0, 0.0, e)) - solid_at(uvw + vec3<f32>(0.0, 0.0, e))) + vec3<f32>(1e-5));
+      let pv = textureSampleLevel(press, vs, uvw, 0.0).r * 2.0 - 1.0;
+      let lambert = 0.35 + 0.65 * max(dot(nrm, ldir), 0.0);
+      let rim = pow(1.0 - abs(dot(nrm, dir)), 2.0) * 0.25;
+      let surf = load_color(pv) * lambert + vec3<f32>(rim);
+      col = col + trans * surf;
+      trans = 0.0;
+      break;
+    }
     let s = dens(uvw);
     let d = smoothstep(dlo, dhi, s);
     if (d > 0.002) {
@@ -1001,9 +1353,12 @@ mod tests {
     fn gpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::default();
         let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        Some(pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .expect("request_device"))
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()?;
+        Some(
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("request_device"),
+        )
     }
 
     /// Render one callback into a 64² Rgba8Unorm surface (cleared black) exactly
@@ -1016,7 +1371,11 @@ mod tests {
 
         let out = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test.out"),
-            size: wgpu::Extent3d { width: S, height: S, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: S,
+                height: S,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1025,7 +1384,10 @@ mod tests {
             view_formats: &[],
         });
         let out_view = out.create_view(&Default::default());
-        let screen = ScreenDescriptor { size_in_pixels: [S, S], pixels_per_point: 1.0 };
+        let screen = ScreenDescriptor {
+            size_in_pixels: [S, S],
+            pixels_per_point: 1.0,
+        };
         let mut encoder = device.create_command_encoder(&Default::default());
         let extra = cb.prepare(device, queue, &screen, &mut encoder, &mut resources);
         {
@@ -1048,7 +1410,8 @@ mod tests {
                 })
                 .forget_lifetime();
             rp.set_viewport(0.0, 0.0, S as f32, S as f32, 0.0, 1.0);
-            let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(S as f32, S as f32));
+            let full =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(S as f32, S as f32));
             let info = egui::epaint::PaintCallbackInfo {
                 viewport: full,
                 clip_rect: full,
@@ -1069,16 +1432,27 @@ mod tests {
             out.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: None },
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: None,
+                },
             },
-            wgpu::Extent3d { width: S, height: S, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: S,
+                height: S,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let bytes = buf.slice(..).get_mapped_range().to_vec();
         buf.unmap();
-        assert!(pollster::block_on(scope.pop()).is_none(), "wgpu validation error");
+        assert!(
+            pollster::block_on(scope.pop()).is_none(),
+            "wgpu validation error"
+        );
         bytes
     }
 
@@ -1094,10 +1468,19 @@ mod tests {
             return;
         };
         let cb = FlowCallback {
-            instances: vec![GpuInstance { pos: [0.0, 0.0], radius_px: 16.0, weight: 1.0, color: [4.0, 2.6, 0.8, 1.0] }],
+            instances: vec![GpuInstance {
+                pos: [0.0, 0.0],
+                radius_px: 16.0,
+                weight: 1.0,
+                color: [4.0, 2.6, 0.8, 1.0],
+            }],
             // a gold streamline ribbon along the bottom exercises the seg pipeline
             segments: vec![SegInstance {
-                p0: [-0.6, -0.6], p1: [0.6, -0.6], width_px: 3.0, _pad: 0.0, color: [1.5, 1.0, 0.35, 1.0],
+                p0: [-0.6, -0.6],
+                p1: [0.6, -0.6],
+                width_px: 3.0,
+                _pad: 0.0,
+                color: [1.5, 1.0, 0.35, 1.0],
             }],
             size_px: [S, S],
             bloom_strength: 1.6,
@@ -1106,10 +1489,20 @@ mod tests {
         };
         let px = render(&device, &queue, cb);
         let (center, ring) = (at(&px, 32, 32), at(&px, 32, 11));
-        assert!(center > 40, "core did not render bright (center luma {center})");
-        assert!(ring > 2, "bloom did not spread beyond the core (ring luma {ring})");
+        assert!(
+            center > 40,
+            "core did not render bright (center luma {center})"
+        );
+        assert!(
+            ring > 2,
+            "bloom did not spread beyond the core (ring luma {ring})"
+        );
         // the ribbon sits in the lower half (NDC y=-0.6 → ~pixel row 51) and glows
-        assert!(at(&px, 32, 51) > 15, "streamline ribbon did not render (luma {})", at(&px, 32, 51));
+        assert!(
+            at(&px, 32, 51) > 15,
+            "streamline ribbon did not render (luma {})",
+            at(&px, 32, 51)
+        );
     }
 
     #[test]
@@ -1125,7 +1518,8 @@ mod tests {
         for k in 0..n {
             for j in 0..n {
                 for i in 0..n {
-                    let d2 = (i as f32 - c).powi(2) + (j as f32 - c).powi(2) + (k as f32 - c).powi(2);
+                    let d2 =
+                        (i as f32 - c).powi(2) + (j as f32 - c).powi(2) + (k as f32 - c).powi(2);
                     data[(k * n + j) * n + i] = ((-d2 / 8.0).exp() * 255.0) as u8;
                 }
             }
@@ -1141,12 +1535,66 @@ mod tests {
             bloom_strength: 1.5,
             exposure: 1.2,
             threshold: 1.0,
-            volume: Some(VolumeData { data: std::sync::Arc::new(data), dims: [n as u32; 3], version: 1 }),
+            volume: Some(VolumeData {
+                data: std::sync::Arc::new(data.clone()),
+                dims: [n as u32; 3],
+                version: 1,
+            }),
+            surface: None,
         };
         let px = render(&device, &queue, cb);
         let (center, corner) = (at(&px, 32, 32), at(&px, 6, 6));
-        assert!(center > 30, "volume core not visible (center luma {center})");
-        assert!(center > corner + 10, "no isosurface contrast (center {center} vs corner {corner})");
+        assert!(
+            center > 30,
+            "volume core not visible (center luma {center})"
+        );
+        assert!(
+            center > corner + 10,
+            "no isosurface contrast (center {center} vs corner {corner})"
+        );
+
+        // with a CAD surface layer: a solid block with high frontal pressure must
+        // render opaque (the load-map shading path, exercising the new bindings)
+        let mut mask = vec![0u8; n * n * n];
+        let mut press = vec![128u8; n * n * n]; // 0.5 = zero pressure
+        for k in 6..10 {
+            for j in 6..10 {
+                for i in 6..10 {
+                    mask[(k * n + j) * n + i] = 255;
+                    press[(k * n + j) * n + i] = 240; // strong +p → red load
+                }
+            }
+        }
+        let cb = VolumeCallback {
+            size_px: [S, S],
+            eye: [0.0, 0.0, 4.0],
+            tan_half_fov: 0.55,
+            density_lo: 0.15,
+            density_hi: 0.6,
+            slice: [-2.0, -2.0, -2.0],
+            shadows: false,
+            bloom_strength: 1.5,
+            exposure: 1.2,
+            threshold: 1.0,
+            volume: Some(VolumeData {
+                data: std::sync::Arc::new(data),
+                dims: [n as u32; 3],
+                version: 2,
+            }),
+            surface: Some(SurfaceData {
+                mask: std::sync::Arc::new(mask),
+                pressure: std::sync::Arc::new(press),
+                dims: [n as u32; 3],
+                version: 1,
+            }),
+        };
+        let px = render(&device, &queue, cb);
+        let o = ((32u32 * 4 * S) + 32 * 4) as usize;
+        let (r, g, b) = (px[o] as i32, px[o + 1] as i32, px[o + 2] as i32);
+        assert!(
+            r > 40 && r > g && r > b,
+            "load surface should shade red-dominant (rgb {r},{g},{b})"
+        );
     }
 
     /// N2-AC1: end-to-end throughput for 1M point-sprites (upload + additive
@@ -1163,7 +1611,9 @@ mod tests {
         let n: u32 = 1_000_000;
         let mut st = 0x1234_5678u32;
         let mut rnd = move || {
-            st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
             st as f32 / u32::MAX as f32
         };
         let instances: Vec<GpuInstance> = (0..n)
@@ -1186,10 +1636,17 @@ mod tests {
             exposure: 1.25,
             threshold: 1.0,
         };
-        let screen = ScreenDescriptor { size_in_pixels: size, pixels_per_point: 1.0 };
+        let screen = ScreenDescriptor {
+            size_in_pixels: size,
+            pixels_per_point: 1.0,
+        };
         let out = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("bench.out"),
-            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1222,9 +1679,15 @@ mod tests {
                     })
                     .forget_lifetime();
                 rp.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
-                let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(size[0] as f32, size[1] as f32));
+                let full = egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(size[0] as f32, size[1] as f32),
+                );
                 let info = egui::epaint::PaintCallbackInfo {
-                    viewport: full, clip_rect: full, pixels_per_point: 1.0, screen_size_px: size,
+                    viewport: full,
+                    clip_rect: full,
+                    pixels_per_point: 1.0,
+                    screen_size_px: size,
                 };
                 cb.paint(info, &mut rp, resources);
             }
@@ -1246,6 +1709,9 @@ mod tests {
             "\n[bench] {n} points @ {}x{}: {:.2} ms/frame · {:.0} fps · {:.1}M pts/s (upload+render+bloom+composite)\n",
             size[0], size[1], per * 1000.0, fps, n as f64 * fps / 1e6
         );
-        assert!(fps > 30.0, "1M-point pipeline below the 30 fps floor ({fps:.0})");
+        assert!(
+            fps > 30.0,
+            "1M-point pipeline below the 30 fps floor ({fps:.0})"
+        );
     }
 }

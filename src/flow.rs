@@ -27,7 +27,9 @@ fn curl_x(p: [f32; 3]) -> f32 {
 pub fn generate(n: usize, seed: u64) -> Vec<Particle> {
     let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15).max(1);
     let mut rnd = || {
-        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
         (rng >> 11) as f32 / (1u64 << 53) as f32
     };
     let scale = std::f32::consts::PI; // domain [-π, π] for ABC, mapped to [-1,1] at the end
@@ -42,7 +44,9 @@ pub fn generate(n: usize, seed: u64) -> Vec<Particle> {
         let dt = 0.06;
         for _ in 0..36 {
             let v = abc(p);
-            for k in 0..3 { p[k] += v[k] * dt; }
+            for k in 0..3 {
+                p[k] += v[k] * dt;
+            }
         }
         let v = abc(p);
         let speed = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() / 3.0_f32.sqrt();
@@ -66,9 +70,13 @@ pub fn generate(n: usize, seed: u64) -> Vec<Particle> {
 /// speed for brightness, position normalized to [-1, 1]. This is the real model
 /// output driving the viewport.
 pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
-    if shape.len() != 4 || shape[0] != 3 { return Vec::new(); }
+    if shape.len() != 4 || shape[0] != 3 {
+        return Vec::new();
+    }
     let (nx, ny, nz) = (shape[1], shape[2], shape[3]);
-    if data.len() < 3 * nx * ny * nz { return Vec::new(); }
+    if data.len() < 3 * nx * ny * nz {
+        return Vec::new();
+    }
     let at = |c: usize, i: usize, j: usize, k: usize| data[((c * nx + i) * ny + j) * nz + k];
 
     let target = 8000usize;
@@ -76,9 +84,13 @@ pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
     // per-sample jitter breaks the visible lattice so it reads as a field
     let cell = 2.0 / (nx.max(2) - 1) as f32 * stride as f32;
     let hash = |a: usize, b: usize, c: usize, salt: u32| -> f32 {
-        let mut h = (a as u32).wrapping_mul(73856093) ^ (b as u32).wrapping_mul(19349663)
-            ^ (c as u32).wrapping_mul(83492791) ^ salt.wrapping_mul(2654435761);
-        h ^= h >> 13; h = h.wrapping_mul(0x5bd1e995); h ^= h >> 15;
+        let mut h = (a as u32).wrapping_mul(73856093)
+            ^ (b as u32).wrapping_mul(19349663)
+            ^ (c as u32).wrapping_mul(83492791)
+            ^ salt.wrapping_mul(2654435761);
+        h ^= h >> 13;
+        h = h.wrapping_mul(0x5bd1e995);
+        h ^= h >> 15;
         (h as f32 / u32::MAX as f32) - 0.5
     };
     let mut raw: Vec<([f32; 3], f32, f32)> = Vec::new();
@@ -89,9 +101,12 @@ pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
         while j < ny - 1 {
             let mut k = 1;
             while k < nz - 1 {
-                let wx = (at(2, i, j + 1, k) - at(2, i, j - 1, k)) - (at(1, i, j, k + 1) - at(1, i, j, k - 1));
-                let wy = (at(0, i, j, k + 1) - at(0, i, j, k - 1)) - (at(2, i + 1, j, k) - at(2, i - 1, j, k));
-                let wz = (at(1, i + 1, j, k) - at(1, i - 1, j, k)) - (at(0, i, j + 1, k) - at(0, i, j - 1, k));
+                let wx = (at(2, i, j + 1, k) - at(2, i, j - 1, k))
+                    - (at(1, i, j, k + 1) - at(1, i, j, k - 1));
+                let wy = (at(0, i, j, k + 1) - at(0, i, j, k - 1))
+                    - (at(2, i + 1, j, k) - at(2, i - 1, j, k));
+                let wz = (at(1, i + 1, j, k) - at(1, i - 1, j, k))
+                    - (at(0, i, j + 1, k) - at(0, i, j - 1, k));
                 let mag = (wx * wx + wy * wy + wz * wz).sqrt();
                 let (u, v, w) = (at(0, i, j, k), at(1, i, j, k), at(2, i, j, k));
                 let sp = (u * u + v * v + w * w).sqrt();
@@ -109,18 +124,26 @@ pub fn from_field(shape: &[usize], data: &[f32]) -> Vec<Particle> {
         }
         i += stride;
     }
-    raw.into_iter().map(|(pos, vort, sp)| Particle {
-        pos, vort: (vort / maxv).clamp(-1.0, 1.0), speed: (sp / maxs).clamp(0.0, 1.0),
-    }).collect()
+    raw.into_iter()
+        .map(|(pos, vort, sp)| Particle {
+            pos,
+            vort: (vort / maxv).clamp(-1.0, 1.0),
+            speed: (sp / maxs).clamp(0.0, 1.0),
+        })
+        .collect()
 }
 
 /// Vorticity-magnitude scalar volume from an engine velocity field `[3,N,N,N]`,
 /// normalized to `[0,1]` and laid out for a wgpu 3D texture (x = i fastest,
 /// then j, then k). Feeds the volume raymarch. Returns `(bytes, [nx,ny,nz])`.
 pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32; 3])> {
-    if shape.len() != 4 || shape[0] != 3 { return None; }
+    if shape.len() != 4 || shape[0] != 3 {
+        return None;
+    }
     let (nx, ny, nz) = (shape[1], shape[2], shape[3]);
-    if nx < 2 || ny < 2 || nz < 2 || data.len() < 3 * nx * ny * nz { return None; }
+    if nx < 2 || ny < 2 || nz < 2 || data.len() < 3 * nx * ny * nz {
+        return None;
+    }
     let at = |c: usize, i: usize, j: usize, k: usize| data[((c * nx + i) * ny + j) * nz + k];
     let cl = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
     let mut mag = vec![0f32; nx * ny * nz];
@@ -136,12 +159,129 @@ pub fn vorticity_volume(shape: &[usize], data: &[f32]) -> Option<(Vec<u8>, [u32;
                 let wz = (at(1, ip, j, k) - at(1, im, j, k)) - (at(0, i, jp, k) - at(0, i, jm, k));
                 let m = (wx * wx + wy * wy + wz * wz).sqrt();
                 mag[(k * ny + j) * nx + i] = m;
-                if m > maxv { maxv = m; }
+                if m > maxv {
+                    maxv = m;
+                }
             }
         }
     }
-    let bytes = mag.iter().map(|m| ((m / maxv).clamp(0.0, 1.0) * 255.0) as u8).collect();
+    let bytes = mag
+        .iter()
+        .map(|m| ((m / maxv).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
     Some((bytes, [nx as u32, ny as u32, nz as u32]))
+}
+
+/// The 3D counterparts of the 2D Field Insights, found in one gradient pass over
+/// an engine field: strongest rotation (max |ω|), fastest flow (max |v|), and
+/// the **Q-criterion maximum** — the standard vortex-core detector
+/// (Q = ½(‖Ω‖² − ‖S‖²) > 0 where rotation beats strain).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Insight3DKind {
+    VortexCore, // max Q
+    MaxVorticity,
+    MaxSpeed,
+    SurfLoad,    // max surface pressure — stagnation / load point (CAD)
+    SurfSuction, // min surface pressure — suction peak / weak point (CAD)
+}
+
+impl Insight3DKind {
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Insight3DKind::VortexCore => "Q",
+            Insight3DKind::MaxVorticity => "ω",
+            Insight3DKind::MaxSpeed => "v",
+            Insight3DKind::SurfLoad => "P▲",
+            Insight3DKind::SurfSuction => "P▼",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Insight3D {
+    pub kind: Insight3DKind,
+    pub pos: [f32; 3], // [-1,1]³ domain coords (matches the render particles)
+    pub value: f32,
+}
+
+/// Critical points of a `[3,N,N,N]` velocity field. Runs once per field arrival
+/// (~10 ms at 64³ native) — not per frame.
+pub fn insights3d(shape: &[usize], data: &[f32]) -> Vec<Insight3D> {
+    if shape.len() != 4 || shape[0] != 3 {
+        return Vec::new();
+    }
+    let (nx, ny, nz) = (shape[1], shape[2], shape[3]);
+    if nx < 3 || ny < 3 || nz < 3 || data.len() < 3 * nx * ny * nz {
+        return Vec::new();
+    }
+    let at = |c: usize, i: usize, j: usize, k: usize| data[((c * nx + i) * ny + j) * nz + k];
+    let cl = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
+
+    let mut best_q = (f32::MIN, [0usize; 3]);
+    let mut best_w = (f32::MIN, [0usize; 3]);
+    let mut best_s = (f32::MIN, [0usize; 3]);
+    for i in 0..nx {
+        let (ip, im) = (cl(i as i64 + 1, nx), cl(i as i64 - 1, nx));
+        for j in 0..ny {
+            let (jp, jm) = (cl(j as i64 + 1, ny), cl(j as i64 - 1, ny));
+            for k in 0..nz {
+                let (kp, km) = (cl(k as i64 + 1, nz), cl(k as i64 - 1, nz));
+                // g[c][a] = ∂u_c/∂x_a (central, cell units)
+                let mut g = [[0f32; 3]; 3];
+                for (c, row) in g.iter_mut().enumerate() {
+                    row[0] = 0.5 * (at(c, ip, j, k) - at(c, im, j, k));
+                    row[1] = 0.5 * (at(c, i, jp, k) - at(c, i, jm, k));
+                    row[2] = 0.5 * (at(c, i, j, kp) - at(c, i, j, km));
+                }
+                let (mut oo, mut ss) = (0f32, 0f32);
+                for a in 0..3 {
+                    for b in 0..3 {
+                        let om = 0.5 * (g[a][b] - g[b][a]);
+                        let st = 0.5 * (g[a][b] + g[b][a]);
+                        oo += om * om;
+                        ss += st * st;
+                    }
+                }
+                let q = 0.5 * (oo - ss);
+                let wmag = (2.0 * oo).sqrt(); // ‖Ω‖² = ½|ω|²
+                let (u, v, w) = (at(0, i, j, k), at(1, i, j, k), at(2, i, j, k));
+                let sp = (u * u + v * v + w * w).sqrt();
+                if q > best_q.0 {
+                    best_q = (q, [i, j, k]);
+                }
+                if wmag > best_w.0 {
+                    best_w = (wmag, [i, j, k]);
+                }
+                if sp > best_s.0 {
+                    best_s = (sp, [i, j, k]);
+                }
+            }
+        }
+    }
+    let to_pos = |c: [usize; 3]| {
+        [
+            c[0] as f32 / (nx - 1) as f32 * 2.0 - 1.0,
+            c[1] as f32 / (ny - 1) as f32 * 2.0 - 1.0,
+            c[2] as f32 / (nz - 1) as f32 * 2.0 - 1.0,
+        ]
+    };
+    vec![
+        Insight3D {
+            kind: Insight3DKind::VortexCore,
+            pos: to_pos(best_q.1),
+            value: best_q.0,
+        },
+        Insight3D {
+            kind: Insight3DKind::MaxVorticity,
+            pos: to_pos(best_w.1),
+            value: best_w.0,
+        },
+        Insight3D {
+            kind: Insight3DKind::MaxSpeed,
+            pos: to_pos(best_s.1),
+            value: best_s.0,
+        },
+    ]
 }
 
 /// Procedural |ω| volume (ABC/Beltrami, where curl u = u so |ω| = |u|) for the
@@ -159,10 +299,99 @@ pub fn procedural_volume(n: usize, seed: u64) -> (Vec<u8>, [u32; 3]) {
                 let v = abc([coord(i) + ph, coord(j) + ph, coord(k) + ph]);
                 let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
                 vals[(k * n + j) * n + i] = m;
-                if m > maxv { maxv = m; }
+                if m > maxv {
+                    maxv = m;
+                }
             }
         }
     }
-    let bytes = vals.iter().map(|m| ((m / maxv).clamp(0.0, 1.0) * 255.0) as u8).collect();
+    let bytes = vals
+        .iter()
+        .map(|m| ((m / maxv).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
     (bytes, [n as u32, n as u32, n as u32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A quiet field with a planted fast jet and a planted solid-body vortex:
+    /// the insights must land on them.
+    #[test]
+    fn insights3d_find_planted_structures() {
+        let n = 16usize;
+        let shape = [3, n, n, n];
+        let mut data = vec![0.0f32; 3 * n * n * n];
+        let idx = |c: usize, i: usize, j: usize, k: usize| ((c * n + i) * n + j) * n + k;
+
+        // fast jet PLATEAU around (3,4,5): constant u inside → high speed, zero
+        // interior gradients (a single hot voxel would be a delta function whose
+        // shear out-vorticizes the actual vortex — the detector is that literal)
+        for i in 2..=4usize {
+            for j in 3..=5usize {
+                for k in 4..=6usize {
+                    data[idx(0, i, j, k)] = 9.0;
+                }
+            }
+        }
+
+        // solid-body rotation about the z-axis centred at (10,10,8):
+        // u = -(y-yc)*s, v = (x-xc)*s → ω_z = 2s and Q = ½‖Ω‖² > 0 at the centre
+        let (xc, yc, zc, s) = (10i64, 10i64, 8i64, 5.0f32);
+        for di in -1i64..=1 {
+            for dj in -1i64..=1 {
+                for dk in -1i64..=1 {
+                    let (i, j, k) = ((xc + di) as usize, (yc + dj) as usize, (zc + dk) as usize);
+                    data[idx(0, i, j, k)] = -(dj as f32) * s;
+                    data[idx(1, i, j, k)] = di as f32 * s;
+                }
+            }
+        }
+
+        let out = insights3d(&shape, &data);
+        assert_eq!(out.len(), 3);
+        let get = |k: Insight3DKind| out.iter().find(|x| x.kind == k).unwrap();
+
+        let sp = get(Insight3DKind::MaxSpeed);
+        let cell = |p: f32| ((p + 1.0) / 2.0 * (n - 1) as f32).round() as i64;
+        assert!(
+            (cell(sp.pos[0]) - 3).abs() <= 1
+                && (cell(sp.pos[1]) - 4).abs() <= 1
+                && (cell(sp.pos[2]) - 5).abs() <= 1,
+            "speed max off the jet: {:?}",
+            (cell(sp.pos[0]), cell(sp.pos[1]), cell(sp.pos[2]))
+        );
+        assert!((sp.value - 9.0).abs() < 1e-4);
+
+        // vortex centre: pure rotation (zero strain) → Q max within the core
+        let q = get(Insight3DKind::VortexCore);
+        assert!(
+            (cell(q.pos[0]) - xc).abs() <= 1
+                && (cell(q.pos[1]) - yc).abs() <= 1
+                && (cell(q.pos[2]) - zc).abs() <= 1,
+            "Q core off target: {:?}",
+            (cell(q.pos[0]), cell(q.pos[1]), cell(q.pos[2]))
+        );
+        assert!(
+            q.value > 0.0,
+            "vortex core must have Q > 0 (got {})",
+            q.value
+        );
+
+        // max |ω| also lives in the vortex, with |ω| ≈ 2s
+        let w = get(Insight3DKind::MaxVorticity);
+        assert!((cell(w.pos[0]) - xc).abs() <= 2 && (cell(w.pos[1]) - yc).abs() <= 2);
+        assert!(
+            w.value > s,
+            "|ω| at the core should exceed s (got {})",
+            w.value
+        );
+
+        for ins in &out {
+            for a in 0..3 {
+                assert!(ins.pos[a] >= -1.0 && ins.pos[a] <= 1.0);
+            }
+        }
+    }
 }

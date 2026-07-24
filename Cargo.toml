@@ -5,11 +5,26 @@ edition = "2021"
 description = "Reyn Studio — fully-native (egui + wgpu) neural-CFD workbench, linked to a Python inference engine"
 
 [dependencies]
-eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.35"
 bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 rfd = "0.17.2"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
+fontdue = "0.9"
+png = "0.18"
+base64 = "0.22"
+ed25519-dalek = "3"
+getrandom = "0.4"
+zeroize = "1"
+egui-phosphor = "0.13.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.19.3"
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
 
 [dev-dependencies]
 pollster = "0.4"
