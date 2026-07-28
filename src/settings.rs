@@ -5,12 +5,17 @@
 //! older build load cleanly. Display units, formatting, and viewport
 //! preferences never change stored evidence — run manifests and versioned
 //! exports remain SI regardless of these preferences.
-use crate::engine::EngineConfig;
+use crate::engine::{
+    EngineConfig, DEFAULT_2D_MODEL_ID, DEFAULT_3D_MODEL_ID, MODEL_BUNDLE_EXTENSION,
+    TRUSTED_MODEL_CONVERSION_GUIDANCE,
+};
+use crate::engineering::OperatingPoint;
 use crate::engineering_section::{SectionAxis, SectionQuantity};
 use crate::field2d::FieldColormap;
 use crate::signing::{PublicKeyRecord, SIGNATURE_ALGORITHM};
 use crate::theme::*;
 use crate::units::{self, InputUnitPrefs, NumberNotation, UnitSystem, ValueFormat};
+use crate::viewport::{NavScheme, StandardView};
 use egui::{Align, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
 use egui_phosphor::regular as ph;
 use serde::{Deserialize, Serialize};
@@ -125,6 +130,131 @@ pub struct OperatingPointPreset {
     pub reference_pressure_pa: f64,
 }
 
+pub const CASE_TEMPLATE_SCHEMA_VERSION: u32 = 1;
+pub const CASE_TEMPLATE_EXTENSION: &str = "reyntemplate";
+
+/// Portable defaults for a new or existing external-flow draft.
+///
+/// The format deliberately excludes geometry, source/model identity, transforms,
+/// waivers, runs, and evidence. Applying one still goes through the ordinary
+/// readiness and staleness paths before a new immutable run can be created.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CaseTemplate {
+    pub schema_version: u32,
+    pub name: String,
+    pub operating: CaseTemplateOperatingDefaults,
+    pub preferred_view: CaseTemplateViewDefaults,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CaseTemplateOperatingDefaults {
+    /// Canonical SI, regardless of the display/input units used while saving.
+    pub velocity_mps: f64,
+    pub density_kg_m3: f64,
+    pub viscosity_pa_s: f64,
+    pub reference_pressure_pa: f64,
+    pub horizon_steps: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaseTemplateViewDefaults {
+    pub section_axis: SectionAxis,
+    pub section_quantity: SectionQuantity,
+}
+
+impl CaseTemplate {
+    pub fn from_draft(
+        name: impl Into<String>,
+        operating: &OperatingPoint,
+        section_axis: SectionAxis,
+        section_quantity: SectionQuantity,
+    ) -> Self {
+        Self {
+            schema_version: CASE_TEMPLATE_SCHEMA_VERSION,
+            name: name.into().trim().to_owned(),
+            operating: CaseTemplateOperatingDefaults {
+                velocity_mps: operating.velocity,
+                density_kg_m3: operating.density,
+                viscosity_pa_s: operating.viscosity,
+                reference_pressure_pa: operating.reference_pressure,
+                horizon_steps: operating.horizon_steps,
+            },
+            preferred_view: CaseTemplateViewDefaults {
+                section_axis,
+                section_quantity,
+            },
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CASE_TEMPLATE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported case-template schema {}; this build supports schema {}",
+                self.schema_version, CASE_TEMPLATE_SCHEMA_VERSION
+            ));
+        }
+        if self.name.trim().is_empty() {
+            return Err("case-template name cannot be empty".into());
+        }
+        if !self.operating.velocity_mps.is_finite() || self.operating.velocity_mps <= 0.0 {
+            return Err("case-template free-stream speed must be positive".into());
+        }
+        if !self.operating.density_kg_m3.is_finite() || self.operating.density_kg_m3 <= 0.0 {
+            return Err("case-template density must be positive".into());
+        }
+        if !self.operating.viscosity_pa_s.is_finite() || self.operating.viscosity_pa_s <= 0.0 {
+            return Err("case-template dynamic viscosity must be positive".into());
+        }
+        if !self.operating.reference_pressure_pa.is_finite() {
+            return Err("case-template reference pressure must be finite".into());
+        }
+        if !(1..=256).contains(&self.operating.horizon_steps) {
+            return Err("case-template horizon must be between 1 and 256 steps".into());
+        }
+        Ok(())
+    }
+
+    /// Seed only template-owned draft fields. Geometry-derived reference
+    /// length/units and the fixed +X flow direction remain untouched.
+    pub fn apply_to(
+        &self,
+        operating: &mut OperatingPoint,
+        model_max_steps: u32,
+    ) -> Result<bool, String> {
+        self.validate()?;
+        if model_max_steps == 0 {
+            return Err("the selected model does not declare a supported horizon".into());
+        }
+        let horizon_steps = self.operating.horizon_steps.min(model_max_steps);
+        let changed = operating.velocity != self.operating.velocity_mps
+            || operating.density != self.operating.density_kg_m3
+            || operating.viscosity != self.operating.viscosity_pa_s
+            || operating.reference_pressure != self.operating.reference_pressure_pa
+            || operating.horizon_steps != horizon_steps;
+        operating.velocity = self.operating.velocity_mps;
+        operating.density = self.operating.density_kg_m3;
+        operating.viscosity = self.operating.viscosity_pa_s;
+        operating.reference_pressure = self.operating.reference_pressure_pa;
+        operating.horizon_steps = horizon_steps;
+        Ok(changed)
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} m/s · {} kg/m³ · {:.3e} Pa·s · H{} · {} / {}",
+            self.operating.velocity_mps,
+            self.operating.density_kg_m3,
+            self.operating.viscosity_pa_s,
+            self.operating.horizon_steps,
+            self.preferred_view.section_quantity.label(),
+            self.preferred_view.section_axis.label(),
+        )
+    }
+}
+
 /// Built-in reference fluids at standard conditions. These are textbook
 /// values, clearly named; they fill inputs and never bypass validation.
 pub fn built_in_presets() -> Vec<OperatingPointPreset> {
@@ -193,6 +323,10 @@ pub struct AppSettings {
     pub default_section_quantity: SectionQuantity,
 
     // -- Viewport -------------------------------------------------------------
+    /// Which mouse buttons orbit, pan, and zoom. Rival-vendor mappings ship
+    /// alongside the Reyn default because orbit muscle memory is a real
+    /// switching cost.
+    pub navigation_scheme: NavScheme,
     pub orbit_sensitivity: f32,
     pub invert_scroll_zoom: bool,
     pub show_domain_bounds: bool,
@@ -201,9 +335,18 @@ pub struct AppSettings {
 
     // -- Workflow defaults ----------------------------------------------------
     pub default_horizon_steps: u32,
+    /// Last explicit verified-bundle selections. Aliases consume settings
+    /// written by development builds that persisted the runtime field names.
+    #[serde(alias = "current_model")]
+    pub default_3d_model: String,
+    #[serde(alias = "f2d_model")]
+    pub default_2d_model: String,
     /// Empty means "use the system default / last location".
     pub default_export_directory: String,
     pub operating_presets: Vec<OperatingPointPreset>,
+    /// User-owned reusable defaults. Entries are also exportable as strict,
+    /// versioned `.reyntemplate` files for another machine.
+    pub case_templates: Vec<CaseTemplate>,
 }
 
 impl Default for AppSettings {
@@ -233,14 +376,18 @@ impl Default for AppSettings {
             cp_pinned_extent: 1.5,
             default_section_axis: SectionAxis::X,
             default_section_quantity: SectionQuantity::PhysicalCp,
+            navigation_scheme: NavScheme::default(),
             orbit_sensitivity: 1.0,
             invert_scroll_zoom: false,
             show_domain_bounds: true,
             show_viewport_hints: true,
             viewport_background: ViewportBackground::InstrumentWell,
             default_horizon_steps: 4,
+            default_3d_model: DEFAULT_3D_MODEL_ID.into(),
+            default_2d_model: DEFAULT_2D_MODEL_ID.into(),
             default_export_directory: String::new(),
             operating_presets: Vec::new(),
+            case_templates: Vec::new(),
         }
     }
 }
@@ -256,14 +403,25 @@ impl AppSettings {
         if !path.is_file() {
             return (Self::default(), None);
         }
-        match std::fs::read_to_string(&path)
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path)
             .map_err(|error| error.to_string())
             .and_then(|text| serde_json::from_str::<Self>(&text).map_err(|error| error.to_string()))
         {
             Ok(mut settings) => {
                 settings.telemetry = false;
+                let migrated_models = settings.migrate_legacy_model_defaults();
                 settings.normalize();
-                (settings, None)
+                let warning = migrated_models.then(|| {
+                    format!(
+                        "Legacy .pth model preferences were migrated to .reynmodel identifiers. {}",
+                        TRUSTED_MODEL_CONVERSION_GUIDANCE
+                    )
+                });
+                (settings, warning)
             }
             Err(error) => (
                 Self::default(),
@@ -277,6 +435,7 @@ impl AppSettings {
     /// Clamp numeric preferences into their supported ranges so a hand-edited
     /// or older settings file can never push the UI into a broken state.
     pub fn normalize(&mut self) {
+        self.migrate_legacy_model_defaults();
         self.significant_digits = self
             .significant_digits
             .clamp(units::MIN_SIGNIFICANT_DIGITS, units::MAX_SIGNIFICANT_DIGITS);
@@ -296,6 +455,11 @@ impl AppSettings {
         self.autosave_interval_seconds = self.autosave_interval_seconds.clamp(30, 3600);
         self.operating_presets
             .retain(|preset| !preset.name.trim().is_empty());
+    }
+
+    fn migrate_legacy_model_defaults(&mut self) -> bool {
+        migrate_legacy_model_id(&mut self.default_3d_model, DEFAULT_3D_MODEL_ID)
+            | migrate_legacy_model_id(&mut self.default_2d_model, DEFAULT_2D_MODEL_ID)
     }
 
     /// The active display format for numeric values.
@@ -350,6 +514,20 @@ impl AppSettings {
         let path = config_path().ok_or_else(|| "settings directory unavailable".to_string())?;
         save_to(self, &path)?;
         Ok(path)
+    }
+
+    pub fn upsert_case_template(&mut self, mut template: CaseTemplate) -> Result<(), String> {
+        template.name = template.name.trim().to_owned();
+        template.validate()?;
+        self.case_templates
+            .retain(|existing| !existing.name.eq_ignore_ascii_case(&template.name));
+        self.case_templates.push(template);
+        self.case_templates.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        });
+        Ok(())
     }
 
     pub fn configured_signing_key(&self) -> Result<Option<PublicKeyRecord>, String> {
@@ -412,6 +590,30 @@ impl AppSettings {
     }
 }
 
+fn migrate_legacy_model_id(model: &mut String, fallback: &str) -> bool {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        *model = fallback.into();
+        return false;
+    }
+    if trimmed != model {
+        *model = trimmed.into();
+    }
+    let path = Path::new(model);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pth"))
+    {
+        let mut migrated = path.to_path_buf();
+        migrated.set_extension(MODEL_BUNDLE_EXTENSION);
+        *model = migrated.to_string_lossy().into_owned();
+        true
+    } else {
+        false
+    }
+}
+
 fn default_project_directory() -> String {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -427,9 +629,9 @@ pub fn config_path() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        return std::env::var_os("HOME").map(|home| {
+        std::env::var_os("HOME").map(|home| {
             PathBuf::from(home).join("Library/Application Support/Reyn Studio/settings.json")
-        });
+        })
     }
     #[cfg(target_os = "windows")]
     {
@@ -452,11 +654,13 @@ pub enum SettingsAction {
     RestoreDefaults,
     CreateSigningKey,
     RevokeSigningKey,
+    ImportCaseTemplate,
+    ExportCaseTemplate(usize),
 }
 
 /// Settings screen categories — a left rail selects one; only its sections
 /// render, so depth never becomes a control wall (§3, progressive disclosure).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub enum SettingsCategory {
     #[default]
     Compute,
@@ -496,14 +700,94 @@ impl SettingsCategory {
             Self::Developer => "Developer",
         }
     }
+
+    /// Dev/QA deep-link ids for `REYN_STUDIO_START_NAV=settings:<id>`.
+    pub fn from_qa_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "compute" => Self::Compute,
+            "units" => Self::Units,
+            "appearance" => Self::Appearance,
+            "viewport" => Self::Viewport,
+            "workflow" => Self::Workflow,
+            "shortcuts" => Self::Shortcuts,
+            "storage" => Self::Storage,
+            "signing" => Self::Signing,
+            "developer" => Self::Developer,
+            _ => return None,
+        })
+    }
 }
 
 /// Per-session UI state for the Settings screen (never persisted).
-#[derive(Default)]
 pub struct SettingsUiState {
     pub category: SettingsCategory,
     pub confirm_restore_defaults: bool,
     pub revoke_signing_key_armed: bool,
+    preset_delete_armed: Option<usize>,
+    template_delete_armed: Option<usize>,
+    qa_focus_category: Option<SettingsCategory>,
+    qa_scroll_bottom: bool,
+}
+
+impl Default for SettingsUiState {
+    fn default() -> Self {
+        // Capture-only state hooks. They do not alter AppSettings, and ordinary
+        // launches never set them. Keeping them here lets the native screenshot
+        // harness exercise adverse states without app.rs ownership.
+        let armed = std::env::var("REYN_STUDIO_SETTINGS_QA_ARM_DELETE").ok();
+        let preset_delete_armed = armed
+            .as_deref()
+            .and_then(|value| value.strip_prefix("preset:"))
+            .and_then(|index| index.parse().ok());
+        let template_delete_armed = armed
+            .as_deref()
+            .and_then(|value| value.strip_prefix("template:"))
+            .and_then(|index| index.parse().ok());
+        let qa_focus_category = std::env::var("REYN_STUDIO_SETTINGS_QA_FOCUS_CATEGORY")
+            .ok()
+            .and_then(|id| SettingsCategory::from_qa_id(&id));
+        let qa_scroll_bottom = std::env::var_os("REYN_STUDIO_SETTINGS_QA_SCROLL_BOTTOM").is_some();
+        Self {
+            category: SettingsCategory::default(),
+            confirm_restore_defaults: false,
+            revoke_signing_key_armed: false,
+            preset_delete_armed,
+            template_delete_armed,
+            qa_focus_category,
+            qa_scroll_bottom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsBodyLayout {
+    CategoryRail,
+    CategoryPicker,
+}
+
+const CATEGORY_PICKER_BREAKPOINT: f32 = 720.0;
+const CATEGORY_PICKER_HEIGHT: f32 = 54.0;
+
+fn settings_body_layout(width: f32) -> SettingsBodyLayout {
+    if width < CATEGORY_PICKER_BREAKPOINT {
+        SettingsBodyLayout::CategoryPicker
+    } else {
+        SettingsBodyLayout::CategoryRail
+    }
+}
+
+fn settings_footer_height(confirming_restore: bool) -> f32 {
+    if confirming_restore {
+        100.0
+    } else {
+        64.0
+    }
+}
+
+const SAVE_DISABLED_REASON: &str = "No settings changes to save.";
+
+fn save_disabled_reason(dirty: bool) -> Option<&'static str> {
+    (!dirty).then_some(SAVE_DISABLED_REASON)
 }
 
 pub fn show_settings(
@@ -530,79 +814,42 @@ pub fn show_settings(
 
         // Reserve room for the action row below the scroll region so the save
         // controls can never be pushed under the status bar.
-        let footer_height = 56.0;
+        let footer_height = settings_footer_height(state.confirm_restore_defaults);
         let body_height = (ui.available_height() - footer_height).max(120.0);
-        ui.horizontal_top(|ui| {
-            // Category rail — quiet list rows; the active row gets the level-1
-            // fill and a 2px quiet edge marker (ember stays on Save).
-            ui.vertical(|ui| {
-                ui.set_width(188.0);
-                for category in SettingsCategory::ALL {
-                    let active = state.category == category;
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Sense::click(),
+        match settings_body_layout(ui.available_width()) {
+            SettingsBodyLayout::CategoryRail => {
+                ui.horizontal_top(|ui| {
+                    category_rail(ui, state);
+                    ui.add_space(6.0);
+                    // Single meeting-edge hairline between rail and content
+                    // (§3.4 level 0). It stops short of the action-row rule.
+                    let x = ui.cursor().min.x;
+                    ui.painter().vline(
+                        x,
+                        egui::Rangef::new(
+                            ui.cursor().min.y,
+                            ui.cursor().min.y + (body_height - 14.0).max(0.0),
+                        ),
+                        Stroke::new(1.0, HAIRLINE),
                     );
-                    let painter = ui.painter();
-                    if active {
-                        painter.rect_filled(rect, CornerRadius::same(R1), SURFACE_HIGH);
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(
-                                rect.min + egui::vec2(0.0, 6.0),
-                                egui::vec2(2.0, rect.height() - 12.0),
-                            ),
-                            CornerRadius::same(1),
-                            OUTLINE,
-                        );
-                    } else if resp.hovered() {
-                        painter.rect_filled(rect, CornerRadius::same(R1), SURFACE);
-                    }
-                    painter.text(
-                        egui::pos2(rect.min.x + 12.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        category.label(),
-                        body_strong().resolve(ui.style()),
-                        if active { TEXT } else { TEXT_DIM },
-                    );
-                    if resp.clicked() {
-                        state.category = category;
-                    }
-                    ui.add_space(2.0);
-                }
-            });
-            ui.add_space(6.0);
-            // Meeting-edge hairline between rail and content (§3.4 level 0).
-            let x = ui.cursor().min.x;
-            ui.painter().vline(
-                x,
-                egui::Rangef::new(ui.cursor().min.y, ui.cursor().min.y + body_height),
-                Stroke::new(1.0, HAIRLINE),
-            );
-            ui.add_space(14.0);
-            ui.vertical(|ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height(body_height)
-                    .show(ui, |ui| {
-                        match state.category {
-                            SettingsCategory::Compute => {
-                                category_compute(ui, draft, &mut action)
-                            }
-                            SettingsCategory::Units => category_units(ui, draft),
-                            SettingsCategory::Appearance => category_appearance(ui, draft),
-                            SettingsCategory::Viewport => category_viewport(ui, draft),
-                            SettingsCategory::Workflow => category_workflow(ui, draft),
-                            SettingsCategory::Shortcuts => category_shortcuts(ui, draft),
-                            SettingsCategory::Storage => category_storage(ui, draft),
-                            SettingsCategory::Signing => {
-                                category_signing(ui, draft, state, &mut action)
-                            }
-                            SettingsCategory::Developer => category_developer(ui, draft),
-                        }
-                        ui.add_space(16.0);
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        settings_category_scroll(ui, body_height, draft, state, &mut action);
                     });
-            });
-        });
+                });
+            }
+            SettingsBodyLayout::CategoryPicker => {
+                category_picker(ui, state);
+                ui.add_space(8.0);
+                settings_category_scroll(
+                    ui,
+                    (body_height - CATEGORY_PICKER_HEIGHT).max(80.0),
+                    draft,
+                    state,
+                    &mut action,
+                );
+            }
+        }
 
         // Action row — always visible beneath the scroll region, above the
         // status bar, separated by a full-span hairline (§3.4 level 0).
@@ -614,32 +861,42 @@ pub fn show_settings(
             Stroke::new(1.0, HAIRLINE),
         );
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let dirty = draft != saved;
-            if ui
-                .add_enabled(
-                    dirty,
-                    egui::Button::new(
-                        RichText::new(if runtime_changed(saved, draft) {
-                            "Save & restart engine"
-                        } else {
-                            "Save settings"
-                        })
-                        .color(ON_EMBER),
-                    )
-                    .fill(EMBER)
-                    .min_size(egui::vec2(0.0, 28.0)),
+        if state.confirm_restore_defaults {
+            ui.label(
+                RichText::new(
+                    "Restore every preference default? Signing keys, saved presets, and case templates are kept.",
                 )
-                .clicked()
-            {
+                .text_style(caption())
+                .color(WARN),
+            );
+            ui.add_space(4.0);
+        }
+        ui.horizontal_wrapped(|ui| {
+            let dirty = draft != saved;
+            let save_fill = if dirty { EMBER } else { SURFACE_HIGH };
+            let save_text = if dirty { ON_EMBER } else { TEXT_MUTE };
+            let save = ui.add_enabled(
+                dirty,
+                egui::Button::new(
+                    RichText::new(if runtime_changed(saved, draft) {
+                        "Save & restart engine"
+                    } else {
+                        "Save settings"
+                    })
+                    .color(save_text),
+                )
+                .fill(save_fill)
+                .min_size(egui::vec2(0.0, 28.0)),
+            );
+            let save = if let Some(reason) = save_disabled_reason(dirty) {
+                save.on_disabled_hover_text(reason)
+            } else {
+                save
+            };
+            if save.clicked() {
                 action = Some(SettingsAction::Save);
             }
             if state.confirm_restore_defaults {
-                ui.label(
-                    RichText::new("Reset every preference? Signing keys and saved presets are kept.")
-                        .text_style(caption())
-                        .color(WARN),
-                );
                 if ui
                     .add(egui::Button::new("Confirm reset").min_size(egui::vec2(0.0, 28.0)))
                     .clicked()
@@ -671,11 +928,183 @@ pub fn show_settings(
     })
 }
 
+fn category_picker(ui: &mut egui::Ui, state: &mut SettingsUiState) {
+    ui.label(overline_text("Category"));
+    egui::ComboBox::from_id_salt("settings.category-picker")
+        .selected_text(state.category.label())
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            for category in SettingsCategory::ALL {
+                ui.selectable_value(&mut state.category, category, category.label());
+            }
+        });
+}
+
+fn category_rail(ui: &mut egui::Ui, state: &mut SettingsUiState) {
+    // Quiet list rows; the active row gets a tonal fill and edge marker. Ember
+    // remains reserved for Save, but keyboard focus is always explicit.
+    ui.vertical(|ui| {
+        ui.set_width(188.0);
+        for category in SettingsCategory::ALL {
+            let active = state.category == category;
+            let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 30.0));
+            let response = ui.interact(rect, category_row_id(category), egui::Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    true,
+                    active,
+                    category.label(),
+                )
+            });
+            if state.qa_focus_category == Some(category) {
+                response.request_focus();
+                if response.has_focus() {
+                    state.qa_focus_category = None;
+                }
+            }
+            let painter = ui.painter();
+            if active {
+                painter.rect_filled(rect, CornerRadius::same(R1), SURFACE_HIGH);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        rect.min + egui::vec2(0.0, 6.0),
+                        egui::vec2(2.0, rect.height() - 12.0),
+                    ),
+                    CornerRadius::same(1),
+                    OUTLINE,
+                );
+            } else if response.hovered() {
+                painter.rect_filled(rect, CornerRadius::same(R1), SURFACE);
+            }
+            if response.has_focus() {
+                painter.rect_stroke(
+                    rect.expand(1.0),
+                    CornerRadius::same(R1),
+                    focus_stroke(),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            painter.text(
+                egui::pos2(rect.min.x + 12.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                category.label(),
+                body_strong().resolve(ui.style()),
+                if active { TEXT } else { TEXT_DIM },
+            );
+            let keyboard_activated = response.has_focus()
+                && ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        || input.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+                });
+            if response.clicked() || keyboard_activated {
+                state.category = category;
+            }
+            ui.add_space(2.0);
+        }
+    });
+}
+
+fn category_row_id(category: SettingsCategory) -> egui::Id {
+    egui::Id::new(("settings.category-row", category))
+}
+
+fn settings_category_scroll(
+    ui: &mut egui::Ui,
+    height: f32,
+    draft: &mut AppSettings,
+    state: &mut SettingsUiState,
+    action: &mut Option<SettingsAction>,
+) {
+    let mut scroll = egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(height);
+    if state.qa_scroll_bottom {
+        // Egui propagates an infinite offset into the clip calculation and
+        // renders a blank viewport; a finite sentinel clamps to the real end.
+        scroll = scroll.vertical_scroll_offset(1_000_000.0);
+    }
+    scroll.show(ui, |ui| {
+        match state.category {
+            SettingsCategory::Compute => category_compute(ui, draft, action),
+            SettingsCategory::Units => category_units(ui, draft),
+            SettingsCategory::Appearance => category_appearance(ui, draft),
+            SettingsCategory::Viewport => category_viewport(ui, draft),
+            SettingsCategory::Workflow => category_workflow(ui, draft, state, action),
+            SettingsCategory::Shortcuts => category_shortcuts(ui, draft),
+            SettingsCategory::Storage => category_storage(ui, draft),
+            SettingsCategory::Signing => category_signing(ui, draft, state, action),
+            SettingsCategory::Developer => category_developer(ui, draft),
+        }
+        // Tall windows used to leave unexplained space under short cards.
+        // Anchor a real scope note to the bottom instead.
+        let footnote = settings_scope_footnote_height(ui);
+        let slack = ui.available_height();
+        ui.add_space(if slack > footnote + 26.0 {
+            slack - footnote
+        } else {
+            16.0
+        });
+        settings_scope_footnote(ui);
+    });
+}
+
+const SCOPE_FOOTNOTE_SCOPE: &str = "Local to this machine. Stored evidence — run manifests, fields, and versioned exports — stays SI regardless of these choices.";
+
+fn scope_footnote_location() -> String {
+    let location = config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "location unavailable on this machine".to_owned());
+    format!("Preferences file · {location}")
+}
+
+/// Height the footnote needs at the current column width. Measured rather than
+/// guessed: the scope line wraps to two rows in a narrow window, and a guessed
+/// reserve clipped it.
+fn settings_scope_footnote_height(ui: &egui::Ui) -> f32 {
+    let width = ui.available_width();
+    let line = |text: String, style: egui::TextStyle| {
+        let font = style.resolve(ui.style());
+        ui.painter().layout(text, font, TEXT_MUTE, width).size().y
+    };
+    // Two label rows, so two helpings of the vertical item spacing egui inserts.
+    9.0 + line(scope_footnote_location(), mono_s())
+        + 2.0
+        + line(SCOPE_FOOTNOTE_SCOPE.to_owned(), caption())
+        + ui.spacing().item_spacing.y * 2.0
+}
+
+/// Quiet closing line for the settings column: where preferences are stored and
+/// what they cannot change. Anchors the bottom of the content area at any height.
+fn settings_scope_footnote(ui: &mut egui::Ui) {
+    ui.painter().hline(
+        egui::Rangef::new(ui.cursor().min.x, ui.max_rect().max.x),
+        ui.cursor().min.y,
+        Stroke::new(1.0, HAIRLINE),
+    );
+    ui.add_space(9.0);
+    ui.label(
+        RichText::new(scope_footnote_location())
+            .text_style(mono_s())
+            .color(TEXT_MUTE),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(SCOPE_FOOTNOTE_SCOPE)
+            .text_style(caption())
+            .color(TEXT_MUTE),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Category bodies
 // ---------------------------------------------------------------------------
 
-fn category_compute(ui: &mut egui::Ui, draft: &mut AppSettings, _action: &mut Option<SettingsAction>) {
+fn category_compute(
+    ui: &mut egui::Ui,
+    draft: &mut AppSettings,
+    _action: &mut Option<SettingsAction>,
+) {
     section(ui, "Compute & engine", |ui| {
         setting_row_reset(
             ui,
@@ -695,18 +1124,24 @@ fn category_compute(ui: &mut egui::Ui, draft: &mut AppSettings, _action: &mut Op
             },
         );
         ui.separator();
-        setting_row(
+        path_setting_row(
             ui,
             "Python executable",
             "Pinned interpreter used to launch the bundled inference engine.",
-            |ui| path_control(ui, &mut draft.python_path, PathPick::File),
+            "python",
+            &mut draft.python_path,
+            &AppSettings::default().python_path,
+            PathPick::File,
         );
         ui.separator();
-        setting_row(
+        path_setting_row(
             ui,
             "Research checkout",
-            "Checkpoint library and solver modules used by this development build.",
-            |ui| path_control(ui, &mut draft.research_dir, PathPick::Folder),
+            "Verified model-bundle library and solver modules used by this development build.",
+            "research",
+            &mut draft.research_dir,
+            &AppSettings::default().research_dir,
+            PathPick::Folder,
         );
     });
 }
@@ -738,9 +1173,10 @@ fn category_units(ui: &mut egui::Ui, draft: &mut AppSettings) {
             &mut draft.significant_digits,
             AppSettings::default().significant_digits,
             |ui, value| {
-                ui.add(egui::DragValue::new(value).range(
-                    units::MIN_SIGNIFICANT_DIGITS..=units::MAX_SIGNIFICANT_DIGITS,
-                ));
+                ui.add(
+                    egui::DragValue::new(value)
+                        .range(units::MIN_SIGNIFICANT_DIGITS..=units::MAX_SIGNIFICANT_DIGITS),
+                );
             },
         );
         ui.separator();
@@ -1011,6 +1447,57 @@ fn category_appearance(ui: &mut egui::Ui, draft: &mut AppSettings) {
 }
 
 fn category_viewport(ui: &mut egui::Ui, draft: &mut AppSettings) {
+    section(ui, "Navigation scheme", |ui| {
+        setting_row_reset(
+            ui,
+            "Mouse mapping",
+            "Which buttons orbit, pan, and zoom. Pick the tool your hands already know — the camera behaviour is identical, only the buttons move.",
+            &mut draft.navigation_scheme,
+            AppSettings::default().navigation_scheme,
+            |ui, value| {
+                egui::ComboBox::from_id_salt("settings.nav-scheme")
+                    .selected_text(value.label())
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for scheme in NavScheme::ALL {
+                            ui.selectable_value(value, scheme, scheme.label())
+                                .on_hover_text(scheme.detail());
+                        }
+                    });
+            },
+        );
+        ui.add_space(6.0);
+        // The active mapping is printed rather than described, so the binding is
+        // learnable without experimenting in the viewport.
+        for (gesture, binding) in draft.navigation_scheme.mapping() {
+            ui.horizontal(|ui| {
+                ui.allocate_ui(egui::vec2(96.0, 18.0), |ui| {
+                    ui.label(
+                        RichText::new(gesture)
+                            .text_style(body_strong())
+                            .color(TEXT_DIM),
+                    );
+                });
+                ui.label(RichText::new(binding).text_style(mono_s()).color(TEXT));
+            });
+            ui.add_space(2.0);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(draft.navigation_scheme.detail())
+                .text_style(caption())
+                .color(TEXT_MUTE),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "F frames the geometry. 1–7 jump to the standard stations; the free stream always runs along +X, so the views are named for the flow.",
+            )
+            .text_style(caption())
+            .color(TEXT_MUTE),
+        );
+    });
+    ui.add_space(12.0);
     section(ui, "Camera", |ui| {
         setting_row_reset(
             ui,
@@ -1082,7 +1569,12 @@ fn category_viewport(ui: &mut egui::Ui, draft: &mut AppSettings) {
     });
 }
 
-fn category_workflow(ui: &mut egui::Ui, draft: &mut AppSettings) {
+fn category_workflow(
+    ui: &mut egui::Ui,
+    draft: &mut AppSettings,
+    state: &mut SettingsUiState,
+    action: &mut Option<SettingsAction>,
+) {
     section(ui, "New-case defaults", |ui| {
         setting_row_reset(
             ui,
@@ -1095,11 +1587,14 @@ fn category_workflow(ui: &mut egui::Ui, draft: &mut AppSettings) {
             },
         );
         ui.separator();
-        setting_row(
+        path_setting_row(
             ui,
             "Default export directory",
             "Starting location for CSV, PNG, and report export dialogs. Empty uses the system default.",
-            |ui| path_control(ui, &mut draft.default_export_directory, PathPick::Folder),
+            "export-dir",
+            &mut draft.default_export_directory,
+            &AppSettings::default().default_export_directory,
+            PathPick::Folder,
         );
     });
     ui.add_space(12.0);
@@ -1113,59 +1608,232 @@ fn category_workflow(ui: &mut egui::Ui, draft: &mut AppSettings) {
             .color(TEXT_MUTE),
         );
         ui.add_space(8.0);
+        ui.label(overline_text("Built-in references"));
+        ui.add_space(3.0);
         for preset in built_in_presets() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&preset.name).text_style(body_strong()).color(TEXT_DIM));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            collection_item_row(
+                ui,
+                &preset.name,
+                &preset_summary(&preset),
+                TEXT_MUTE,
+                |ui| {
                     ui.label(
-                        RichText::new("built-in")
+                        RichText::new("Built-in")
                             .text_style(caption())
                             .color(TEXT_MUTE),
                     );
-                    ui.label(
-                        RichText::new(preset_summary(&preset))
-                            .text_style(mono_s())
-                            .color(TEXT_MUTE),
-                    );
-                });
-            });
+                },
+            );
         }
-        if !draft.operating_presets.is_empty() {
-            ui.add_space(4.0);
-            ui.separator();
-        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(overline_text("Custom presets"));
+        ui.add_space(3.0);
         let mut remove_index = None;
         for (index, preset) in draft.operating_presets.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&preset.name).text_style(body_strong()).color(TEXT));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let armed = state.preset_delete_armed == Some(index);
+            collection_item_row(ui, &preset.name, &preset_summary(preset), TEXT_MUTE, |ui| {
+                if armed {
                     if ui
-                        .small_button("Delete")
-                        .on_hover_text("Remove this saved preset")
+                        .small_button("Cancel")
+                        .on_hover_text("Keep this preset")
+                        .clicked()
+                    {
+                        state.preset_delete_armed = None;
+                    }
+                    if ui
+                        .small_button("Confirm remove")
+                        .on_hover_text("Remove this saved preset after settings are saved")
                         .clicked()
                     {
                         remove_index = Some(index);
                     }
-                    ui.label(
-                        RichText::new(preset_summary(preset))
-                            .text_style(mono_s())
-                            .color(TEXT_MUTE),
-                    );
-                });
+                } else if ui
+                    .small_button("Remove…")
+                    .on_hover_text(format!("Remove preset “{}”", preset.name))
+                    .clicked()
+                {
+                    state.preset_delete_armed = Some(index);
+                }
             });
         }
         if let Some(index) = remove_index {
             draft.operating_presets.remove(index);
+            state.preset_delete_armed = None;
         }
         if draft.operating_presets.is_empty() {
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("No saved presets yet.")
-                    .text_style(caption())
-                    .color(TEXT_MUTE),
+            state.preset_delete_armed = None;
+            empty_collection_state(
+                ui,
+                "No custom presets",
+                "Create one from Case Setup › Operating point. Built-in references remain available.",
             );
         }
     });
+    ui.add_space(12.0);
+    section(ui, "Portable case templates", |ui| {
+        ui.label(
+            RichText::new(
+                "Versioned defaults for operating conditions and the preferred section view. \
+                 Templates never include geometry, models, transforms, waivers, runs, or evidence; \
+                 applying one still runs every readiness gate.",
+            )
+            .text_style(caption())
+            .color(TEXT_MUTE),
+        );
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Import template…").clicked() {
+                *action = Some(SettingsAction::ImportCaseTemplate);
+            }
+            ui.label(
+                RichText::new(format!(
+                    ".{} · schema {} · defaults only",
+                    CASE_TEMPLATE_EXTENSION, CASE_TEMPLATE_SCHEMA_VERSION
+                ))
+                .text_style(mono_s())
+                .color(TEXT_MUTE),
+            );
+        });
+        if draft.case_templates.is_empty() {
+            state.template_delete_armed = None;
+            ui.add_space(8.0);
+            empty_collection_state(
+                ui,
+                "No saved case templates",
+                "Import a .reyntemplate file here, or save defaults from Case Setup.",
+            );
+            return;
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        let mut remove_index = None;
+        for (index, template) in draft.case_templates.iter().enumerate() {
+            let validation = template.validate();
+            let (detail, color) = match &validation {
+                Ok(()) => (template.summary(), TEXT_MUTE),
+                Err(error) => (format!("! Unavailable · {error}"), DANGER),
+            };
+            let armed = state.template_delete_armed == Some(index);
+            collection_item_row(ui, &template.name, &detail, color, |ui| {
+                if armed {
+                    if ui
+                        .small_button("Cancel")
+                        .on_hover_text("Keep this case template")
+                        .clicked()
+                    {
+                        state.template_delete_armed = None;
+                    }
+                    if ui
+                        .small_button("Confirm remove")
+                        .on_hover_text("Remove this template after settings are saved")
+                        .clicked()
+                    {
+                        remove_index = Some(index);
+                    }
+                } else {
+                    if ui
+                        .small_button("Remove…")
+                        .on_hover_text(format!("Remove template “{}”", template.name))
+                        .clicked()
+                    {
+                        state.template_delete_armed = Some(index);
+                    }
+                    let export = ui
+                        .add_enabled(validation.is_ok(), egui::Button::new("Export…"))
+                        .on_disabled_hover_text(
+                            validation
+                                .as_ref()
+                                .err()
+                                .map_or("Template is unavailable", String::as_str),
+                        );
+                    if export.clicked() {
+                        *action = Some(SettingsAction::ExportCaseTemplate(index));
+                    }
+                }
+            });
+        }
+        if let Some(index) = remove_index {
+            draft.case_templates.remove(index);
+            state.template_delete_armed = None;
+        }
+    });
+}
+
+fn collection_item_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    detail: &str,
+    detail_color: egui::Color32,
+    actions: impl FnOnce(&mut egui::Ui),
+) {
+    ui.add_space(5.0);
+    let identity = |ui: &mut egui::Ui| {
+        ui.add(
+            egui::Label::new(RichText::new(name).text_style(body_strong()).color(TEXT)).truncate(),
+        )
+        .on_hover_text(name);
+        ui.add(
+            egui::Label::new(
+                RichText::new(detail)
+                    .text_style(mono_s())
+                    .color(detail_color),
+            )
+            .truncate(),
+        )
+        .on_hover_text(detail);
+    };
+    if collection_row_stacks(ui.available_width()) {
+        identity(ui);
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), actions);
+        });
+    } else {
+        let available = ui.available_width();
+        let action_width = 190.0_f32.min(available * 0.38);
+        let gap = ui.spacing().item_spacing.x;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2((available - action_width - gap).max(120.0), 0.0),
+                Layout::top_down(Align::Min),
+                identity,
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(action_width, 0.0),
+                Layout::right_to_left(Align::Center),
+                actions,
+            );
+        });
+    }
+    ui.add_space(5.0);
+}
+
+fn empty_collection_state(ui: &mut egui::Ui, title: &str, detail: &str) {
+    Frame::NONE
+        .fill(BG_0)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(CornerRadius::same(R1))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.label(
+                    RichText::new("○")
+                        .text_style(body_strong())
+                        .color(TEXT_MUTE),
+                );
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(title)
+                            .text_style(body_strong())
+                            .color(TEXT_DIM),
+                    );
+                    ui.label(RichText::new(detail).text_style(caption()).color(TEXT_MUTE));
+                });
+            });
+        });
 }
 
 fn preset_summary(preset: &OperatingPointPreset) -> String {
@@ -1183,44 +1851,114 @@ fn category_shortcuts(ui: &mut egui::Ui, draft: &mut AppSettings) {
                 .color(TEXT_MUTE),
         );
         ui.add_space(8.0);
-        let mut rows: Vec<(&str, &str)> = vec![
+        let (undo_keys, redo_keys) = if cfg!(target_os = "macos") {
+            ("⌘Z", "⇧⌘Z")
+        } else {
+            ("Ctrl+Z", "Ctrl+Shift+Z / Ctrl+Y")
+        };
+        let mut rows: Vec<(String, String)> = [
             ("⌘K", "Command palette — navigate or act"),
+            (
+                undo_keys,
+                "Undo the last safe Case Setup draft edit (immutable identity excluded)",
+            ),
+            (redo_keys, "Redo the last safe Case Setup draft edit"),
             ("⌘N", "New project (guarded by unsaved changes)"),
             ("⌘O", "Open project…"),
             ("⌘S", "Save project"),
             ("⇧⌘S", "Save project as…"),
             ("⌘W / ⌘Q", "Close / quit through the unsaved-changes guard"),
             ("⌘+ / ⌘− / ⌘0", "Interface zoom in / out / reset (live)"),
-            ("Drag", "Orbit the 3D viewport"),
-            ("Scroll", "Zoom the 3D viewport"),
-        ];
+        ]
+        .into_iter()
+        .map(|(keys, description)| (keys.to_owned(), description.to_owned()))
+        .collect();
         if draft.developer_research_sandbox {
-            rows.push(("G", "Regenerate procedural flow (research sandbox)"));
-            rows.push(("← ↑ → ↓", "Move the selected benchmark cell (Benchmark Lab)"));
+            rows.push((
+                "G".into(),
+                "Regenerate procedural flow (research sandbox)".into(),
+            ));
+            rows.push((
+                "← ↑ → ↓".into(),
+                "Move the selected benchmark cell (Benchmark Lab)".into(),
+            ));
         }
-        for (keys, description) in rows {
-            ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(120.0, 18.0), |ui| {
-                    ui.label(RichText::new(keys).text_style(mono_s()).color(TEXT));
-                });
-                ui.label(
-                    RichText::new(description)
-                        .text_style(caption())
-                        .color(TEXT_DIM),
-                );
-            });
-            ui.add_space(2.0);
-        }
+        shortcut_rows(ui, &rows);
     });
+    ui.add_space(12.0);
+    // The viewport bindings live here as well as in Viewport & camera: this is
+    // where an engineer looks for "how do I pan", and it follows the scheme they
+    // actually have selected instead of describing a default they changed.
+    section(ui, "3D viewport", |ui| {
+        ui.label(
+            RichText::new(format!(
+                "Mouse mapping follows Settings › Viewport & camera — currently {}.",
+                draft.navigation_scheme.label()
+            ))
+            .text_style(caption())
+            .color(TEXT_MUTE),
+        );
+        ui.add_space(8.0);
+        let mut rows: Vec<(String, String)> = draft
+            .navigation_scheme
+            .mapping()
+            .into_iter()
+            .map(|(gesture, binding)| (binding.to_owned(), format!("{gesture} the 3D viewport")))
+            .collect();
+        rows.push((
+            "F".into(),
+            "Frame the geometry (zoom to fit; the solver domain when nothing is loaded)".into(),
+        ));
+        for (index, view) in StandardView::ALL.iter().enumerate() {
+            rows.push((
+                (index + 1).to_string(),
+                format!("{} — {}", view.label(), view.detail()),
+            ));
+        }
+        rows.push((
+            "Click".into(),
+            "Probe the surface under the pointer for local Cp, pressure, and traction".into(),
+        ));
+        rows.push((
+            "Space".into(),
+            "Play or pause horizon playback on a completed result".into(),
+        ));
+        rows.push((
+            ", / .".into(),
+            "Step the horizon back / forward by one model step".into(),
+        ));
+        shortcut_rows(ui, &rows);
+    });
+}
+
+/// Key/description reference rows. The key column is fixed-width so the
+/// descriptions align into a readable second column.
+fn shortcut_rows(ui: &mut egui::Ui, rows: &[(String, String)]) {
+    for (keys, description) in rows {
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui(egui::vec2(148.0, 18.0), |ui| {
+                ui.label(RichText::new(keys).text_style(mono_s()).color(TEXT));
+            });
+            ui.label(
+                RichText::new(description)
+                    .text_style(caption())
+                    .color(TEXT_DIM),
+            );
+        });
+        ui.add_space(3.0);
+    }
 }
 
 fn category_storage(ui: &mut egui::Ui, draft: &mut AppSettings) {
     section(ui, "Storage & recovery", |ui| {
-        setting_row(
+        path_setting_row(
             ui,
             "Project directory",
             "Default location for local project bundles; portable content hashes remain authoritative.",
-            |ui| path_control(ui, &mut draft.project_directory, PathPick::Folder),
+            "project-dir",
+            &mut draft.project_directory,
+            &AppSettings::default().project_directory,
+            PathPick::Folder,
         );
         ui.separator();
         setting_row_reset(
@@ -1286,10 +2024,7 @@ fn category_signing(
             "A valid signature proves possession of this key. Recipients must compare its fingerprint through an independent channel.",
             |ui| {
                 ui.label(
-                    RichText::new(key_state.0)
-                        .monospace()
-                        .size(11.0)
-                        .strong()
+                    chip_text(key_state.0)
                         .color(key_state.1),
                 );
             },
@@ -1326,13 +2061,7 @@ fn category_signing(
             "No analytics endpoint is bundled. Model paths and fields never leave the machine.",
             |ui| {
                 draft.telemetry = false;
-                ui.label(
-                    RichText::new("OFF")
-                        .monospace()
-                        .size(11.0)
-                        .strong()
-                        .color(SUCCESS),
-                );
+                ui.label(chip_text("OFF").color(SUCCESS));
             },
         );
     });
@@ -1407,7 +2136,7 @@ pub fn show_controls(
     }
 
     runtime_fact(ui, "ENGINE", engine_status, engine_state_color(engine_ok));
-    runtime_fact(ui, "DEVICE POLICY", saved.compute_device.label(), BRAND);
+    runtime_fact(ui, "DEVICE POLICY", saved.compute_device.label(), TEXT_DIM);
     runtime_fact(ui, "THEME", saved.theme.label(), TEXT_DIM);
     runtime_fact(
         ui,
@@ -1458,15 +2187,21 @@ pub fn show_controls(
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unavailable".into());
             // S8: elide instead of wrapping mid-path; full path on hover.
-            ui.add(
+            let path = ui.add(
                 egui::Label::new(
                     RichText::new(&path_text)
                         .text_style(mono_s())
                         .color(TEXT_DIM),
                 )
-                .truncate(),
-            )
-            .on_hover_text(RichText::new(path_text).monospace());
+                .truncate()
+                .sense(egui::Sense::click()),
+            );
+            if path.clicked() {
+                ui.ctx().copy_text(path_text.clone());
+            }
+            path.on_hover_text(
+                RichText::new(format!("{path_text}\n\nClick to copy full path.")).monospace(),
+            );
         });
 }
 
@@ -1490,10 +2225,41 @@ fn section(ui: &mut egui::Ui, section_title: &str, add: impl FnOnce(&mut egui::U
         });
 }
 
+/// Below this row width the label + control pair cannot share a line without
+/// overlapping, so rows stack the control under the label instead.
+const ROW_STACK_BREAKPOINT: f32 = 400.0;
+const PATH_CONTROL_STACK_BREAKPOINT: f32 = 360.0;
+const COLLECTION_ROW_STACK_BREAKPOINT: f32 = 440.0;
+
+fn setting_row_stacks(width: f32) -> bool {
+    width < ROW_STACK_BREAKPOINT
+}
+
+fn path_controls_stack(width: f32) -> bool {
+    width < PATH_CONTROL_STACK_BREAKPOINT
+}
+
+fn collection_row_stacks(width: f32) -> bool {
+    width < COLLECTION_ROW_STACK_BREAKPOINT
+}
+
 fn setting_row(ui: &mut egui::Ui, label: &str, detail: &str, control: impl FnOnce(&mut egui::Ui)) {
     // S3: the label column yields to the control at narrow widths instead of
     // overlapping it (min 200px reserved for the control), with row padding.
     ui.add_space(4.0);
+    if setting_row_stacks(ui.available_width()) {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(RichText::new(label).text_style(body_strong()).color(TEXT));
+            ui.label(RichText::new(detail).text_style(caption()).color(TEXT_MUTE));
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), control);
+            });
+        });
+        ui.add_space(4.0);
+        return;
+    }
     ui.horizontal(|ui| {
         let label_width = (ui.available_width() - 216.0).clamp(140.0, 360.0);
         ui.vertical(|ui| {
@@ -1519,6 +2285,30 @@ fn setting_row_reset<T: PartialEq>(
     control: impl FnOnce(&mut egui::Ui, &mut T),
 ) {
     ui.add_space(4.0);
+    let control_line = |ui: &mut egui::Ui, value: &mut T| {
+        let modified = *value != default;
+        let reset = reset_button(ui, modified, label);
+        if reset {
+            *value = default;
+            return;
+        }
+        control(ui, value);
+    };
+    if setting_row_stacks(ui.available_width()) {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(RichText::new(label).text_style(body_strong()).color(TEXT));
+            ui.label(RichText::new(detail).text_style(caption()).color(TEXT_MUTE));
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    control_line(ui, value);
+                });
+            });
+        });
+        ui.add_space(4.0);
+        return;
+    }
     ui.horizontal(|ui| {
         let label_width = (ui.available_width() - 240.0).clamp(140.0, 360.0);
         ui.vertical(|ui| {
@@ -1528,24 +2318,27 @@ fn setting_row_reset<T: PartialEq>(
             ui.label(RichText::new(detail).text_style(caption()).color(TEXT_MUTE));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let modified = *value != default;
-            let reset = ui.add_visible(
-                modified,
-                egui::Button::new(
-                    RichText::new(ph::ARROW_COUNTER_CLOCKWISE)
-                        .size(13.0)
-                        .color(TEXT_MUTE),
-                )
-                .frame(false),
-            );
-            if modified && reset.on_hover_text("Reset to default").clicked() {
-                *value = default;
-                return;
-            }
-            control(ui, value);
+            control_line(ui, value);
         });
     });
     ui.add_space(4.0);
+}
+
+fn reset_button(ui: &mut egui::Ui, visible: bool, label: &str) -> bool {
+    let accessible_label = format!("Reset {label} to default");
+    let response = ui.add_visible(
+        visible,
+        egui::Button::new(
+            RichText::new(ph::ARROW_COUNTER_CLOCKWISE)
+                .size(13.0)
+                .color(TEXT_MUTE),
+        )
+        .frame(false),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label.clone())
+    });
+    visible && response.on_hover_text(accessible_label).clicked()
 }
 
 #[derive(Clone, Copy)]
@@ -1554,10 +2347,57 @@ enum PathPick {
     Folder,
 }
 
-/// Right-aligned path field: Browse… on the right edge, then a flexible-width
-/// monospace field that uses the remaining row width (no more hard 250px clip)
-/// with the full path on hover.
-fn path_control(ui: &mut egui::Ui, value: &mut String, pick: PathPick) {
+/// A path setting: label and detail on their own line, then the path itself
+/// across the full card width. Paths are long and the tail is the informative
+/// end, so they get the whole row instead of the ~200px control gutter the
+/// two-column rows reserve (QA S8).
+fn path_setting_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    detail: &str,
+    salt: &str,
+    value: &mut String,
+    default: &str,
+    pick: PathPick,
+) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(label).text_style(body_strong()).color(TEXT));
+    ui.add_space(2.0);
+    ui.label(RichText::new(detail).text_style(caption()).color(TEXT_MUTE));
+    ui.add_space(6.0);
+    let stacked = path_controls_stack(ui.available_width());
+    if stacked {
+        path_field(ui, value, label, salt, ui.available_width().max(80.0));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                browse_path_button(ui, value, pick);
+                ui.add_space(4.0);
+                if reset_button(ui, value != default, label) {
+                    *value = default.to_owned();
+                }
+            });
+        });
+    } else {
+        ui.horizontal(|ui| {
+            // Browse… is placed first in a right-to-left pass so the field can
+            // claim everything left over without a fixed path-width cap.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                browse_path_button(ui, value, pick);
+                ui.add_space(4.0);
+                if reset_button(ui, value != default, label) {
+                    *value = default.to_owned();
+                }
+                ui.add_space(8.0);
+                let width = ui.available_width().max(80.0);
+                path_field(ui, value, label, salt, width);
+            });
+        });
+    }
+    ui.add_space(6.0);
+}
+
+fn browse_path_button(ui: &mut egui::Ui, value: &mut String, pick: PathPick) {
     if ui.button("Browse…").clicked() {
         let dialog = rfd::FileDialog::new();
         let picked = match pick {
@@ -1568,14 +2408,115 @@ fn path_control(ui: &mut egui::Ui, value: &mut String, pick: PathPick) {
             *value = path.display().to_string();
         }
     }
-    let width = (ui.available_width() - 8.0).clamp(220.0, 560.0);
-    let full_path = value.clone();
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .desired_width(width)
-            .font(egui::TextStyle::Monospace),
-    )
-    .on_hover_text(RichText::new(full_path).monospace());
+}
+
+/// Click-to-edit path field. Unfocused it paints the value middle-elided with a
+/// visible ellipsis (and the full value on hover) so a long path never appears
+/// silently cut mid-word; focused it is an ordinary text field.
+fn path_field(ui: &mut egui::Ui, value: &mut String, label: &str, salt: &str, width: f32) {
+    let edit_id = ui.id().with(salt).with("path-edit");
+    let editing = ui.memory(|memory| memory.has_focus(edit_id));
+    if editing {
+        let response = ui.add_sized(
+            egui::vec2(width, 24.0),
+            egui::TextEdit::singleline(value)
+                .id(edit_id)
+                .font(egui::TextStyle::Monospace),
+        );
+        response.widget_info(|| {
+            let mut info = egui::WidgetInfo::text_edit(true, value.as_str(), value.as_str(), "");
+            info.label = Some(label.to_owned());
+            info
+        });
+        return;
+    }
+    let (_, rect) = ui.allocate_space(egui::vec2(width, 24.0));
+    let response = ui.interact(rect, edit_id, egui::Sense::click());
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::text_edit(true, value.as_str(), value.as_str(), "");
+        info.label = Some(label.to_owned());
+        info
+    });
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(R1), BG_0);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(R1),
+        Stroke::new(
+            1.0,
+            if response.hovered() {
+                OUTLINE
+            } else {
+                OUTLINE_VARIANT
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.expand(1.0),
+            CornerRadius::same(R1),
+            focus_stroke(),
+            egui::StrokeKind::Outside,
+        );
+    }
+    let font = mono_s().resolve(ui.style());
+    let inner = rect.width() - 20.0;
+    let (shown, color) = if value.trim().is_empty() {
+        ("not set".to_owned(), TEXT_MUTE)
+    } else {
+        (elide_middle(ui, value, inner, font.clone()), TEXT)
+    };
+    ui.painter().text(
+        egui::pos2(rect.min.x + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        shown,
+        font,
+        color,
+    );
+    if response.clicked() {
+        ui.memory_mut(|memory| memory.request_focus(edit_id));
+    }
+    let hover = if value.trim().is_empty() {
+        "No location set — the system default is used. Click to type a path, or Browse…".to_owned()
+    } else {
+        value.clone()
+    };
+    response.on_hover_text(RichText::new(hover).monospace());
+}
+
+/// Shorten `text` to fit `width`, dropping from the middle and keeping more of
+/// the tail (the file or folder name is the part that identifies a path).
+fn elide_middle(ui: &egui::Ui, text: &str, width: f32, font: egui::FontId) -> String {
+    let measure = |candidate: &str| {
+        ui.painter()
+            .layout_no_wrap(candidate.to_owned(), font.clone(), TEXT)
+            .size()
+            .x
+    };
+    if width <= 0.0 || measure(text) <= width {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let build = |keep: usize| -> String {
+        let tail = (keep * 2 / 3).min(chars.len());
+        let head = keep.saturating_sub(tail);
+        let mut shown: String = chars[..head.min(chars.len())].iter().collect();
+        shown.push('…');
+        shown.extend(chars[chars.len() - tail..].iter());
+        shown
+    };
+    // Largest keep-count that still fits.
+    let (mut low, mut high) = (0usize, chars.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if measure(&build(mid)) <= width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    build(low)
 }
 
 /// Three-swatch preview of a theme mode: surface, text, and ember accent.
@@ -1641,9 +2582,219 @@ fn save_to(settings: &AppSettings, path: &Path) -> Result<(), String> {
     std::fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
+pub fn encode_case_template(template: &CaseTemplate) -> Result<Vec<u8>, String> {
+    template.validate()?;
+    let mut bytes = serde_json::to_vec_pretty(template).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn decode_case_template(bytes: &[u8]) -> Result<CaseTemplate, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("invalid template JSON: {error}"))?;
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "case template is missing schema_version".to_string())?;
+    if version != CASE_TEMPLATE_SCHEMA_VERSION as u64 {
+        return Err(format!(
+            "unsupported case-template schema {version}; this build supports schema {}",
+            CASE_TEMPLATE_SCHEMA_VERSION
+        ));
+    }
+    let template: CaseTemplate =
+        serde_json::from_value(value).map_err(|error| format!("invalid case template: {error}"))?;
+    template.validate()?;
+    Ok(template)
+}
+
+pub fn save_case_template(template: &CaseTemplate, path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "case-template path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("{CASE_TEMPLATE_EXTENSION}.tmp"));
+    std::fs::write(&temporary, encode_case_template(template)?)
+        .map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, path).map_err(|error| error.to_string())
+}
+
+pub fn load_case_template(path: &Path) -> Result<CaseTemplate, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    decode_case_template(&bytes)
+}
+
+pub fn case_template_file_name(template: &CaseTemplate) -> String {
+    let stem: String = template
+        .name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = stem.trim();
+    let stem = if stem.is_empty() {
+        "Reyn case template"
+    } else {
+        stem
+    };
+    format!("{stem}.{CASE_TEMPLATE_EXTENSION}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_layout_protects_narrow_content_widths() {
+        assert_eq!(
+            settings_body_layout(CATEGORY_PICKER_BREAKPOINT - 1.0),
+            SettingsBodyLayout::CategoryPicker
+        );
+        assert_eq!(
+            settings_body_layout(CATEGORY_PICKER_BREAKPOINT),
+            SettingsBodyLayout::CategoryRail
+        );
+        assert!(setting_row_stacks(ROW_STACK_BREAKPOINT - 1.0));
+        assert!(!setting_row_stacks(ROW_STACK_BREAKPOINT));
+        assert!(path_controls_stack(PATH_CONTROL_STACK_BREAKPOINT - 1.0));
+        assert!(!path_controls_stack(PATH_CONTROL_STACK_BREAKPOINT));
+        assert!(collection_row_stacks(COLLECTION_ROW_STACK_BREAKPOINT - 1.0));
+        assert!(!collection_row_stacks(COLLECTION_ROW_STACK_BREAKPOINT));
+    }
+
+    #[test]
+    fn restore_confirmation_reserves_a_second_footer_line() {
+        assert!(settings_footer_height(true) > settings_footer_height(false));
+        assert_eq!(settings_footer_height(false), 64.0);
+        assert_eq!(save_disabled_reason(false), Some(SAVE_DISABLED_REASON));
+        assert_eq!(save_disabled_reason(true), None);
+    }
+
+    #[test]
+    fn focused_category_rows_activate_from_enter_and_space() {
+        for (key, target) in [
+            (egui::Key::Enter, SettingsCategory::Workflow),
+            (egui::Key::Space, SettingsCategory::Signing),
+        ] {
+            let context = egui::Context::default();
+            crate::fonts::install(&context);
+            crate::theme::apply(&context);
+            let mut state = SettingsUiState {
+                category: SettingsCategory::Compute,
+                confirm_restore_defaults: false,
+                revoke_signing_key_armed: false,
+                preset_delete_armed: None,
+                template_delete_armed: None,
+                qa_focus_category: None,
+                qa_scroll_bottom: false,
+            };
+            let target_id = category_row_id(target);
+            context.memory_mut(|memory| memory.request_focus(target_id));
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 420.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = context.run_ui(input, |ui| {
+                category_rail(ui, &mut state);
+            });
+            assert_eq!(state.category, target);
+            assert_eq!(context.memory(|memory| memory.focused()), Some(target_id));
+        }
+    }
+
+    #[test]
+    fn adverse_capture_fixture_covers_populated_and_invalid_states() {
+        let settings: AppSettings =
+            serde_json::from_str(include_str!("../docs/qa/settings-adverse/settings.json"))
+                .unwrap();
+        assert!(settings.operating_presets[0].name.chars().count() > 100);
+        assert!(settings.case_templates[0].name.chars().count() > 100);
+        assert!(settings.case_templates[0].validate().is_ok());
+        assert!(settings.case_templates[1]
+            .validate()
+            .unwrap_err()
+            .contains("viscosity must be positive"));
+    }
+
+    #[test]
+    fn populated_workflow_rows_render_narrow_and_wide_without_expanding() {
+        for width in [320.0, 720.0] {
+            let context = egui::Context::default();
+            crate::fonts::install(&context);
+            crate::theme::apply(&context);
+            let mut settings: AppSettings =
+                serde_json::from_str(include_str!("../docs/qa/settings-adverse/settings.json"))
+                    .unwrap();
+            let mut state = SettingsUiState {
+                category: SettingsCategory::Workflow,
+                confirm_restore_defaults: false,
+                revoke_signing_key_armed: false,
+                preset_delete_armed: Some(0),
+                template_delete_armed: Some(0),
+                qa_focus_category: None,
+                qa_scroll_bottom: false,
+            };
+            let mut action = None;
+            let mut occupied = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 1_400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = context.run_ui(input, |ui| {
+                ui.set_width(width);
+                category_workflow(ui, &mut settings, &mut state, &mut action);
+                occupied = ui.min_rect();
+            });
+            assert!(
+                occupied.width() <= width + 0.5,
+                "workflow content expanded to {} at {width}px",
+                occupied.width()
+            );
+            assert!(action.is_none());
+            assert_eq!(state.preset_delete_armed, Some(0));
+            assert_eq!(state.template_delete_armed, Some(0));
+        }
+    }
+
+    /// Every settings category stays reachable through the QA deep-link
+    /// (REYN_STUDIO_START_NAV=settings:<id>).
+    #[test]
+    fn every_settings_category_has_a_qa_deep_link_id() {
+        let ids = [
+            "compute",
+            "units",
+            "appearance",
+            "viewport",
+            "workflow",
+            "shortcuts",
+            "storage",
+            "signing",
+            "developer",
+        ];
+        assert_eq!(ids.len(), SettingsCategory::ALL.len());
+        for (id, category) in ids.iter().zip(SettingsCategory::ALL) {
+            assert_eq!(SettingsCategory::from_qa_id(id), Some(category));
+        }
+        assert_eq!(SettingsCategory::from_qa_id("nonsense"), None);
+    }
 
     /// Honesty guard (PRD: no fake state): the runtime rail's engine color
     /// must track the real `engine_ok` flag — never green while down.
@@ -1702,6 +2853,19 @@ mod tests {
                 viscosity_pa_s: 1.8e-5,
                 reference_pressure_pa: 101_000.0,
             }],
+            case_templates: vec![CaseTemplate::from_draft(
+                "Tunnel B review",
+                &OperatingPoint {
+                    velocity: 22.0,
+                    density: 1.2,
+                    viscosity: 1.8e-5,
+                    reference_pressure: 101_000.0,
+                    horizon_steps: 8,
+                    ..OperatingPoint::default()
+                },
+                SectionAxis::Z,
+                SectionQuantity::VelocityMagnitude,
+            )],
             ..AppSettings::default()
         };
         save_to(&settings, &path).unwrap();
@@ -1747,8 +2911,49 @@ mod tests {
             ViewportBackground::InstrumentWell
         );
         assert_eq!(settings.default_horizon_steps, 4);
+        assert_eq!(settings.default_3d_model, DEFAULT_3D_MODEL_ID);
+        assert_eq!(settings.default_2d_model, DEFAULT_2D_MODEL_ID);
         assert!(settings.default_export_directory.is_empty());
         assert!(settings.operating_presets.is_empty());
+        assert!(settings.case_templates.is_empty());
+    }
+
+    #[test]
+    fn persisted_legacy_model_defaults_migrate_without_loading_pickle() {
+        let root = std::env::temp_dir().join(format!(
+            "reyn-settings-model-migration-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "python_path": "python3",
+                "research_dir": "/tmp",
+                "current_model": "flow3d_obs_v1.pth",
+                "f2d_model": "reyn_models/obstacle_v2_shapes.PTH"
+            }"#,
+        )
+        .unwrap();
+
+        let (settings, warning) = AppSettings::load_from_path(&path);
+        assert_eq!(settings.default_3d_model, "flow3d_obs_v1.reynmodel");
+        assert_eq!(
+            settings.default_2d_model,
+            "reyn_models/obstacle_v2_shapes.reynmodel"
+        );
+        let warning = warning.expect("migration guidance");
+        assert!(warning.contains("never opened"));
+        assert!(warning.contains("convert_model_bundle.py"));
+        assert!(warning.contains(".reynmodel.sig"));
+
+        save_to(&settings, &path).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("flow3d_obs_v1.reynmodel"));
+        assert!(!persisted.contains(".pth"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1770,7 +2975,10 @@ mod tests {
         assert_eq!(settings.cp_pinned_extent, 1.5);
         assert_eq!(settings.default_horizon_steps, 1);
         assert_eq!(settings.autosave_interval_seconds, 30);
-        assert!(settings.operating_presets.is_empty(), "nameless presets dropped");
+        assert!(
+            settings.operating_presets.is_empty(),
+            "nameless presets dropped"
+        );
     }
 
     #[test]
@@ -1834,5 +3042,89 @@ mod tests {
         restored.revoke_signing_key();
         assert!(restored.signing_key_is_revoked());
         assert!(restored.configured_signing_key().is_err());
+    }
+
+    #[test]
+    fn portable_case_template_round_trips_and_seeds_only_owned_defaults() {
+        let mut operating = OperatingPoint {
+            length_unit: crate::engineering::LengthUnit::Millimeter,
+            reference_length: 420.0,
+            velocity: 12.0,
+            density: 1.18,
+            viscosity: 1.9e-5,
+            reference_pressure: 100_800.0,
+            flow_direction: [1.0, 0.0, 0.0],
+            horizon_steps: 12,
+        };
+        let template = CaseTemplate::from_draft(
+            "Aero review",
+            &operating,
+            SectionAxis::Y,
+            SectionQuantity::PhysicalCp,
+        );
+        let bytes = encode_case_template(&template).unwrap();
+        let restored = decode_case_template(&bytes).unwrap();
+        assert_eq!(restored, template);
+        let json = String::from_utf8(bytes).unwrap();
+        for forbidden in [
+            "source_sha256",
+            "model_sha256",
+            "transform_4x4",
+            "waivers",
+            "run_id",
+            "evidence",
+            "reference_length",
+            "flow_direction",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "{forbidden} leaked into template"
+            );
+        }
+
+        operating.length_unit = crate::engineering::LengthUnit::Foot;
+        operating.reference_length = 7.5;
+        operating.flow_direction = [1.0, 0.0, 0.0];
+        operating.velocity = 3.0;
+        operating.horizon_steps = 2;
+        assert!(restored.apply_to(&mut operating, 8).unwrap());
+        assert_eq!(operating.velocity, 12.0);
+        assert_eq!(operating.horizon_steps, 8, "model support clamps defaults");
+        assert_eq!(operating.length_unit, crate::engineering::LengthUnit::Foot);
+        assert_eq!(operating.reference_length, 7.5);
+        assert_eq!(operating.flow_direction, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn case_template_import_rejects_future_schema_and_invalid_defaults() {
+        let future = br#"{
+            "schema_version": 99,
+            "name": "Future",
+            "operating": {
+                "velocity_mps": 1.0,
+                "density_kg_m3": 1.0,
+                "viscosity_pa_s": 0.001,
+                "reference_pressure_pa": 101325.0,
+                "horizon_steps": 4
+            },
+            "preferred_view": {
+                "section_axis": "x",
+                "section_quantity": "physical_cp"
+            }
+        }"#;
+        assert!(decode_case_template(future)
+            .unwrap_err()
+            .contains("unsupported case-template schema 99"));
+
+        let mut template = CaseTemplate::from_draft(
+            "Invalid",
+            &OperatingPoint::default(),
+            SectionAxis::X,
+            SectionQuantity::PhysicalCp,
+        );
+        template.operating.viscosity_pa_s = 0.0;
+        assert!(encode_case_template(&template)
+            .unwrap_err()
+            .contains("viscosity must be positive"));
     }
 }

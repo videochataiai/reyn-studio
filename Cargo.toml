@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Reyn Studio — fully-native (egui + wgpu) neural-CFD workbench, linked to a Python inference engine"
 
+[package.metadata.reyn-macos]
+bundle-identifier = "com.reyn.studio"
+display-name = "Reyn Studio"
+category = "public.app-category.productivity"
+minimum-system-version = "11.0"
+
 [dependencies]
 eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.35"
@@ -28,6 +34,9 @@ security-framework = { version = "3.7", features = ["OSX_10_15"] }
 
 [dev-dependencies]
 pollster = "0.4"
+# Shader validation without an adapter: the GPU render tests silently skip on
+# machines with no wgpu adapter, so WGSL is parsed and validated separately.
+naga = { version = "29", features = ["wgsl-in"] }
 
 [profile.dev]
 opt-level = 1          # keep the 3D viewport smooth even in debug builds
@@ -35,3 +44,5 @@ opt-level = 1          # keep the 3D viewport smooth even in debug builds
 [profile.release]
 opt-level = 3
 lto = "thin"
+codegen-units = 1
+strip = "symbols"

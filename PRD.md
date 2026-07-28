@@ -166,7 +166,7 @@ This section is historical grounding, not permission to infer unlisted features.
 | N4 — Flow Painter | Done | Brush, symmetries, presets, native divergence-free projection, diagnostics, and prediction handoff. | A solver reference for painted ICs remains deferred until viscosity/regime are explicit. |
 | N5.1 — Benchmark suite | Done | Seed × horizon suite, persistence comparison, CSV, and deterministic canonical JSON with SHA-256 integrity. | SHA-256 is not a signature. |
 | N5.2 — coherent evidence slice | Done, milestone still partial | Exact stream classification; legacy provenance findings; selected-cell velocity, vorticity, recovered-pressure, error, and spatial-divergence evidence with source/unit/method metadata and shared calibrated scales (`N5X-INSP-01` passed); energy spectra; legacy, mask-conditioned, and fixed-body-v2 benchmark contracts. Deterministic PNG/PDF reports derive from the same run/model/protocol/hash-linked canonical JSON (`N5X-EXPORT-01` passed). The signing slice now implements detached Ed25519 signatures over the raw canonical-payload SHA-256, explicit key ID/public-key fingerprint/signature bytes/verification state, portable offline CLI verification, revocation-aware trust, deterministic JSON/PNG/PDF sidecar lineage, append-only project evidence, and non-secret provider tests. | `N5X-SIGN-01` remains open until the production macOS Keychain/user-presence path is safely exercised on a supported app build; the canonical report remains explicitly `UNSIGNED` and authenticity lives in its derived sidecar. The overlap analysis is not yet integrated with an archived candidate artifact, so `N5X-VV-01` and `N5X-VV-02` also remain open. |
-| External engineering case | Implementation complete; interactive release smoke pending | The landing action imports STL into **Project → Case Setup → Run → Results → Evidence**. Source bytes/hash, units, topology, transform, voxel adequacy, named waivers, model support, and the operating point gate execution. Results carry physical-reference `Cp`, pressure and viscous fluid traction, integrated force/moment coefficients, velocity/vorticity volume evidence, hotspots, CAD-linked sections, immutable field/scalar evidence, variant lineage, and FEA-load CSV provenance. | This remains managed tessellated import, not embedded/associative CAD. Pressure is recovered from predicted velocity; no structural stress or independent spatial error is shown without a reference. `N5X-CAD-01`–`04`, `N5X-PHYS-01`, and the full first-user path still require an interactive packaged-app smoke before release status is marked passed. |
+| External engineering case | Implementation complete; interactive release smoke pending | The landing action imports STL into **Project → Case Setup → Run → Results → Evidence**. Source bytes/hash, units, topology, transform, voxel adequacy, named waivers, model support, and the operating point gate execution. Results carry physical-reference `Cp`, pressure and viscous fluid traction, integrated force/moment coefficients, velocity/vorticity volume evidence, hotspots, CAD-linked sections, immutable field/scalar evidence, variant lineage, FEA-load CSV provenance, and a streaming legacy-VTK StructuredGrid export of the completed persisted run in approved source-frame SI coordinates. | This remains managed tessellated import, not embedded/associative CAD. Pressure is recovered from predicted velocity; no structural stress or independent spatial error is shown without a reference. Neutral field export has automated format/provenance tests but still requires an external ParaView/manual-open smoke. `N5X-CAD-01`–`04`, `N5X-PHYS-01`, and the full first-user path still require an interactive packaged-app smoke before release status is marked passed. |
 | N6 | Partial; release gate open | `N6-MODEL-01`, `N6-MODEL-02`, and `N6-PROJ-01` through `N6-PROJ-07` passed. The case-centered IA candidate and shared-unit parent/current variant comparison are implemented; procedural 3D, Flow Painter, standalone 2D, and Benchmark Lab now remain permanently available behind the persisted Developer-mode Research Sandbox. External engineering field blobs reopen from content-addressed project evidence. | `N6-SET-01` remains open for production Keychain/user-presence exercise. `N6-IA-01` and `N6-COMP-01` remain release candidates until the interactive acceptance path is exercised. Packaging, notarization, clean-machine, and offline gates remain open. |
 
 Closeout verification on 2026-07-24: **89 Rust correctness tests passed** (the explicit GPU
@@ -254,7 +254,8 @@ Create/open project → **New External-Flow Analysis / Import Geometry** → rev
 defects, transform, voxel adequacy, and model support → set the operating point → confirm the
 locked contract → create an immutable run → inspect applicability, `Cp`, fluid loads,
 force/moment coefficients, hotspots, wake indicators, and source-labeled 3D/2D evidence → compare
-a parented variant or export mapped FEA loads and run-linked evidence.
+a parented variant or export mapped FEA loads, a source-frame neutral VTK field, and run-linked
+evidence.
 
 **Success:** another user can inspect every transformation and assumption, reproduce into a new
 run when dependencies exist, or understand precisely why reproduction is unavailable.
@@ -302,7 +303,8 @@ The release-defining path is **Project → Case Setup → Run → Results → Ev
 - **Results** — applicability first, then forces/moments and critical load/suction regions, then
   geometry-linked 3D and section evidence.
 - **Evidence** — exact source/case/run/model lineage, methods, warnings, immutable field/scalar
-  artifacts, comparison links, and FEA export.
+  artifacts, comparison links, mapped FEA export, and neutral VTK export of a completed persisted
+  external-flow field.
 - **Model Library** and **Settings** remain contextual product destinations.
 
 Procedural 3D, Flow Painter, standalone Fields (2D), and Benchmark Lab are not primary product
@@ -335,10 +337,12 @@ labels are absent from the default workflow.
 **Stage 1 — N5.4: source-aware import and preflight — release candidate**
 
 - Source hash, units, frame, extents, transform preview/approval, revision, and run manifest.
-- Watertight/open/non-manifold/degenerate/component/normal diagnostics.
-- Solid fraction, boundary clearance, disconnected voxel components, cells across critical
+- Watertight/open/non-manifold/degenerate/component/winding/self-intersection diagnostics.
+- Three-axis inside/outside classification with persisted disagreement and odd-scanline evidence;
+  solid fraction, boundary clearance, disconnected voxel components, morphological resolved-core
   thickness, target grid, and model-support checks.
-- Explicit warnings/waivers and source-aware reimport diff; no silent geometry mutation.
+- Explicit warnings/waivers and source-aware reimport diff; no silent geometry mutation. Measured
+  topology/classification failures are hard gates and cannot be replaced by prose waivers.
 
 **Stage 2 — post-N6: neutral B-rep translation — integrate**
 
@@ -405,6 +409,7 @@ Priority meanings: **P0** blocks the named phase/release; **P1** is the next coh
 | REQ-N5-EXPORT-01 | P0 | Export portable PNG/PDF evidence from the canonical report data. | REQ-N5-EV-01 | N5X-EXPORT-01 |
 | REQ-N5-SIGN-01 | P0 | Add real organization-key signing without conflating it with SHA-256 integrity. | REQ-N5-EXPORT-01 | N5X-SIGN-01 |
 | REQ-N5-CAD-01 | P0 | Add source-aware CAD preflight, transform approval, adequacy/support gates, and waivers. | REQ-N5-EV-01 | N5X-CAD-01, N5X-CAD-02, N5X-CAD-03, N5X-CAD-04 |
+| REQ-N5-CAD-02 | P0 | Classify occupancy independently along X/Y/Z, persist normalized axis disagreement and odd scanline counts, block disagreement above 2%, and hard-gate open, non-manifold, inconsistent-winding, multi-shell, or self-intersecting sources. Pre-v2 single-axis projects must re-import. | REQ-N5-CAD-01 | N5X-CAD-05 |
 | REQ-N5-PHYS-01 | P0 | Correct pressure terminology and permit `Cp` only after physical nondimensionalization is recorded. | REQ-N5-EV-02 | N5X-PHYS-01 |
 | REQ-N5-LOAD-01 | P0 | Produce versioned pressure/viscous fluid traction, force/moment integration, hotspots, wake indicators, and mapped FEA-load export with exact reference quantities and lineage. | REQ-N5-CAD-01, REQ-N5-PHYS-01 | N5X-LOAD-01, N5X-LOAD-02, N5X-LOAD-03 |
 
@@ -420,6 +425,18 @@ Priority meanings: **P0** blocks the named phase/release; **P1** is the next coh
 | REQ-N6-COMP-01 | P0 | Compare runs/variants on shared scales and deep-link every point to immutable evidence. | REQ-N6-PROJ-02 | N6-COMP-01 |
 | REQ-N6-IA-01 | P0 | Make the external engineering case the default project path and preserve procedural 2D/3D/Painter/Benchmark workflows behind the persisted Developer Research Sandbox. | REQ-N6-PROJ-02, REQ-UX-02 | N6-IA-01 |
 | REQ-N6-PKG-01 | P0 | Ship a checksummed, codesigned, notarized standalone app with clean-machine and offline review. | REQ-N6-PROJ-03, REQ-N6-MODEL-01, REQ-N6-SET-01 | N6-PKG-01, N6-PKG-02 |
+| REQ-N6-SET-02 | P1 | Ship deep, categorized preferences (units & formatting, appearance incl. UI scale and field colormap/range, viewport & camera, workflow defaults incl. named operating-point presets, read-only shortcut reference) with per-setting and confirmed global reset, all serde-defaulted so older settings files load cleanly. Display/entry unit preferences must never alter stored SI evidence, run manifests, or versioned export schemas. | REQ-N6-SET-01 | N6-SET-01 |
+| REQ-N6-UNITS-01 | P1 | Provide unit-aware operating-point entry (per-field unit selection converting to SI on entry, stored value always SI and visible) and unit-system-aware display of results and reference values (SI/Imperial with significant-digit and notation preferences). | REQ-N6-SET-02 | N6-IA-01 |
+| REQ-N6-REPORT-01 | P1 | Export a single self-contained HTML engineering report per immutable run: full provenance chain (source SHA-256 → case revision → run → model SHA-256), operating point, geometry preflight, coefficients and physical loads, optional stored-field section figure, and an explicit limitations block. A report is never produced from a draft. | REQ-N6-PROJ-02 | N6-PROJ-04 |
+| REQ-N6-EXPORT-02 | P1 | Export the rendered engineering section and the composited 3D viewport as PNG from the Results screen; results summary (named coefficients, loads, reference values, provenance ids) copyable as tab-separated text. | REQ-N6-PROJ-02 | N6-COMP-01 |
+| REQ-N6-FIELD-EXPORT-01 | P1 | Export the selected completed external-flow run's persisted velocity, recovered pressure, physical-reference `Cp`, fluid traction, and solid occupancy as a ParaView-readable VTK StructuredGrid. Points and vector components use the approved imported-source frame in SI units; schema, source/case/run/model/contract identity, field hash, units, source classes, methods, and transform travel inside the file. Draft, preview, stale, malformed, non-finite, unapproved-transform, missing-content, and non-canonical-model inputs cannot export. Writing streams through a sibling temporary file and publishes atomically. | REQ-N5-EV-02, REQ-N5-PHYS-01, REQ-N6-PROJ-02, REQ-N6-PROJ-03 | N6-FIELD-EXPORT-01 |
+| REQ-N6-NAV-01 | P0 | Provide a complete viewport navigation floor: orbit with a sensitivity preference, pan, zoom-to-cursor honouring the invert-scroll preference, zoom-to-fit on the real geometry bounds, and standard view stations named in flow terms (upstream/downstream/side/top/bottom/iso) with smooth, reduced-motion-aware interpolation. Bindings are switchable between a Reyn default and SolidWorks- and Fusion-style mappings, and every mapping is documented in Settings and reachable from the keyboard-shortcut reference and the viewport hint. | REQ-N6-SET-02 | N6-NAV-01 |
+| REQ-N6-RUN-01 | P0 | Every in-flight run is cancellable, and progress is never fabricated: show elapsed time and a named indeterminate state unless the engine reports genuine step progress. A cancelled or stale result must be discarded on arrival and must never become a result, a run, or evidence. | REQ-N6-PROJ-02 | N6-RUN-01 |
+| REQ-N6-HORIZON-01 | P1 | Let the operator step, scrub, and play through model horizon steps 1..H for a completed case in both the 3D and 2D section views. Every step is labeled as a model prediction at horizon step k — with physical lead time only when it can be derived honestly from the operating point — and steps other than the recorded horizon are display-only previews that never enter the content store, the run ledger, or evidence. A step that has not been computed says so rather than showing another step's field. | REQ-N6-RUN-01 | N6-HORIZON-01 |
+| REQ-N6-AOA-01 | P0 | Support body attitude (angle of attack, yaw, roll) applied as a geometry transform before voxelization, since the model's free stream is fixed on +X. The angles are recorded in the geometry preflight, folded into the preprocessing transform, carried in the case revision and report, re-open transform approval, and invalidate results like any other case edit. Force and moment coefficients state their reference frame explicitly and are reported in wind axes, never rotated with the body. | REQ-N5-CAD-01 | N6-AOA-01 |
+| REQ-N6-PROBE-01 | P1 | Clicking the 3D result reports local Cp, recovered pressure, and traction magnitude at the picked surface cell with source-class chips, the point's position in the approved source frame, and the horizon step it came from — consistent with the 2D section probe. | REQ-N5-EV-02 | N6-PROBE-01 |
+| REQ-N6-HAZARD-01 | P0 | Any decorative or analytic overlay that is not driven by model output is quarantined to the Developer Research Sandbox, disabled elsewhere with a reason on hover, and labeled in place whenever it renders. The gate is pinned by a test. | REQ-SCI-01 | N6-HAZARD-01 |
+| REQ-N6-DIAG-01 | P0 | A blocked preprocessing path must name its actual cause and the action that would clear it, and may never suggest a repair the artifact does not need. Rendering programs are parsed and validated by the test suite itself, so a machine with no GPU adapter cannot produce a green gate for a build that cannot paint. | REQ-SCI-01 | N6-DIAG-01 |
 
 ### 9.4 Post-N6 requirements
 
@@ -491,6 +508,10 @@ criteria must pass with evidence from relevant automated and/or clean-machine te
   under-resolved critical thickness blocks execution or records a named waiver.
 - **N5X-CAD-04:** The model displays supported grid/channels/geometry/physics/horizon; unsupported
   inputs cannot receive an unqualified green state.
+- **N5X-CAD-05:** The five valid STL fixtures classify with no more than 2% three-axis
+  disagreement. The small-hole and missing-cap fixtures block on topology and measured
+  disagreement; nested and intersecting shells block on component/intersection ambiguity; old
+  single-axis cases block until re-import. None of these gates accepts a prose waiver.
 - **N5X-PHYS-01:** `Cp` appears only when \(p_\infty,\rho_\infty,V_\infty\) are recorded and
   \(C_p=(p-p_\infty)/(0.5\rho_\infty V_\infty^2)\) is computed. Otherwise UI and exports say
   recovered pressure.
@@ -536,6 +557,42 @@ criteria must pass with evidence from relevant automated and/or clean-machine te
   creates/saves/reopens a project, runs one smoke case, and exports verifiable evidence without a
   terminal.
 - **N6-PKG-02:** Offline launch/read-only review work without an account and with telemetry off.
+- **N6-FIELD-EXPORT-01:** A completed selected run exports deterministic legacy-VTK
+  `STRUCTURED_GRID` bytes whose dimensions and array lengths match the persisted field. Grid
+  cell-centre coordinates and velocity/traction components round-trip through rotated,
+  isotropically scaled approved source transforms into metres and source-frame Cartesian
+  components. Embedded field data records schema, source revision, case revision, run ID, canonical
+  model and field SHA-256, contract kind, transform, units, source classes, and methods. Tests reject
+  incomplete/stale run states, missing canonical identity, malformed lengths, non-finite values,
+  invalid occupancy, and unapproved or invalid transforms. The Results and Evidence affordances
+  write through a flushed sibling temporary file; external ParaView/manual-open validation remains
+  a release smoke rather than an automated claim.
+- **N6-NAV-01:** Orbit, pan, zoom-to-cursor, zoom-to-fit, and the named view stations behave
+  identically under every shipped mouse scheme; fit frames the actual geometry bounds with every
+  corner on screen; view snaps interpolate and settle exactly on their station; zoom-to-cursor keeps
+  the pointed-at point under the pointer; and the active scheme's bindings are readable in Settings,
+  in the shortcut reference, and in the viewport hint. A station's on-screen orientation matches the
+  physical claim in its label: the side and plan views put the free stream left to right, the
+  upstream station stands ahead of the body looking downstream, and no station rolls the view.
+- **N6-RUN-01:** Cancelling an in-flight run clears the pending state immediately, and when the
+  engine's result finally arrives it is discarded with a stated reason — no result, run, evidence,
+  or partial field is written. No progress percentage is displayed unless it is genuinely reported.
+- **N6-HORIZON-01:** Scrubbing to a cached horizon step is instant and never re-requests it; an
+  uncomputed step is named as such in both the 3D and section views instead of showing another
+  step's field; every step other than the recorded horizon is chipped as a preview; and previews are
+  discarded whenever the case contract changes.
+- **N6-AOA-01:** A non-zero attitude changes the voxel mask and the recorded transform, round-trips
+  solver points back to the approved source frame, appears in the case revision and the HTML report,
+  clears transform approval, and invalidates the result. Zero attitude is bit-identical to the
+  imported-orientation path.
+- **N6-PROBE-01:** A 3D pick on the body reports Cp, pressure, and traction with source classes and
+  the horizon step; a pick that misses the body says so rather than reporting a value.
+- **N6-HAZARD-01:** The analytic streamline overlay cannot render outside the research sandbox, its
+  control is disabled elsewhere with a reason, and a test pins the gate.
+- **N6-DIAG-01:** A watertight body that auto-fits to less than one cell thick is reported as a grid
+  resolution limit, with the measured thickness and the axis it is thin across, rather than as a mesh
+  repair problem. Every shipped shader parses and validates in the test suite whether or not the test
+  machine has a GPU adapter.
 
 ### 10.4 Post-N6
 

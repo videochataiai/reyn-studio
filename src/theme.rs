@@ -31,8 +31,8 @@ pub const SURFACE_HIGHEST: Color32 = BG_4;
 
 /// Separators and quiet borders — visible, not loud.
 pub const HAIRLINE: Color32 = Color32::from_rgb(0x3B, 0x34, 0x2C);
-/// Interactive borders, focus-adjacent.
-pub const OUTLINE: Color32 = Color32::from_rgb(0x57, 0x4C, 0x41);
+/// Interactive borders — ≥3:1 against every surface in the ladder.
+pub const OUTLINE: Color32 = Color32::from_rgb(0x89, 0x78, 0x67);
 pub const OUTLINE_VARIANT: Color32 = HAIRLINE;
 
 // ---------------------------------------------------------------------------
@@ -42,8 +42,8 @@ pub const OUTLINE_VARIANT: Color32 = HAIRLINE;
 pub const TEXT: Color32 = Color32::from_rgb(0xF1, 0xEC, 0xE6);
 /// Body, labels (≈8:1).
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0xC6, 0xBC, 0xB1);
-/// Captions, placeholders — ≥11.5px sizes only (≈4.6:1).
-pub const TEXT_MUTE: Color32 = Color32::from_rgb(0x8F, 0x84, 0x78);
+/// Captions, placeholders — ≥11.5px sizes only and ≥4.5:1 on every surface.
+pub const TEXT_MUTE: Color32 = Color32::from_rgb(0xA2, 0x98, 0x8E);
 
 // ---------------------------------------------------------------------------
 // Accent — spent, not sprayed. Ember marks exactly one primary action per
@@ -62,7 +62,7 @@ pub const OK: Color32 = Color32::from_rgb(0x3F, 0xBF, 0x8A);
 /// UNKNOWN / metadata gaps / stale.
 pub const WARN: Color32 = Color32::from_rgb(0xE3, 0xA9, 0x3C);
 /// Failed gate, destructive actions, REJECTED.
-pub const DANGER: Color32 = Color32::from_rgb(0xE5, 0x54, 0x4B);
+pub const DANGER: Color32 = Color32::from_rgb(0xFF, 0x69, 0x5F);
 /// Neutral notices; also the tertiary data blue.
 pub const INFO: Color32 = Color32::from_rgb(0x8A, 0xCE, 0xFF);
 
@@ -196,9 +196,12 @@ pub fn motion_t(ctx: &egui::Context, id: egui::Id, target: bool, seconds: f32) -
     ctx.animate_bool_with_time_and_easing(id, target, seconds, egui::emath::easing::cubic_out)
 }
 
-/// Keyboard focus ring — ember at ~60%, drawn outside the widget rect.
+/// Keyboard focus ring — ember at 75%, drawn outside the widget rect.
+///
+/// The opacity floor keeps the composited ring above 3:1 against the
+/// lightest overlay surface while retaining the restrained ember treatment.
 pub fn focus_stroke() -> egui::Stroke {
-    egui::Stroke::new(2.0, EMBER.gamma_multiply(0.6))
+    egui::Stroke::new(2.0, EMBER.gamma_multiply(0.75))
 }
 
 /// Shared document-screen rhythm (§3.2): every content screen caps its column
@@ -247,8 +250,14 @@ pub fn apply_with_contrast(ctx: &egui::Context, high_contrast: bool) {
     visuals.extreme_bg_color = BG_2; // text edit backgrounds (inputs)
     visuals.faint_bg_color = BG_1;
     visuals.hyperlink_color = INFO;
-    visuals.selection.bg_fill = EMBER.linear_multiply(0.35);
-    visuals.selection.stroke = egui::Stroke::new(1.0, EMBER);
+    visuals.warn_fg_color = WARN;
+    visuals.error_fg_color = DANGER;
+    visuals.selection.bg_fill = if high_contrast {
+        EMBER
+    } else {
+        EMBER.linear_multiply(0.35)
+    };
+    visuals.selection.stroke = egui::Stroke::new(1.0, if high_contrast { ON_EMBER } else { TEXT });
 
     // Overlay elevation (§3.4 level 3): one soft shadow, no stroke.
     let overlay_shadow = egui::epaint::Shadow {
@@ -259,33 +268,39 @@ pub fn apply_with_contrast(ctx: &egui::Context, high_contrast: bool) {
     };
     visuals.popup_shadow = overlay_shadow;
     visuals.window_shadow = overlay_shadow;
-    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.window_stroke = if high_contrast {
+        egui::Stroke::new(1.0, TEXT_MUTE)
+    } else {
+        egui::Stroke::NONE
+    };
     visuals.window_corner_radius = egui::CornerRadius::same(R2);
     visuals.menu_corner_radius = egui::CornerRadius::same(R2);
 
     let w = &mut visuals.widgets;
     w.noninteractive.bg_fill = BG_2;
-    let quiet_outline = if high_contrast { OUTLINE } else { HAIRLINE };
+    let quiet_outline = if high_contrast { TEXT_MUTE } else { HAIRLINE };
+    let control_outline = if high_contrast { TEXT_MUTE } else { OUTLINE };
     let quiet_text = if high_contrast { TEXT } else { TEXT_DIM };
     w.noninteractive.bg_stroke = egui::Stroke::new(1.0, quiet_outline);
     w.noninteractive.fg_stroke = egui::Stroke::new(1.0, quiet_text);
     w.inactive.bg_fill = BG_3;
     w.inactive.weak_bg_fill = BG_3;
-    w.inactive.bg_stroke = egui::Stroke::new(1.0, quiet_outline);
+    w.inactive.bg_stroke = egui::Stroke::new(1.0, control_outline);
     w.inactive.fg_stroke = egui::Stroke::new(1.0, quiet_text);
     w.hovered.bg_fill = BG_4;
     w.hovered.weak_bg_fill = BG_4;
-    w.hovered.bg_stroke = egui::Stroke::new(1.0, OUTLINE);
+    w.hovered.bg_stroke = egui::Stroke::new(1.0, control_outline);
     w.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    // Pressed state stays tonal — ember is reserved for the one primary
-    // action per screen, not a generic press flash.
+    // A focused widget resolves to egui's active state, so its border must
+    // carry the same visible-focus treatment as custom widgets. The fill
+    // remains tonal; ember is confined to the 2 px indicator.
     w.active.bg_fill = BG_4;
     w.active.weak_bg_fill = BG_4;
-    w.active.bg_stroke = egui::Stroke::new(1.0, OUTLINE);
+    w.active.bg_stroke = focus_stroke();
     w.active.fg_stroke = egui::Stroke::new(1.0, TEXT);
     w.open.bg_fill = BG_3;
     w.open.weak_bg_fill = BG_3;
-    w.open.bg_stroke = egui::Stroke::new(1.0, quiet_outline);
+    w.open.bg_stroke = egui::Stroke::new(1.0, control_outline);
 
     let r = egui::CornerRadius::same(R1);
     for s in [
@@ -307,9 +322,9 @@ pub fn apply_with_contrast(ctx: &egui::Context, high_contrast: bool) {
             (display(), FontId::new(22.0, semibold.clone())),
             (title(), FontId::new(16.0, semibold.clone())),
             (body_strong(), FontId::new(13.0, medium.clone())),
-            (overline(), FontId::new(10.5, medium.clone())),
-            (mono_s(), FontId::new(11.0, FontFamily::Monospace)),
-            (mono_chip(), FontId::new(10.5, mono_medium)),
+            (overline(), FontId::new(11.5, medium.clone())),
+            (mono_s(), FontId::new(11.5, FontFamily::Monospace)),
+            (mono_chip(), FontId::new(11.5, mono_medium)),
             (TextStyle::Heading, FontId::new(16.0, semibold)),
             (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
             (TextStyle::Button, FontId::new(13.0, medium)),
@@ -326,13 +341,179 @@ pub fn apply_with_contrast(ctx: &egui::Context, high_contrast: bool) {
     };
 
     // egui 0.35: apply to every theme slot so light/dark both use the instrument look.
+    let animation_time = if reduced_motion(ctx) { 0.0 } else { 0.16 };
     ctx.all_styles_mut(|style| {
         style.visuals = visuals.clone();
         style.text_styles = text_styles.clone();
-        style.animation_time = 0.16;
+        style.animation_time = animation_time;
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
         style.spacing.scroll = egui::style::ScrollStyle::floating();
         style.spacing.scroll.bar_width = 6.0;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn linear_channel(channel: u8) -> f32 {
+        let channel = f32::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(color: Color32) -> f32 {
+        let [red, green, blue, _] = color.to_srgba_unmultiplied();
+        0.2126 * linear_channel(red)
+            + 0.7152 * linear_channel(green)
+            + 0.0722 * linear_channel(blue)
+    }
+
+    fn contrast_ratio(first: Color32, second: Color32) -> f32 {
+        let first = luminance(first);
+        let second = luminance(second);
+        (first.max(second) + 0.05) / (first.min(second) + 0.05)
+    }
+
+    /// Composite a premultiplied `Color32` over an opaque surface. This
+    /// models the final focus/selection color that contrast is measured on.
+    fn composite_over(foreground: Color32, background: Color32) -> Color32 {
+        let [red, green, blue, alpha] = foreground.to_array();
+        let [bg_red, bg_green, bg_blue, _] = background.to_array();
+        let inverse_alpha = u16::from(255 - alpha);
+        let composite = |channel: u8, bg_channel: u8| {
+            u16::from(channel)
+                .saturating_add((u16::from(bg_channel) * inverse_alpha + 127) / 255)
+                .min(255) as u8
+        };
+        Color32::from_rgb(
+            composite(red, bg_red),
+            composite(green, bg_green),
+            composite(blue, bg_blue),
+        )
+    }
+
+    #[test]
+    fn text_and_status_tokens_meet_aa_on_lightest_surface() {
+        for (name, color) in [
+            ("text", TEXT),
+            ("dim text", TEXT_DIM),
+            ("muted text", TEXT_MUTE),
+            ("ember", EMBER),
+            ("success", OK),
+            ("warning", WARN),
+            ("danger", DANGER),
+            ("info", INFO),
+        ] {
+            let ratio = contrast_ratio(color, BG_4);
+            assert!(
+                ratio >= 4.5,
+                "{name} contrast on BG_4 was {ratio:.2}:1, expected at least 4.5:1"
+            );
+        }
+        assert!(contrast_ratio(ON_EMBER, EMBER) >= 4.5);
+    }
+
+    #[test]
+    fn interactive_outline_and_focus_meet_non_text_contrast() {
+        assert!(contrast_ratio(OUTLINE, BG_4) >= 3.0);
+
+        let focus = composite_over(focus_stroke().color, BG_4);
+        let ratio = contrast_ratio(focus, BG_4);
+        assert!(
+            ratio >= 3.0,
+            "composited focus contrast was {ratio:.2}:1, expected at least 3:1"
+        );
+    }
+
+    #[test]
+    fn selection_text_remains_readable() {
+        let context = egui::Context::default();
+        apply_with_contrast(&context, false);
+        let style = context.style_of(egui::Theme::Dark);
+        let visuals = &style.visuals;
+        let selection_fill = composite_over(visuals.selection.bg_fill, BG_4);
+        assert!(contrast_ratio(visuals.selection.stroke.color, selection_fill) >= 4.5);
+
+        apply_with_contrast(&context, true);
+        let style = context.style_of(egui::Theme::Dark);
+        let visuals = &style.visuals;
+        assert!(contrast_ratio(visuals.selection.stroke.color, visuals.selection.bg_fill) >= 4.5);
+    }
+
+    #[test]
+    fn type_scale_has_an_eleven_and_a_half_point_floor() {
+        let context = egui::Context::default();
+        apply(&context);
+        let style = context.style_of(egui::Theme::Dark);
+        for text_style in [
+            display(),
+            title(),
+            body_strong(),
+            overline(),
+            mono_s(),
+            mono_chip(),
+            TextStyle::Heading,
+            TextStyle::Body,
+            TextStyle::Button,
+            TextStyle::Small,
+            TextStyle::Monospace,
+        ] {
+            let font = style
+                .text_styles
+                .get(&text_style)
+                .unwrap_or_else(|| panic!("missing text style {text_style:?}"));
+            assert!(
+                font.size >= 11.5,
+                "{text_style:?} was {} pt, expected at least 11.5 pt",
+                font.size
+            );
+        }
+    }
+
+    #[test]
+    fn theme_reapplication_preserves_reduced_motion() {
+        let context = egui::Context::default();
+        set_reduced_motion(&context, true);
+        apply_with_contrast(&context, true);
+        assert_eq!(context.style_of(egui::Theme::Dark).animation_time, 0.0);
+        assert_eq!(
+            motion_t(&context, egui::Id::new("reduced-target-on"), true, 0.2),
+            1.0
+        );
+        assert_eq!(
+            motion_t(&context, egui::Id::new("reduced-target-off"), false, 0.2),
+            0.0
+        );
+
+        set_reduced_motion(&context, false);
+        apply(&context);
+        assert_eq!(context.style_of(egui::Theme::Dark).animation_time, 0.16);
+    }
+
+    #[test]
+    fn high_contrast_strengthens_control_and_overlay_boundaries() {
+        let normal = egui::Context::default();
+        apply_with_contrast(&normal, false);
+        let normal = normal.style_of(egui::Theme::Dark);
+
+        let high_contrast = egui::Context::default();
+        apply_with_contrast(&high_contrast, true);
+        let high_contrast = high_contrast.style_of(egui::Theme::Dark);
+
+        assert!(
+            contrast_ratio(
+                high_contrast.visuals.widgets.inactive.bg_stroke.color,
+                high_contrast.visuals.widgets.inactive.bg_fill
+            ) > contrast_ratio(
+                normal.visuals.widgets.inactive.bg_stroke.color,
+                normal.visuals.widgets.inactive.bg_fill
+            )
+        );
+        assert_ne!(high_contrast.visuals.window_stroke, egui::Stroke::NONE);
+    }
 }

@@ -15,12 +15,12 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import shutil
 import socket
 import struct
 import sys
 import traceback
+from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # CPU-fallback any MPS gap
 
@@ -291,7 +291,7 @@ def engineering_surface_loads(
 def list_checkpoints(research_dir):
     out = []
     for name in sorted(os.listdir(research_dir)):
-        if name.endswith(".pth"):
+        if name.endswith(".reynmodel"):
             out.append(name)
     return out
 
@@ -558,6 +558,10 @@ class Engine:
     def managed_model_dir(self):
         return Path(self.research_dir) / "reyn_models"
 
+    @property
+    def model_trust_state_dir(self):
+        return self.managed_model_dir / ".tuf-trusted-state"
+
     def _model_id(self, path):
         path = Path(path).resolve()
         try:
@@ -588,9 +592,157 @@ class Engine:
             },
         }
 
-    def checkpoint_card(self, path, *, managed=False):
-        """Read checkpoint metadata without instantiating the neural network."""
+    def _bundle_model_card(self, path, *, managed=False):
+        """Verify a non-pickle inference bundle and return its model card."""
         path = Path(path).expanduser().resolve()
+        stat = path.stat()
+        bundle_sha256 = (
+            self._checkpoint_sha256(path)
+            if stat.st_size <= 2 * 1024**3
+            else None
+        )
+        card = {
+            "id": self._model_id(path),
+            "name": path.name,
+            "managed": bool(managed),
+            "size_bytes": int(stat.st_size),
+            "modified_unix": int(stat.st_mtime),
+            "checkpoint_sha256": bundle_sha256,
+            "status": "invalid",
+            "status_detail": "",
+            "dimension": 0,
+            "grid": 0,
+            "in_channels": 0,
+            "out_channels": 0,
+            "max_steps": 0,
+            "epoch": 0,
+            "declared_epochs": 0,
+            "checkpoint_role": "unknown",
+            "scenario": "unknown",
+            "source_digest": None,
+            "physics_contract": "unknown",
+            "authenticity_status": "unverified",
+            "publisher_key_id": None,
+            "publisher_key_sha256": None,
+            "release_sequence": None,
+            "tuf_target_path": None,
+            "tuf_metadata_versions": None,
+            "support": [],
+            "limitations": [],
+            "benchmark_report_hashes": [],
+            "unknown_fields": [],
+            "fact_sources": {},
+            "validation_issues": [],
+        }
+        try:
+            from model_bundle import ModelBundleError, load_model_bundle
+
+            loaded = load_model_bundle(
+                path,
+                trusted_state_dir=self.model_trust_state_dir,
+            )
+            manifest = loaded.manifest
+            authenticity = loaded.authenticity
+        except Exception as exc:
+            if "ModelBundleError" in locals() and isinstance(exc, ModelBundleError):
+                code, field, message = exc.code, exc.field, exc.message
+            else:
+                code, field, message = (
+                    "bundle.validation_failed",
+                    "bundle",
+                    f"bundle validation failed: {exc}",
+                )
+            card["validation_issues"].append(
+                {
+                    "code": code,
+                    "field": field,
+                    "message": message,
+                    "severity": "error",
+                }
+            )
+            card["status_detail"] = message
+            return card
+
+        architecture = manifest["architecture"]
+        config = architecture["config"]
+        support_envelope = manifest["support_envelope"]
+        source = manifest["source_training"]
+        conditioning = manifest["conditioning"]
+        dimension = int(support_envelope["dimension"])
+        grid = int(support_envelope["grid_size"])
+        max_steps = int(support_envelope["horizon_steps"]["max"])
+        role = source["checkpoint_role"]
+        epoch = int(source["epoch"])
+        declared_epochs = int(source["declared_epochs"])
+        fixed_final = (
+            role in ("fixed_final", "fixed_final_raw", "fixed_final_ema")
+            and epoch == declared_epochs
+        )
+        support_lines = [
+            f"{dimension}D · {grid}^{dimension} grid",
+            f"{config['in_channels']} input → {config['out_channels']} output channels",
+            f"declared horizon 1–{max_steps} steps",
+            f"declared regime: {support_envelope['scenario']}",
+            f"physics contract: {conditioning['physics_id']}",
+        ]
+        if fixed_final:
+            status = "clean"
+            status_detail = (
+                "authenticated TUF target + Ed25519 publisher · verified "
+                "non-pickle bundle · strict tensor contract · fixed final source identity"
+            )
+            unknown_fields = []
+        else:
+            status = "review"
+            status_detail = (
+                "authenticated TUF target + Ed25519 publisher · verified "
+                "non-pickle bundle · strict tensor contract · final checkpoint "
+                "role/epoch unverified"
+            )
+            unknown_fields = ["fixed_final_source_status"]
+        card.update(
+            {
+                "status": status,
+                "status_detail": status_detail,
+                "dimension": dimension,
+                "grid": grid,
+                "in_channels": int(config["in_channels"]),
+                "out_channels": int(config["out_channels"]),
+                "max_steps": max_steps,
+                "epoch": epoch,
+                "declared_epochs": declared_epochs,
+                "checkpoint_role": role,
+                "scenario": support_envelope["scenario"],
+                "source_digest": source["source_fingerprint"]["digest"],
+                "physics_contract": conditioning["physics_id"],
+                "authenticity_status": authenticity["status"],
+                "publisher_key_id": authenticity["key_id"],
+                "publisher_key_sha256": authenticity["public_key_sha256"],
+                "release_sequence": authenticity["release_sequence"],
+                "tuf_target_path": authenticity["tuf_target_path"],
+                "tuf_metadata_versions": authenticity["tuf_metadata_versions"],
+                "support": support_lines,
+                "limitations": list(manifest["limitations"]),
+                "benchmark_report_hashes": list(manifest["benchmark_reports"]),
+                "unknown_fields": unknown_fields,
+                "fact_sources": {
+                    "dimension": "verified_bundle_manifest_and_tensor_schema",
+                    "grid": "verified_bundle_manifest",
+                    "channels": "verified_bundle_manifest_and_tensor_schema",
+                    "horizon": "verified_bundle_manifest",
+                    "scenario": "verified_bundle_manifest",
+                    "integrity": "verified_sha256",
+                    "authenticity": "verified_tuf_target_and_ed25519_signature",
+                },
+            }
+        )
+        return card
+
+    def checkpoint_card(self, path, *, managed=False):
+        """Verify safe bundles; reject pickle-backed checkpoints without opening."""
+        path = Path(path).expanduser().resolve()
+        if path.suffix.lower() == ".reynmodel":
+            return self._bundle_model_card(path, managed=managed)
         stat = path.stat()
         card = {
             "id": self._model_id(path),
@@ -598,7 +750,7 @@ class Engine:
             "managed": bool(managed),
             "size_bytes": int(stat.st_size),
             "modified_unix": int(stat.st_mtime),
-            "checkpoint_sha256": self._checkpoint_sha256(path),
+            "checkpoint_sha256": None,
             "status": "invalid",
             "status_detail": "",
             "dimension": 0,
@@ -643,22 +795,13 @@ class Engine:
             )
             return card
 
-        try:
-            try:
-                checkpoint = self.torch.load(
-                    path, map_location="cpu", weights_only=False, mmap=True
-                )
-            except TypeError:
-                checkpoint = self.torch.load(
-                    path, map_location="cpu", weights_only=False
-                )
-        except Exception as exc:
-            issue(
-                "checkpoint.unreadable",
-                "checkpoint",
-                f"unreadable checkpoint: {exc}",
-            )
-            return reject()
+        issue(
+            "checkpoint.unsafe_pickle_disabled",
+            "checkpoint",
+            "pickle-backed checkpoints are disabled in the Reyn Studio runtime; "
+            "convert a trusted checkpoint offline with convert_model_bundle.py",
+        )
+        return reject()
 
         if not isinstance(checkpoint, dict):
             issue(
@@ -910,9 +1053,11 @@ class Engine:
     def list_model_cards(self):
         root = Path(self.research_dir)
         managed = self.managed_model_dir
-        paths = [(path, False) for path in sorted(root.glob("*.pth"))]
+        paths = [(path, False) for path in sorted(root.glob("*.reynmodel"))]
         if managed.is_dir():
-            paths.extend((path, True) for path in sorted(managed.glob("*.pth")))
+            paths.extend(
+                (path, True) for path in sorted(managed.glob("*.reynmodel"))
+            )
         return [
             self.checkpoint_card(path, managed=is_managed)
             for path, is_managed in paths
@@ -928,11 +1073,15 @@ class Engine:
 
     def import_model(self, source):
         source = Path(source).expanduser().resolve()
-        if source.suffix.lower() != ".pth":
+        if source.suffix.lower() != ".reynmodel":
             issue = {
-                "code": "checkpoint.invalid_extension",
+                "code": "bundle.invalid_extension",
                 "field": "path",
-                "message": "model import requires a .pth checkpoint",
+                "message": (
+                    "production model import requires a .reynmodel bundle; "
+                    "convert trusted .pth checkpoints offline with "
+                    "convert_model_bundle.py"
+                ),
                 "severity": "error",
             }
             return {
@@ -993,12 +1142,59 @@ class Engine:
         target_dir = self.managed_model_dir
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / source.name
-        suffix = 2
-        while target.exists():
-            target = target_dir / f"{source.stem}-{suffix}{source.suffix}"
-            suffix += 1
-        shutil.copy2(source, target)
+        target_signature = target.with_name(target.name + ".sig")
+        target_tuf = target.with_name(target.name + ".tuf")
+        if target.exists() or target_signature.exists() or target_tuf.exists():
+            issue = {
+                "code": "bundle.import_collision",
+                "field": "path",
+                "message": (
+                    "authenticated model filenames are immutable; remove or select "
+                    f"the existing managed target before importing {target.name}"
+                ),
+                "severity": "error",
+            }
+            candidate["status"] = "invalid"
+            candidate["status_detail"] = issue["message"]
+            candidate["validation_issues"].append(issue)
+            return {
+                "ok": False,
+                "error": f"checkpoint rejected: {issue['message']}",
+                "validation": self._validation(candidate),
+            }
+        source_signature = source.with_name(source.name + ".sig")
+        source_tuf = source.with_name(source.name + ".tuf")
+        temporary_bundle = target.with_name(f".{target.name}.importing")
+        temporary_signature = target_signature.with_name(
+            f".{target_signature.name}.importing"
+        )
+        temporary_tuf = target_tuf.with_name(f".{target_tuf.name}.importing")
+        try:
+            shutil.copy2(source, temporary_bundle)
+            shutil.copy2(source_signature, temporary_signature)
+            shutil.copytree(source_tuf, temporary_tuf)
+            os.replace(temporary_tuf, target_tuf)
+            os.replace(temporary_signature, target_signature)
+            os.replace(temporary_bundle, target)
+        except Exception:
+            target.unlink(missing_ok=True)
+            target_signature.unlink(missing_ok=True)
+            shutil.rmtree(target_tuf, ignore_errors=True)
+            raise
+        finally:
+            temporary_bundle.unlink(missing_ok=True)
+            temporary_signature.unlink(missing_ok=True)
+            shutil.rmtree(temporary_tuf, ignore_errors=True)
         imported = self.checkpoint_card(target, managed=True)
+        if imported["status"] == "invalid":
+            target.unlink(missing_ok=True)
+            target_signature.unlink(missing_ok=True)
+            shutil.rmtree(target_tuf, ignore_errors=True)
+            return {
+                "ok": False,
+                "error": f"checkpoint rejected after import: {imported['status_detail']}",
+                "validation": self._validation(imported),
+            }
         return {
             "ok": True,
             "validation": self._validation(imported),
@@ -1009,11 +1205,13 @@ class Engine:
     def delete_model(self, model_id):
         target = (Path(self.research_dir) / model_id).resolve()
         managed = self.managed_model_dir.resolve()
-        if target.parent != managed or target.suffix.lower() != ".pth":
-            raise ValueError("only checkpoints imported into Reyn Studio can be deleted")
+        if target.parent != managed or target.suffix.lower() != ".reynmodel":
+            raise ValueError("only model bundles imported into Reyn Studio can be deleted")
         if not target.is_file():
             raise ValueError(f"managed checkpoint not found: {model_id}")
         target.unlink()
+        target.with_name(target.name + ".sig").unlink(missing_ok=True)
+        shutil.rmtree(target.with_name(target.name + ".tuf"), ignore_errors=True)
         target_id = self._model_id(target)
         self.cache = {
             key: value
@@ -1031,32 +1229,60 @@ class Engine:
     def _load(self, path):
         if path in self.cache:
             return self.cache[path]
-        torch = self.torch
-        ck = torch.load(path, map_location="cpu", weights_only=False)
-        cfg = ck["model_config"]
-        is3d = any(k.endswith("weight") and ck["model_state_dict"][k].dim() == 5
-                   for k in ck["model_state_dict"])
+        bundle_path = Path(path).expanduser().resolve()
+        if bundle_path.suffix.lower() != ".reynmodel":
+            raise ValueError(
+                "production inference requires a verified .reynmodel bundle; "
+                "pickle checkpoints are never opened by the Reyn Studio runtime"
+            )
+        from model_bundle import load_model_bundle
+
+        loaded = load_model_bundle(
+            bundle_path,
+            trusted_state_dir=self.model_trust_state_dir,
+        )
+        manifest = loaded.manifest
+        m = loaded.model
+        cfg = dict(manifest["architecture"]["config"])
+        support = manifest["support_envelope"]
+        source = manifest["source_training"]
+        conditioning = manifest["conditioning"]
+        integration = support["time_integration"]
+        is3d = support["dimension"] == 3
+        ta = {
+            "grid_size": support["grid_size"],
+            "max_steps": support["horizon_steps"]["max"],
+            "dt": integration["solver_dt"],
+            "stride": integration["stride"],
+            "warmup_steps": integration["warmup_steps"],
+            "scenario": support["scenario"],
+            "seed": source["training_seed"],
+            "dataset": source["dataset"],
+            "epochs": source["declared_epochs"],
+        }
         if is3d:
-            from models_3d import DirectFlowMap3D
-            m = DirectFlowMap3D(**cfg)
-        else:
-            from time_moe_operator import DirectFlowMap
-            m = DirectFlowMap(**cfg)
-        m.load_state_dict(ck["model_state_dict"])
+            ta["nu"] = support["physics"]["kinematic_viscosity"]
+        physics_spec = {
+            "physics_id": conditioning["physics_id"],
+            "state_channels": manifest["io_schema"]["dynamic_inputs"],
+            "spatial_conditions": manifest["io_schema"]["spatial_conditions"],
+            "global_conditions": manifest["io_schema"]["global_conditions"],
+            "output_channels": manifest["io_schema"]["outputs"],
+            "support": dict(support["physics"]),
+        }
         m.eval()
         m.to(self.device)
         checkpoint_meta = {
-            "train_args": dict(ck.get("train_args") or {}),
-            "epoch": ck.get("epoch"),
-            "checkpoint_role": ck.get("checkpoint_role"),
-            "best_metric": ck.get("best_metric"),
-            "source_fingerprint": ck.get("source_fingerprint"),
+            "train_args": dict(ta),
+            "epoch": source["epoch"],
+            "checkpoint_role": source["checkpoint_role"],
+            "best_metric": None,
+            "source_fingerprint": dict(source["source_fingerprint"]),
         }
-        info = {"model": m, "cfg": cfg, "ta": ck["train_args"], "is3d": is3d,
-                "epoch": ck.get("epoch", 0), "checkpoint_meta": checkpoint_meta,
-                "physics_spec": ck.get("physics_spec"),
-                "scenario": ck["train_args"].get("scenario",
-                    "obstacle" if cfg["in_channels"] > cfg["out_channels"] else "free")}
+        info = {"model": m, "cfg": cfg, "ta": ta, "is3d": is3d,
+                "epoch": source["epoch"], "checkpoint_meta": checkpoint_meta,
+                "physics_spec": physics_spec,
+                "scenario": support["scenario"]}
         self.cache[path] = info
         return info
 

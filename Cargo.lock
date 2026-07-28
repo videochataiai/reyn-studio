@@ -2675,6 +2675,7 @@ dependencies = [
  "fontdue",
  "getrandom",
  "muda",
+ "naga",
  "png",
  "pollster",
  "rfd",

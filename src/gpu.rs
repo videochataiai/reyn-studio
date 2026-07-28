@@ -92,7 +92,8 @@ pub struct BloomRenderer {
     // CAD surface-load layer: solid mask + normalized pressure (R8, 3D)
     surf_tex: Option<(wgpu::Texture, wgpu::Texture, [u32; 3])>,
     surf_views: Option<(wgpu::TextureView, wgpu::TextureView)>,
-    surf_version: u64,
+    surf_mask_version: u64,
+    surf_pressure_version: u64,
     dummy_views: (wgpu::TextureView, wgpu::TextureView), // keep the layout bound without CAD
 }
 
@@ -420,7 +421,8 @@ impl BloomRenderer {
             vol_version: 0,
             surf_tex: None,
             surf_views: None,
-            surf_version: 0,
+            surf_mask_version: 0,
+            surf_pressure_version: 0,
             dummy_views,
         }
     }
@@ -574,7 +576,9 @@ impl BloomRenderer {
         }
     }
 
-    /// (Re)upload the 3D scalar (|ω|) texture and rebuild its bind group.
+    /// (Re)upload the 3D scalar (|ω|) texture. Views live for the texture's
+    /// lifetime; the caller rebuilds the combined bind group once after all
+    /// changed volume/surface resources have been installed.
     fn upload_volume(
         &mut self,
         device: &wgpu::Device,
@@ -597,6 +601,7 @@ impl BloomRenderer {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
+            self.vol_view = Some(tex.create_view(&Default::default()));
             self.vol_tex = Some((tex, dims));
         }
         let (tex, _) = self.vol_tex.as_ref().unwrap();
@@ -614,8 +619,6 @@ impl BloomRenderer {
                 depth_or_array_layers: dims[2],
             },
         );
-        self.vol_view = Some(tex.create_view(&Default::default()));
-        self.rebuild_volume_bg(device);
     }
 
     /// (Re)upload the CAD surface layer: the solid mask and the normalized
@@ -627,8 +630,11 @@ impl BloomRenderer {
         mask: &[u8],
         pressure: &[u8],
         dims: [u32; 3],
+        upload: (bool, bool),
     ) {
-        if self.surf_tex.as_ref().map(|(_, _, d)| *d) != Some(dims) {
+        let (upload_mask, upload_pressure) = upload;
+        let recreated = self.surf_tex.as_ref().map(|(_, _, d)| *d) != Some(dims);
+        if recreated {
             let mk = |label: &str| {
                 device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
@@ -645,10 +651,22 @@ impl BloomRenderer {
                     view_formats: &[],
                 })
             };
-            self.surf_tex = Some((mk("reyn.surf.mask"), mk("reyn.surf.p"), dims));
+            let mask_texture = mk("reyn.surf.mask");
+            let pressure_texture = mk("reyn.surf.p");
+            self.surf_views = Some((
+                mask_texture.create_view(&Default::default()),
+                pressure_texture.create_view(&Default::default()),
+            ));
+            self.surf_tex = Some((mask_texture, pressure_texture, dims));
         }
         let (mt, pt, _) = self.surf_tex.as_ref().unwrap();
-        for (tex, bytes) in [(mt, mask), (pt, pressure)] {
+        for (tex, bytes, changed) in [
+            (mt, mask, upload_mask || recreated),
+            (pt, pressure, upload_pressure || recreated),
+        ] {
+            if !changed {
+                continue;
+            }
             queue.write_texture(
                 tex.as_image_copy(),
                 bytes,
@@ -664,11 +682,6 @@ impl BloomRenderer {
                 },
             );
         }
-        self.surf_views = Some((
-            mt.create_view(&Default::default()),
-            pt.create_view(&Default::default()),
-        ));
-        self.rebuild_volume_bg(device);
     }
 
     fn rebuild_volume_bg(&mut self, device: &wgpu::Device) {
@@ -842,7 +855,23 @@ pub struct SurfaceData {
     pub mask: std::sync::Arc<Vec<u8>>,
     pub pressure: std::sync::Arc<Vec<u8>>,
     pub dims: [u32; 3],
-    pub version: u64,
+    /// Geometry identity. Horizon/result changes retain this version when the
+    /// voxel mask is unchanged, so the mask texture is not re-uploaded.
+    pub mask_version: u64,
+    /// Display-normalized recovered-pressure identity.
+    pub pressure_version: u64,
+}
+
+fn surface_upload_plan(
+    current_mask_version: u64,
+    current_pressure_version: u64,
+    views_ready: bool,
+    next: &SurfaceData,
+) -> (bool, bool) {
+    (
+        !views_ready || current_mask_version != next.mask_version,
+        !views_ready || current_pressure_version != next.pressure_version,
+    )
 }
 
 /// Per-frame volume raymarch (isosurface / density view). Casts a ray per pixel
@@ -852,9 +881,13 @@ pub struct SurfaceData {
 /// layer, rays that enter the solid shade it by display-normalized recovered
 /// pressure (red = maximum, blue = minimum), lambert-lit from the mask gradient
 /// normal.
+#[derive(Clone)]
 pub struct VolumeCallback {
     pub size_px: [u32; 2],
     pub eye: [f32; 3],
+    /// Look-at target in domain coordinates. Panning moves this away from the
+    /// origin, so the shader cannot assume the camera stares at the center.
+    pub target: [f32; 3],
     pub tan_half_fov: f32,
     pub density_lo: f32,
     pub density_hi: f32,
@@ -882,17 +915,37 @@ impl CallbackTrait for VolumeCallback {
         let size = [self.size_px[0].max(1), self.size_px[1].max(1)];
         r.ensure_targets(device, size);
 
+        let mut rebuild_bindings = r.volume_bg.is_none();
         if let Some(v) = &self.volume {
             if r.vol_version != v.version || r.volume_bg.is_none() {
                 r.upload_volume(device, queue, &v.data, v.dims);
                 r.vol_version = v.version;
+                rebuild_bindings = true;
             }
         }
         if let Some(s) = &self.surface {
-            if r.surf_version != s.version || r.surf_views.is_none() {
-                r.upload_surface(device, queue, &s.mask, &s.pressure, s.dims);
-                r.surf_version = s.version;
+            let (upload_mask, upload_pressure) = surface_upload_plan(
+                r.surf_mask_version,
+                r.surf_pressure_version,
+                r.surf_views.is_some(),
+                s,
+            );
+            if upload_mask || upload_pressure {
+                r.upload_surface(
+                    device,
+                    queue,
+                    &s.mask,
+                    &s.pressure,
+                    s.dims,
+                    (upload_mask, upload_pressure),
+                );
+                r.surf_mask_version = s.mask_version;
+                r.surf_pressure_version = s.pressure_version;
+                rebuild_bindings = true;
             }
+        }
+        if rebuild_bindings {
+            r.rebuild_volume_bg(device);
         }
         let aspect = size[0] as f32 / size[1] as f32;
         let shadow = if self.shadows { 1.0 } else { 0.0 };
@@ -913,6 +966,10 @@ impl CallbackTrait for VolumeCallback {
                 self.slice[1],
                 self.slice[2],
                 surface_on,
+                self.target[0],
+                self.target[1],
+                self.target[2],
+                0.0,
             ]),
         );
         r.write_post_uniforms(
@@ -1023,14 +1080,14 @@ pub fn add_flow(
         .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
 }
 
-/// Queue a bloom-lit **volume raymarch** for `rect`. `eye` is the camera position
-/// in domain space ([-1,1]³), `slice[a]` a clip coord in [-1,1] (or -2.0 = off).
-#[allow(clippy::too_many_arguments)]
+/// Queue a bloom-lit **volume raymarch** for `rect`. `eye` and `target` are in
+/// domain space ([-1,1]³), `slice[a]` a clip coord in [-1,1] (or -2.0 = off).
 #[allow(clippy::too_many_arguments)]
 pub fn add_volume(
     ui: &egui::Ui,
     rect: Rect,
     eye: [f32; 3],
+    target: [f32; 3],
     tan_half_fov: f32,
     density_lo: f32,
     density_hi: f32,
@@ -1047,6 +1104,7 @@ pub fn add_volume(
     let cb = VolumeCallback {
         size_px,
         eye,
+        target,
         tan_half_fov,
         density_lo,
         density_hi,
@@ -1220,6 +1278,8 @@ struct VU {
   eye_fov: vec4<f32>,   // xyz = eye (domain space), w = tan(half fov)
   params:  vec4<f32>,   // aspect, density_lo, density_hi, shadows
   slice:   vec4<f32>,   // xyz = per-axis clip coord in [-1,1] (-2 = off), w = surface layer on
+  // `target` is a WGSL reserved keyword, hence the spelled-out name.
+  look_at: vec4<f32>,   // xyz = look-at point (domain space), w unused
 };
 @group(0) @binding(0) var<uniform> V: VU;
 @group(0) @binding(1) var vol: texture_3d<f32>;
@@ -1266,8 +1326,13 @@ fn fs_volume(in: FOut) -> @location(0) vec4<f32> {
   let shadows = V.params.w;
 
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-  let fwd = normalize(-eye);
-  let right = normalize(cross(fwd, vec3<f32>(0.0, 1.0, 0.0)));
+  let fwd = normalize(V.look_at.xyz - eye);
+  // World up is +Z (the physics vertical axis); straight down the pole the
+  // reference swings to +X. The threshold matches viewport::UP_REFERENCE_LIMIT
+  // exactly, or CPU annotations would drift off the raymarched image.
+  var up_ref = vec3<f32>(0.0, 0.0, 1.0);
+  if (abs(fwd.z) > 0.99995) { up_ref = vec3<f32>(1.0, 0.0, 0.0); }
+  let right = normalize(cross(fwd, up_ref));
   let up = cross(right, fwd);
   let dir = normalize(fwd + tanH * (ndc.x * aspect * right + ndc.y * up));
 
@@ -1346,6 +1411,20 @@ mod tests {
 
     const S: u32 = 64;
 
+    #[test]
+    fn surface_upload_plan_skips_unchanged_geometry() {
+        let surface = SurfaceData {
+            mask: std::sync::Arc::new(vec![255; 8]),
+            pressure: std::sync::Arc::new(vec![128; 8]),
+            dims: [2; 3],
+            mask_version: 4,
+            pressure_version: 9,
+        };
+        assert_eq!(surface_upload_plan(4, 8, true, &surface), (false, true));
+        assert_eq!(surface_upload_plan(4, 9, true, &surface), (false, false));
+        assert_eq!(surface_upload_plan(4, 9, false, &surface), (true, true));
+    }
+
     fn luma(px: &[u8]) -> u16 {
         px[0].max(px[1]).max(px[2]) as u16
     }
@@ -1359,6 +1438,30 @@ mod tests {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .expect("request_device"),
         )
+    }
+
+    /// Every shader must parse and validate without a GPU. The render tests
+    /// above skip themselves when no adapter is present, so on an adapterless
+    /// machine this is the only thing standing between a typo — or a WGSL
+    /// reserved word used as a struct field — and a crash on first paint.
+    #[test]
+    fn every_shader_parses_and_validates() {
+        for (label, source) in [
+            ("particle", PARTICLE_WGSL),
+            ("post", POST_WGSL),
+            ("composite", COMPOSITE_WGSL),
+            ("segment", SEG_WGSL),
+            ("volume", VOLUME_WGSL),
+        ] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|error| panic!("{label} shader does not parse: {error:?}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{label} shader does not validate: {error:?}"));
+        }
     }
 
     /// Render one callback into a 64² Rgba8Unorm surface (cleared black) exactly
@@ -1527,6 +1630,7 @@ mod tests {
         let cb = VolumeCallback {
             size_px: [S, S],
             eye: [0.0, 0.0, 4.0], // looks down -z at the domain origin
+            target: [0.0; 3],
             tan_half_fov: 0.55,
             density_lo: 0.15,
             density_hi: 0.6,
@@ -1542,7 +1646,7 @@ mod tests {
             }),
             surface: None,
         };
-        let px = render(&device, &queue, cb);
+        let px = render(&device, &queue, cb.clone());
         let (center, corner) = (at(&px, 32, 32), at(&px, 6, 6));
         assert!(
             center > 30,
@@ -1551,6 +1655,21 @@ mod tests {
         assert!(
             center > corner + 10,
             "no isosurface contrast (center {center} vs corner {corner})"
+        );
+
+        // Panning is a look-at move, so the raymarch has to honour the target
+        // the CPU projection uses. Aiming off the blob must slide it out of the
+        // middle of frame; the screen direction depends on the camera basis, so
+        // the assertion is that the centre empties, not which way it goes.
+        let panned = VolumeCallback {
+            target: [0.0, 0.6, 0.0],
+            ..cb.clone()
+        };
+        let px = render(&device, &queue, panned);
+        let off_axis = at(&px, 32, 32);
+        assert!(
+            off_axis + 10 < center,
+            "look-at target did not move the raymarch (centre {center} → {off_axis})"
         );
 
         // with a CAD surface layer: a solid block with high frontal pressure must
@@ -1568,6 +1687,7 @@ mod tests {
         let cb = VolumeCallback {
             size_px: [S, S],
             eye: [0.0, 0.0, 4.0],
+            target: [0.0; 3],
             tan_half_fov: 0.55,
             density_lo: 0.15,
             density_hi: 0.6,
@@ -1585,7 +1705,8 @@ mod tests {
                 mask: std::sync::Arc::new(mask),
                 pressure: std::sync::Arc::new(press),
                 dims: [n as u32; 3],
-                version: 1,
+                mask_version: 1,
+                pressure_version: 1,
             }),
         };
         let px = render(&device, &queue, cb);

@@ -10,7 +10,7 @@ use crate::signing::LocalSigningKeyStore;
 use crate::theme::*;
 use crate::{
     cad, engine, engineering, engineering_section, flow, gpu, library, painter, project,
-    project_lifecycle, report, settings, signing, units, viewport,
+    project_lifecycle, report, settings, signing, units, viewport, vtk_export,
 };
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense,
@@ -34,12 +34,190 @@ enum Nav {
     Benchmark,
 }
 
+/// Detail rails should describe a real object. Empty Results/Evidence states
+/// own the center column instead of repeating the same absence in a second
+/// panel (and leaving less room for the recovery action).
+fn should_show_detail_rail(nav: Nav, has_case: bool, has_result: bool) -> bool {
+    match nav {
+        Nav::Models => false,
+        Nav::Results => has_result,
+        Nav::Evidence => has_case,
+        _ => true,
+    }
+}
+
+/// A Results destination is a scientific canvas only after a real engineering
+/// result exists. Procedural placeholder particles belong to the research
+/// sandbox and must never fill an empty engineering result.
+fn uses_scientific_canvas(nav: Nav, has_result: bool) -> bool {
+    match nav {
+        Nav::Results => has_result,
+        Nav::Metrics | Nav::Fields2D | Nav::FlowPainter | Nav::Benchmark => true,
+        _ => false,
+    }
+}
+
+/// Rail measurement rows stack below this width so labels, vector values,
+/// units, and source chips never overprint one another.
+fn measurement_row_stacks(available_width: f32) -> bool {
+    available_width < 360.0
+}
+
+fn field2d_cache_signature(generation: u64, variable: FieldVar, reference_visible: bool) -> u64 {
+    let variable_id = match variable {
+        FieldVar::Velocity => 0,
+        FieldVar::Vorticity => 1,
+        FieldVar::Pressure => 2,
+    };
+    generation.wrapping_mul(131) ^ (variable_id << 1) ^ ((reference_visible as u64) << 4)
+}
+
+fn background_repaint_delays(
+    live: bool,
+    project_dirty: bool,
+    autosave_blocked: bool,
+    now_utc_unix: u64,
+    next_autosave_utc_unix: u64,
+) -> (Option<std::time::Duration>, Option<std::time::Duration>) {
+    let live_delay = live.then_some(LIVE_REPAINT_INTERVAL);
+    let autosave_delay = (project_dirty && !autosave_blocked).then(|| {
+        std::time::Duration::from_secs(next_autosave_utc_unix.saturating_sub(now_utc_unix).max(1))
+    });
+    (live_delay, autosave_delay)
+}
+
+fn autosave_deadline_after_attempt(
+    completed_utc_unix: u64,
+    interval_seconds: u64,
+    succeeded: bool,
+) -> u64 {
+    completed_utc_unix.saturating_add(if succeeded {
+        interval_seconds.max(1)
+    } else {
+        5
+    })
+}
+
+fn has_unsaved_project_work(
+    document_dirty: bool,
+    case_draft_dirty: bool,
+    orientation_draft: Option<[f64; 3]>,
+    orientation_pending: bool,
+) -> bool {
+    document_dirty || case_draft_dirty || orientation_draft.is_some() || orientation_pending
+}
+
+fn orientation_geometry_gate(
+    operation: &str,
+    orientation_draft: Option<[f64; 3]>,
+    pending: Option<&PendingOrientation>,
+) -> Option<String> {
+    if let Some(pending) = pending {
+        return Some(format!(
+            "{operation} is blocked while body orientation request {} is re-voxelizing. Wait for its deterministic completion before using or saving geometry.",
+            short_id(&pending.request_id)
+        ));
+    }
+    orientation_draft.map(|_| {
+        format!(
+            "{operation} is blocked because the visible body orientation is not in the voxel mask. Apply it and wait for re-voxelization to complete."
+        )
+    })
+}
+
+fn project_mutation_rejection(
+    access_mode: project_lifecycle::ProjectAccessMode,
+    operation: &str,
+) -> Option<String> {
+    (access_mode == project_lifecycle::ProjectAccessMode::ReadOnlyEvidence).then(|| {
+        format!(
+            "{operation} is blocked while this project is in read-only evidence mode. Stored runs and evidence remain unchanged and inspectable."
+        )
+    })
+}
+
+fn is_project_write_conflict(error: &project_lifecycle::LifecycleError) -> bool {
+    matches!(
+        error,
+        project_lifecycle::LifecycleError::Project(project::ProjectError::WriteConflict { .. })
+    )
+}
+
+fn conflict_copy_path(
+    original: &std::path::Path,
+    now_utc_unix: u64,
+    unique_suffix: &str,
+) -> std::path::PathBuf {
+    let parent = original
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = original
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("project");
+    let suffix: String = unique_suffix
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    parent.join(format!(
+        "{stem} conflict {now_utc_unix} {}.reynproj",
+        if suffix.is_empty() { "copy" } else { &suffix }
+    ))
+}
+
+#[derive(Clone)]
+struct ProjectWriteConflict {
+    path: std::path::PathBuf,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectConflictAction {
+    Reload,
+    SaveAs,
+    ConflictCopy,
+    Dismiss,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectConflictResolution {
+    Reload(std::path::PathBuf),
+    PromptSaveAs,
+    SaveConflictCopy(std::path::PathBuf),
+    Dismiss,
+}
+
+fn resolve_project_conflict_action(
+    action: ProjectConflictAction,
+    conflict_path: &std::path::Path,
+    now_utc_unix: u64,
+    unique_suffix: &str,
+) -> ProjectConflictResolution {
+    match action {
+        ProjectConflictAction::Reload => {
+            ProjectConflictResolution::Reload(conflict_path.to_path_buf())
+        }
+        ProjectConflictAction::SaveAs => ProjectConflictResolution::PromptSaveAs,
+        ProjectConflictAction::ConflictCopy => ProjectConflictResolution::SaveConflictCopy(
+            conflict_copy_path(conflict_path, now_utc_unix, unique_suffix),
+        ),
+        ProjectConflictAction::Dismiss => ProjectConflictResolution::Dismiss,
+    }
+}
+
 /// The active external-flow case and its exact CAD/result data.
 struct CadCase {
     mask: std::sync::Arc<Vec<f32>>,
+    /// Geometry bounds are O(N³) to derive but change only with the voxel mask.
+    /// Camera motion and ordinary paints reuse this exact cached result.
+    mask_bounds: Option<([f32; 3], [f32; 3])>,
     model: String,
     steps: u32,
     surf: Option<gpu::SurfaceData>,
+    /// Float mask identity used to build `surf.mask`. Retaining the Arc lets a
+    /// displayed horizon step prove whether those bytes are reusable.
+    surf_mask_source: Option<std::sync::Arc<Vec<f32>>>,
     name: String,
     workflow: engineering::ExternalFlowCase,
     velocity: Vec<f32>,
@@ -47,10 +225,15 @@ struct CadCase {
     cp: Vec<f32>,
     traction: Vec<f32>,
     result_grid: usize,
+    /// Solver time between horizon steps, as reported by the run. Zero until a
+    /// run completes, which is also the signal that physical time is unknown.
+    dt_frame: f32,
     active_run_id: Option<String>,
     pending: bool,
     pending_request_id: Option<String>,
     pending_run: Option<PendingCadRun>,
+    /// Horizon scrubbing state. Preview steps are display-only.
+    playback: HorizonPlayback,
 }
 
 #[derive(Clone)]
@@ -58,6 +241,393 @@ struct PendingCadRun {
     request_id: String,
     workflow: engineering::ExternalFlowCase,
     started_at: std::time::Instant,
+}
+
+struct PendingOrientation {
+    generation: u64,
+    request_id: String,
+    case_id: String,
+    source_sha256: String,
+    angles: [f64; 3],
+    started_at: std::time::Instant,
+    kind: PendingOrientationKind,
+}
+
+enum PendingOrientationKind {
+    Draft,
+    Hydrate(Box<PendingOrientationHydration>),
+}
+
+struct PendingOrientationHydration {
+    workflow: engineering::ExternalFlowCase,
+    selected_run_id: Option<String>,
+    dt_frame: f32,
+}
+
+#[derive(Clone)]
+struct PendingOrientationView {
+    request_id: String,
+    angles: [f64; 3],
+    started_at: std::time::Instant,
+}
+
+impl PendingOrientation {
+    fn mutates_project(&self) -> bool {
+        matches!(&self.kind, PendingOrientationKind::Draft)
+    }
+
+    fn view(&self) -> PendingOrientationView {
+        PendingOrientationView {
+            request_id: self.request_id.clone(),
+            angles: self.angles,
+            started_at: self.started_at,
+        }
+    }
+}
+
+/// One fetched horizon step. Preview frames live in memory only: they are model
+/// predictions the operator asked to look at, not the run that was recorded, so
+/// they never enter the content store or the evidence chain.
+struct HorizonFrame {
+    n: usize,
+    velocity: Vec<f32>,
+    pressure: Vec<f32>,
+    cp: Vec<f32>,
+    traction: Vec<f32>,
+    mask: std::sync::Arc<Vec<f32>>,
+    force_coefficients: [f32; 3],
+    cp_min: f32,
+    cp_max: f32,
+}
+
+/// Playback over the model's prediction horizon for a completed case. Each step
+/// is one engine request (the solver warmup is cached per mask, so a step costs
+/// about one model pass) and every fetched step is cached for instant scrubbing.
+struct HorizonPlayback {
+    /// The horizon step currently on screen.
+    step: u32,
+    playing: bool,
+    /// egui clock time of the last automatic advance.
+    last_advance: f64,
+    frames: std::collections::BTreeMap<u32, HorizonFrame>,
+    /// In-flight fetch, as (step, request_id).
+    fetching: Option<(u32, String)>,
+    /// Steps whose fetch failed, so the view can say so instead of blanking.
+    failed: std::collections::BTreeSet<u32>,
+}
+
+/// Bound on cached preview frames. A 64³ step is ~7 MB across five fields, so
+/// this caps the preview cache at a few hundred MB in the worst case.
+const HORIZON_CACHE_LIMIT: usize = 24;
+/// Bound one UI frame's engine drain. Most messages are cheap, but a queued
+/// burst must not monopolize input indefinitely; the wake bridge schedules the
+/// continuation frame when this budget is exhausted.
+const ENGINE_MESSAGES_PER_FRAME: usize = 8;
+const LIVE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Model-independent grid used only to inspect geometry before a qualified
+/// model exists. Execution remains blocked until a verified model with this
+/// grid is selected.
+const DIAGNOSTIC_PREFLIGHT_GRID: usize = 64;
+
+struct OrientationWorkRequest {
+    generation: u64,
+    request_id: String,
+    case_id: String,
+    source_sha256: String,
+    angles: [f64; 3],
+    grid: usize,
+    source_bytes: Vec<u8>,
+}
+
+struct OrientationWorkResult {
+    generation: u64,
+    request_id: String,
+    case_id: String,
+    source_sha256: String,
+    angles: [f64; 3],
+    completed_utc_unix: u64,
+    result: Result<cad::VoxelMask, String>,
+}
+
+struct OrientationWorker {
+    request_tx: std::sync::mpsc::Sender<OrientationWorkRequest>,
+    result_rx: std::sync::mpsc::Receiver<OrientationWorkResult>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrientationResultDisposition {
+    Apply,
+    Failed,
+    DiscardStale,
+}
+
+fn coalesce_orientation_requests(
+    mut request: OrientationWorkRequest,
+    request_rx: &std::sync::mpsc::Receiver<OrientationWorkRequest>,
+) -> OrientationWorkRequest {
+    while let Ok(newest) = request_rx.try_recv() {
+        request = newest;
+    }
+    request
+}
+
+fn classify_orientation_result(
+    completed: &OrientationWorkResult,
+    pending: Option<&PendingOrientation>,
+    current_case: Option<(&str, &str)>,
+) -> OrientationResultDisposition {
+    let Some(pending) = pending else {
+        return OrientationResultDisposition::DiscardStale;
+    };
+    let current_request = pending.generation == completed.generation
+        && pending.request_id == completed.request_id
+        && pending.case_id == completed.case_id
+        && pending.source_sha256 == completed.source_sha256
+        && pending.angles == completed.angles;
+    let current_context = match &pending.kind {
+        PendingOrientationKind::Draft => current_case.is_some_and(|(case_id, source_sha256)| {
+            pending.case_id == case_id && pending.source_sha256 == source_sha256
+        }),
+        PendingOrientationKind::Hydrate(_) => current_case.is_none(),
+    };
+    if !current_request || !current_context {
+        return OrientationResultDisposition::DiscardStale;
+    }
+    if completed.result.is_ok() {
+        OrientationResultDisposition::Apply
+    } else {
+        OrientationResultDisposition::Failed
+    }
+}
+
+impl OrientationWorker {
+    fn spawn(repaint_context: Option<egui::Context>) -> Result<Self, String> {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("reyn-orientation-voxelizer".into())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    // Only the newest queued attitude starts the expensive pass.
+                    // A pass already executing is allowed to finish, but its
+                    // generation is suppressed by the UI if it was superseded.
+                    let request = coalesce_orientation_requests(request, &request_rx);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cad::parse_stl(&request.source_bytes).and_then(|mesh| {
+                            cad::voxelize_oriented(
+                                &mesh,
+                                request.grid,
+                                cad::BodyOrientation::from_degrees(request.angles),
+                            )
+                        })
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err("orientation worker panicked while re-voxelizing geometry".into())
+                    });
+                    let completed = OrientationWorkResult {
+                        generation: request.generation,
+                        request_id: request.request_id,
+                        case_id: request.case_id,
+                        source_sha256: request.source_sha256,
+                        angles: request.angles,
+                        completed_utc_unix: now_utc_unix(),
+                        result,
+                    };
+                    if result_tx.send(completed).is_err() {
+                        break;
+                    }
+                    if let Some(context) = &repaint_context {
+                        context.request_repaint();
+                    }
+                }
+            })
+            .map_err(|error| format!("orientation worker could not start: {error}"))?;
+        Ok(Self {
+            request_tx,
+            result_rx,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScreenshotWriteKind {
+    Viewport,
+    Qa,
+}
+
+struct ScreenshotWriteResult {
+    kind: ScreenshotWriteKind,
+    path: std::path::PathBuf,
+    result: Result<(), String>,
+}
+
+impl Default for HorizonPlayback {
+    fn default() -> Self {
+        Self {
+            step: 0,
+            playing: false,
+            last_advance: f64::NEG_INFINITY,
+            frames: std::collections::BTreeMap::new(),
+            fetching: None,
+            failed: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
+impl HorizonPlayback {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Keep the recorded step and the neighbourhood of the displayed step.
+    fn trim(&mut self, keep: u32) {
+        while self.frames.len() > HORIZON_CACHE_LIMIT {
+            let victim = self
+                .frames
+                .keys()
+                .copied()
+                .filter(|step| *step != keep && *step != self.step)
+                .max_by_key(|step| step.abs_diff(self.step));
+            match victim {
+                Some(step) => {
+                    self.frames.remove(&step);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// What an arriving engine field is allowed to become. The engine is a blocking
+/// sidecar with no cancel channel, so this classification is the whole of the
+/// cancellation guarantee: a cancelled or stale request can never be recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CadResultDisposition {
+    /// A horizon-playback fetch for this step: display-only.
+    Preview(u32),
+    /// The in-flight run: record it as an immutable run.
+    Record,
+    /// The operator cancelled this request; dropping it is the expected outcome.
+    DiscardCancelled,
+    /// Nothing is waiting for this request (superseded case edit, reimport…).
+    DiscardStale,
+}
+
+fn classify_cad_result(
+    request_id: &str,
+    preview_fetch: Option<(u32, &str)>,
+    pending_run: Option<&str>,
+    cancelled: &[String],
+) -> CadResultDisposition {
+    if let Some((step, fetching)) = preview_fetch {
+        if fetching == request_id {
+            return CadResultDisposition::Preview(step);
+        }
+    }
+    if pending_run == Some(request_id) {
+        return CadResultDisposition::Record;
+    }
+    if cancelled.iter().any(|entry| entry == request_id) {
+        return CadResultDisposition::DiscardCancelled;
+    }
+    CadResultDisposition::DiscardStale
+}
+
+/// A completed engine payload is returned to the UI only after its durable
+/// project write succeeds. Injecting an error here deterministically exercises
+/// the no-transient-result guarantee without filesystem timing or sleeps.
+fn retain_after_persistence<T, O>(
+    transient: T,
+    persist: impl FnOnce(&T) -> Result<O, String>,
+) -> Result<(O, T), String> {
+    let durable = persist(&transient)?;
+    Ok((durable, transient))
+}
+
+/// The fields the result views should draw this frame, and which horizon step
+/// they belong to.
+struct DisplayFields<'a> {
+    n: usize,
+    velocity: &'a [f32],
+    pressure: &'a [f32],
+    cp: &'a [f32],
+    traction: &'a [f32],
+    mask: &'a [f32],
+    step: u32,
+    /// True when this is the run's own recorded horizon — the evidence step.
+    recorded: bool,
+}
+
+/// A picked point on the 3D body surface, reported with the same quantities and
+/// source classes as the 2D section probe.
+#[derive(Clone)]
+struct SurfaceProbe {
+    /// Centre of the picked cell in render-domain coordinates, so the readout
+    /// stays pinned to the body when the camera moves.
+    anchor: [f32; 3],
+    cell: [usize; 3],
+    /// Position in the approved source frame, in metres, when the transform is
+    /// invertible; `None` when it is not.
+    source_m: Option<[f64; 3]>,
+    cp: f32,
+    pressure_pa: f32,
+    traction_pa: [f32; 3],
+    /// Horizon step the values came from, and whether that is the recorded run.
+    step: u32,
+    recorded: bool,
+}
+
+impl CadCase {
+    /// Does the case hold a full set of result fields at the recorded horizon?
+    fn has_recorded_fields(&self) -> bool {
+        let cube = self.result_grid.saturating_pow(3);
+        self.result_grid >= 3
+            && self.velocity.len() == 3 * cube
+            && self.pressure.len() == cube
+            && self.cp.len() == cube
+            && self.traction.len() == 3 * cube
+            && self.mask.len() == cube
+    }
+
+    /// The step the views are showing: the recorded horizon until the operator
+    /// scrubs somewhere else.
+    fn display_step(&self) -> u32 {
+        if self.playback.step == 0 {
+            self.steps
+        } else {
+            self.playback.step
+        }
+    }
+
+    /// Fields for the displayed step, or `None` when that step has not been
+    /// fetched yet (the view then says so rather than showing another step's
+    /// data under this step's label).
+    fn display_fields(&self) -> Option<DisplayFields<'_>> {
+        let step = self.display_step();
+        if step == self.steps && self.has_recorded_fields() {
+            return Some(DisplayFields {
+                n: self.result_grid,
+                velocity: &self.velocity,
+                pressure: &self.pressure,
+                cp: &self.cp,
+                traction: &self.traction,
+                mask: self.mask.as_ref(),
+                step,
+                recorded: true,
+            });
+        }
+        let frame = self.playback.frames.get(&step)?;
+        Some(DisplayFields {
+            n: frame.n,
+            velocity: &frame.velocity,
+            pressure: &frame.pressure,
+            cp: &frame.cp,
+            traction: &frame.traction,
+            mask: frame.mask.as_ref(),
+            step,
+            recorded: false,
+        })
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -69,6 +639,22 @@ enum PMethod {
 enum PBoundary {
     Periodic,
     Dirichlet,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum CaseEditTransaction {
+    ReferenceLength,
+    Velocity,
+    Density,
+    Viscosity,
+    ReferencePressure,
+    Horizon,
+}
+
+#[derive(Clone, Copy)]
+enum CaseHistoryAction {
+    Undo,
+    Redo,
 }
 
 pub struct ReynApp {
@@ -85,8 +671,17 @@ pub struct ReynApp {
     particles: Vec<flow::Particle>,
     seed: u64,
     engine: engine::EngineHandle,
+    /// Runtime-only context used by the engine receiver bridge. `Default`
+    /// remains context-free for tests; `new` installs the native wake hook.
+    repaint_context: Option<egui::Context>,
     engine_status: String,
     engine_ok: bool,
+    /// Dependency reconciliation is expensive and only changes after an engine
+    /// event, model inventory change, project mutation, or content relink.
+    dependencies_dirty: bool,
+    /// UTC deadline for the next recovery snapshot check. This preserves
+    /// autosave without a permanent idle repaint poll.
+    next_autosave_utc_unix: u64,
     last_window_title: String,
     current_model: String,
     models: Vec<engine::ModelCard>,
@@ -101,14 +696,35 @@ pub struct ReynApp {
     input_units: units::InputUnitPrefs,
     preset_name_draft: String,
     preset_notice: Option<(String, bool)>,
+    template_name_draft: String,
+    template_notice: Option<(String, bool)>,
     /// Last frame's render-viewport rect (points) for PNG capture cropping.
     last_render_rect: Option<Rect>,
     /// Destination for an in-flight composited-frame screenshot.
     pending_viewport_shot: Option<std::path::PathBuf>,
+    /// Dev/QA hook (REYN_STUDIO_SHOT=path): save a full-window PNG once the UI
+    /// has settled, without needing OS screen-recording permission.
+    qa_shot_path: Option<std::path::PathBuf>,
+    qa_shot_frames: u32,
+    screenshot_result_tx: std::sync::mpsc::Sender<ScreenshotWriteResult>,
+    screenshot_result_rx: std::sync::mpsc::Receiver<ScreenshotWriteResult>,
+    /// Dev/QA hook (REYN_STUDIO_IMPORT=path.stl): import a mesh through the
+    /// ordinary import path once the model inventory has arrived, so captures
+    /// of the case and viewport screens do not need a file dialog. Nothing is
+    /// faked — the case is gated exactly as a hand-imported one.
+    qa_import_path: Option<std::path::PathBuf>,
+    qa_import_waited: u32,
     project: project_lifecycle::ProjectLifecycle,
     project_name_draft: String,
     project_guard: project_lifecycle::UnsavedChangesGuard,
     project_notice: Option<(String, bool)>,
+    project_conflict: Option<ProjectWriteConflict>,
+    /// True when visible Case Setup inputs differ from the active persisted
+    /// case revision. Pending orientation has its own exact draft below.
+    case_draft_dirty: bool,
+    /// Read-only evidence navigation is session-local and must never dirty the
+    /// authoritative project manifest.
+    review_selection: Option<project::ProjectSelection>,
     allow_close: bool,
     live: bool,
     live_timer: f32,
@@ -130,6 +746,8 @@ pub struct ReynApp {
     f2d_gen: u64,
     f2d_tex: Vec<egui::TextureHandle>,
     f2d_sig: u64,
+    f2d_insights: Vec<field2d::Insight>,
+    f2d_insights_key: Option<(u64, FieldVar, bool)>,
     f2d_method: PMethod,
     f2d_tol_exp: i32, // FD tolerance = 10^-exp
     f2d_boundary: PBoundary,
@@ -181,20 +799,50 @@ pub struct ReynApp {
     palette_open: bool,
     palette_query: String,
     palette_selected: usize,
+    // Viewport navigation requests, consumed by `viewport::show` on the next
+    // frame: a standard-view snap and a zoom-to-fit.
+    view_snap: Option<viewport::StandardView>,
+    view_fit: bool,
+    /// Last 3D surface pick, cleared when the displayed field changes.
+    probe3d: Option<SurfaceProbe>,
+    /// Edited body orientation (α, β, roll in degrees) awaiting re-voxelization.
+    /// `None` while the controls match the case's approved orientation.
+    orientation_draft: Option<[f64; 3]>,
+    /// Lazily spawned single worker. It drains queued requests to the newest
+    /// generation before each expensive voxelization and wakes egui on result.
+    orientation_worker: Option<OrientationWorker>,
+    orientation_generation: u64,
+    /// The only orientation result allowed to mutate the active case. Replacing
+    /// this value cancels the old generation logically; its result is stale.
+    orientation_pending: Option<PendingOrientation>,
+    /// Session-only, bounded history of reversible case-draft inputs. Immutable
+    /// source/model/run/evidence identity never enters these snapshots.
+    case_draft_history: engineering::CaseDraftHistory,
+    /// Active numeric interaction, used to coalesce DragValue/slider repaints
+    /// into one meaningful undo transaction.
+    case_edit_transaction: Option<CaseEditTransaction>,
+    /// Requests the operator cancelled. Their results are discarded on arrival
+    /// so a cancelled run can never leave a partial result in the chain.
+    cancelled_requests: Vec<String>,
 }
 
 impl Default for ReynApp {
     fn default() -> Self {
         let (settings, settings_warning) = settings::AppSettings::load();
+        let now = now_utc_unix();
         let project_state_directory = settings::config_path()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
             .unwrap_or_else(|| std::path::PathBuf::from(".reyn-studio"));
         let (project, project_warnings) =
-            project_lifecycle::ProjectLifecycle::load(project_state_directory, now_utc_unix());
+            project_lifecycle::ProjectLifecycle::load(project_state_directory, now);
         let project_name_draft = project.display_name().to_owned();
         let engine = engine::EngineHandle::spawn_with_config(settings.engine_config());
-        let current_model = "flow3d_obs_v1.pth".to_string();
+        let current_model = settings.default_3d_model.clone();
+        let f2d_model = settings.default_2d_model.clone();
         let _ = engine.tx.send(engine::Cmd::ListModels);
+        let next_autosave_utc_unix =
+            now.saturating_add(settings.autosave_interval_seconds.max(1) as u64);
+        let (screenshot_result_tx, screenshot_result_rx) = std::sync::mpsc::channel();
         let (vol, vdims) = flow::procedural_volume(48, 1); // placeholder until a field arrives
         Self {
             nav: Nav::Projects,
@@ -210,8 +858,11 @@ impl Default for ReynApp {
             particles: flow::generate(6000, 1), // procedural until the model field arrives
             seed: 1,
             engine,
+            repaint_context: None,
             engine_status: "○ Starting engine…".into(),
             engine_ok: false,
+            dependencies_dirty: true,
+            next_autosave_utc_unix,
             last_window_title: String::new(),
             current_model,
             models: Vec::new(),
@@ -224,13 +875,28 @@ impl Default for ReynApp {
             input_units: units::InputUnitPrefs::default(),
             preset_name_draft: String::new(),
             preset_notice: None,
+            template_name_draft: String::new(),
+            template_notice: None,
             last_render_rect: None,
             pending_viewport_shot: None,
+            qa_shot_path: std::env::var("REYN_STUDIO_SHOT")
+                .ok()
+                .map(std::path::PathBuf::from),
+            qa_shot_frames: 0,
+            screenshot_result_tx,
+            screenshot_result_rx,
+            qa_import_path: std::env::var("REYN_STUDIO_IMPORT")
+                .ok()
+                .map(std::path::PathBuf::from),
+            qa_import_waited: 0,
             project,
             project_name_draft,
             project_guard: project_lifecycle::UnsavedChangesGuard::default(),
             project_notice: (!project_warnings.is_empty())
                 .then(|| (project_warnings.join(" "), true)),
+            project_conflict: None,
+            case_draft_dirty: false,
+            review_selection: None,
             allow_close: false,
             live: false,
             live_timer: 0.0,
@@ -243,7 +909,7 @@ impl Default for ReynApp {
             f2d_var: FieldVar::Vorticity,
             f2d_horizon: 8,
             f2d_truth: false,
-            f2d_model: "obstacle_v2_shapes.pth".into(),
+            f2d_model,
             f2d_pending: false,
             f2d_dirty: false,
             f2d_req_at: None,
@@ -251,6 +917,8 @@ impl Default for ReynApp {
             f2d_gen: 0,
             f2d_tex: Vec::new(),
             f2d_sig: u64::MAX,
+            f2d_insights: Vec::new(),
+            f2d_insights_key: None,
             f2d_method: PMethod::Spectral,
             f2d_tol_exp: 5,
             f2d_boundary: PBoundary::Periodic,
@@ -297,6 +965,16 @@ impl Default for ReynApp {
             palette_open: false,
             palette_query: String::new(),
             palette_selected: 0,
+            view_snap: None,
+            view_fit: false,
+            probe3d: None,
+            orientation_draft: None,
+            orientation_worker: None,
+            orientation_generation: 0,
+            orientation_pending: None,
+            case_draft_history: engineering::CaseDraftHistory::default(),
+            case_edit_transaction: None,
+            cancelled_requests: Vec::new(),
         }
     }
 }
@@ -305,7 +983,11 @@ impl ReynApp {
     /// Build the app and register the native wgpu bloom renderer (N2). Falls
     /// back to the CPU glow if the wgpu backend is somehow unavailable.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut app = Self::default();
+        let mut app = Self {
+            repaint_context: Some(cc.egui_ctx.clone()),
+            ..Self::default()
+        };
+        app.attach_engine_repaint_wake();
         apply_with_contrast(
             &cc.egui_ctx,
             app.settings.theme == settings::ThemeMode::HighContrast,
@@ -332,25 +1014,165 @@ impl ReynApp {
         // the rail (e.g. REYN_STUDIO_START_NAV=settings). Screens stay gated
         // exactly as in the UI — no state is faked to reach them.
         if let Ok(start) = std::env::var("REYN_STUDIO_START_NAV") {
-            app.nav = match start.as_str() {
+            // `settings:<category>` deep-links a settings category for QA
+            // (e.g. settings:units, settings:appearance).
+            let (screen, detail) = match start.split_once(':') {
+                Some((screen, detail)) => (screen, Some(detail)),
+                None => (start.as_str(), None),
+            };
+            // The research-sandbox screens are only reachable when the operator
+            // has turned the sandbox on in Settings → Developer; the deep-link
+            // respects that gate rather than opening a back door.
+            let sandbox = app.settings.developer_research_sandbox;
+            app.nav = match screen {
                 "case" => Nav::Case,
+                "results" => Nav::Results,
                 "evidence" => Nav::Evidence,
                 "models" => Nav::Models,
                 "settings" => Nav::Settings,
+                "metrics" if sandbox => Nav::Metrics,
+                "fields2d" if sandbox => Nav::Fields2D,
+                "painter" if sandbox => Nav::FlowPainter,
+                "benchmark" if sandbox => Nav::Benchmark,
                 _ => Nav::Projects,
             };
+            if app.nav == Nav::Settings {
+                if let Some(category) = detail.and_then(settings::SettingsCategory::from_qa_id) {
+                    app.settings_ui.category = category;
+                }
+            }
         }
         app
+    }
+
+    /// Forward engine messages through a receiver that wakes egui exactly when
+    /// new state arrives. This removes the need to poll while ready or
+    /// unavailable, and is reinstalled whenever settings/project changes
+    /// replace the engine handle.
+    fn attach_engine_repaint_wake(&mut self) {
+        let Some(repaint_context) = self.repaint_context.clone() else {
+            return;
+        };
+        let (forward_tx, forward_rx) = std::sync::mpsc::channel();
+        let (_, placeholder_rx) = std::sync::mpsc::channel();
+        let source_rx = std::mem::replace(&mut self.engine.rx, placeholder_rx);
+        self.engine.rx = forward_rx;
+        std::thread::Builder::new()
+            .name("reyn-engine-ui-wake".into())
+            .spawn(move || {
+                while let Ok(message) = source_rx.recv() {
+                    if forward_tx.send(message).is_err() {
+                        break;
+                    }
+                    repaint_context.request_repaint();
+                }
+            })
+            .expect("engine repaint bridge thread should start");
+    }
+
+    fn schedule_autosave_from_now(&mut self) {
+        self.next_autosave_utc_unix =
+            now_utc_unix().saturating_add(self.settings.autosave_interval_seconds.max(1).into());
+    }
+
+    fn has_unsaved_project_work(&self) -> bool {
+        has_unsaved_project_work(
+            self.project.is_dirty(),
+            self.case_draft_dirty,
+            self.orientation_draft,
+            self.orientation_pending
+                .as_ref()
+                .is_some_and(PendingOrientation::mutates_project),
+        )
+    }
+
+    fn mark_case_draft_dirty(&mut self) {
+        if !self.has_unsaved_project_work() {
+            self.schedule_autosave_from_now();
+        }
+        self.case_draft_dirty = true;
+    }
+
+    fn project_write_access(&self, operation: &str) -> Result<(), String> {
+        project_mutation_rejection(self.project.availability().access_mode, operation)
+            .map_or(Ok(()), Err)
+    }
+
+    fn reject_project_mutation(&mut self, operation: &str) -> bool {
+        match self.project_write_access(operation) {
+            Ok(()) => false,
+            Err(reason) => {
+                self.project_notice = Some((reason, true));
+                true
+            }
+        }
+    }
+
+    fn transact_project<T>(
+        &mut self,
+        operation: &str,
+        now_utc_unix: u64,
+        edit: impl FnOnce(&mut project::ProjectManifest) -> Result<T, project::ProjectError>,
+    ) -> Result<T, String> {
+        self.project_write_access(operation)?;
+        self.project
+            .transact(now_utc_unix, edit)
+            .map_err(|error| error.to_string())
+    }
+
+    fn add_project_content(
+        &mut self,
+        operation: &str,
+        bytes: Vec<u8>,
+        media_type: impl Into<String>,
+        expected_digest: &str,
+    ) -> Result<project::ContentInsert, String> {
+        self.project_write_access(operation)?;
+        self.project
+            .add_content_with_digest(bytes, media_type, expected_digest)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Make every visible project-scoped draft durable before Save or recovery.
+    /// Orientation work is never flushed synchronously here: saving stale mask
+    /// bytes under draft angles would be false evidence, and re-voxelizing on
+    /// this call path would block the UI. Save/recovery therefore wait for the
+    /// event-driven worker completion.
+    fn flush_project_drafts_for_persistence(&mut self) -> Result<bool, String> {
+        self.project_write_access("Saving project drafts")?;
+        if let Some(reason) = orientation_geometry_gate(
+            "Saving project drafts",
+            self.orientation_draft,
+            self.orientation_pending.as_ref(),
+        ) {
+            return Err(reason);
+        }
+        if self.case_draft_dirty {
+            self.commit_active_case_revision()?;
+        }
+        Ok(false)
     }
 }
 
 impl eframe::App for ReynApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_orientation_results();
+        self.handle_screenshot_write_results();
         // Complete any in-flight viewport PNG capture first: the screenshot
         // event carries the previous composited frame.
+        self.handle_qa_shot(ui.ctx());
         self.handle_screenshot_events(ui.ctx());
-        // drain engine messages (non-blocking)
-        while let Ok(msg) = self.engine.rx.try_recv() {
+        self.handle_qa_import();
+        // Drain engine messages without allowing a queued burst to monopolize
+        // the UI thread. The forwarding bridge wakes the first frame; hitting
+        // the budget below explicitly schedules the continuation.
+        let mut engine_messages = 0usize;
+        while engine_messages < ENGINE_MESSAGES_PER_FRAME {
+            let Ok(msg) = self.engine.rx.try_recv() else {
+                break;
+            };
+            engine_messages += 1;
+            self.dependencies_dirty = true;
             match msg {
                 engine::Msg::Status(s) => {
                     self.engine_status = s;
@@ -367,7 +1189,10 @@ impl eframe::App for ReynApp {
                     self.library.busy = false;
                     self.library.validation = None;
                     self.library.notice = Some((
-                        format!("Imported {}; checkpoint contract validated", model.name),
+                        format!(
+                            "Imported {}; verified model-bundle contract accepted",
+                            model.name
+                        ),
                         false,
                     ));
                     self.models = models;
@@ -416,24 +1241,75 @@ impl eframe::App for ReynApp {
                     }
                 }
                 engine::Msg::CadField(f) => {
-                    let request_matches = self.cad.as_ref().is_some_and(|case| {
-                        case.pending_run
+                    let disposition = classify_cad_result(
+                        &f.request_id,
+                        self.cad.as_ref().and_then(|case| {
+                            case.playback
+                                .fetching
+                                .as_ref()
+                                .map(|(step, request_id)| (*step, request_id.as_str()))
+                        }),
+                        self.cad
                             .as_ref()
-                            .is_some_and(|pending| pending.request_id == f.request_id)
-                    });
-                    if !request_matches {
-                        self.project_notice = Some((
-                            format!(
-                                "Discarded CAD result for stale request {}. The active case and immutable runs were not changed.",
-                                short_id(&f.request_id)
-                            ),
-                            true,
-                        ));
-                        continue;
+                            .and_then(|case| case.pending_run.as_ref())
+                            .map(|pending| pending.request_id.as_str()),
+                        &self.cancelled_requests,
+                    );
+                    match disposition {
+                        // A horizon-playback fetch: display-only, so it lands in
+                        // the preview cache and nothing else is touched.
+                        CadResultDisposition::Preview(step) => {
+                            self.install_horizon_frame(step, f);
+                            continue;
+                        }
+                        CadResultDisposition::DiscardCancelled => {
+                            self.project_notice = Some((
+                                format!(
+                                    "Discarded the cancelled run {}: no result, run, or evidence was recorded.",
+                                    short_id(&f.request_id)
+                                ),
+                                false,
+                            ));
+                            continue;
+                        }
+                        CadResultDisposition::DiscardStale => {
+                            self.project_notice = Some((
+                                format!(
+                                    "Discarded CAD result for stale request {}. The active case and immutable runs were not changed.",
+                                    short_id(&f.request_id)
+                                ),
+                                true,
+                            ));
+                            continue;
+                        }
+                        CadResultDisposition::Record => {}
                     }
                     self.invalidate_cad_section();
-                    let persisted_run = self.persist_external_flow_run(&f);
-                    let shape = vec![3usize, f.n, f.n, f.n];
+                    let (persisted_run_id, f) = match retain_after_persistence(f, |field| {
+                        self.persist_external_flow_run(field)
+                    }) {
+                        Ok(persisted) => persisted,
+                        Err(error) => {
+                            if let Some(case) = self.cad.as_mut() {
+                                case.pending = false;
+                                case.pending_request_id = None;
+                                case.pending_run = None;
+                                case.workflow.stage = if case.workflow.ready() {
+                                    engineering::CaseStage::Ready
+                                } else {
+                                    engineering::CaseStage::Setup
+                                };
+                            }
+                            self.project_notice = Some((
+                                format!(
+                                    "Prediction completed, but immutable run persistence failed and the transient result was discarded: {error}"
+                                ),
+                                true,
+                            ));
+                            continue;
+                        }
+                    };
+                    let shape = [3usize, f.n, f.n, f.n];
                     let ps = flow::from_field(&shape, &f.vel);
                     if !ps.is_empty() {
                         self.particles = ps;
@@ -448,6 +1324,7 @@ impl eframe::App for ReynApp {
                     self.insights3d = ins;
                     // surface layer textures (transposed to x-fastest for wgpu)
                     let n = f.n;
+                    let mask_bounds = cad::mask_bounds(&f.mask, n);
                     let cp_scale =
                         f.cp.iter()
                             .fold(0.0f32, |scale, value| scale.max(value.abs()))
@@ -470,32 +1347,27 @@ impl eframe::App for ReynApp {
                         mask: std::sync::Arc::new(mask_u8),
                         pressure: std::sync::Arc::new(p_u8),
                         dims: [n as u32; 3],
-                        version: self.cad_version,
+                        mask_version: self.cad_version,
+                        pressure_version: self.cad_version,
                     };
                     if let Some(c) = &mut self.cad {
                         c.mask = std::sync::Arc::new(f.mask);
+                        c.mask_bounds = mask_bounds;
                         c.surf = Some(surf);
+                        c.surf_mask_source = Some(c.mask.clone());
                         c.steps = f.horizon;
                         c.velocity = f.vel;
                         c.pressure = f.pressure;
                         c.cp = f.cp;
                         c.traction = f.traction;
                         c.result_grid = f.n;
+                        c.dt_frame = f.dt_frame;
                         c.pending = false;
                         c.pending_request_id = None;
                         c.pending_run = None;
-                        match persisted_run {
-                            Ok(run_id) => c.active_run_id = Some(run_id),
-                            Err(error) => {
-                                c.active_run_id = None;
-                                self.project_notice = Some((
-                                    format!(
-                                        "Prediction completed, but immutable run persistence failed: {error}"
-                                    ),
-                                    true,
-                                ));
-                            }
-                        }
+                        // Playback opens on the step that was just recorded.
+                        c.playback.reset();
+                        c.active_run_id = Some(persisted_run_id);
                         c.workflow.stage = engineering::CaseStage::Results;
                         c.workflow.parent_run_id = c.active_run_id.clone();
                         c.workflow.result = Some(engineering::EngineeringResult {
@@ -516,13 +1388,14 @@ impl eframe::App for ReynApp {
                             warnings: f.warnings,
                         });
                     }
+                    self.probe3d = None;
                     self.surface_on = true;
                     self.volumetric = true;
                     self.render_volume = true;
                     self.nav = Nav::Results;
                     self.engine_status = format!(
-                        "● Engineering result {}³ · Re {:.0} · t = {} steps",
-                        n, f.reynolds, f.horizon
+                        "● Engineering result {}³ · Re {:.0} · horizon step {} of {}",
+                        n, f.reynolds, f.horizon, f.horizon
                     );
                     self.engine_ok = true;
                 }
@@ -535,23 +1408,30 @@ impl eframe::App for ReynApp {
                         && b.seeds == expected_seeds
                         && b.horizons == [1, 4, 8, 16];
                     if current_request {
-                        match self.persist_benchmark_run(&b) {
-                            Ok(run_id) => {
+                        match retain_after_persistence(b, |benchmark| {
+                            self.persist_benchmark_run(benchmark)
+                        }) {
+                            Ok((run_id, benchmark)) => {
                                 self.active_benchmark_run_id = Some(run_id);
+                                self.bench = Some(benchmark);
+                                self.bench_error = None;
+                                self.engine_ok = true;
+                                self.select_bench_cell(0, 0);
                             }
                             Err(error) => {
+                                self.active_benchmark_run_id = None;
+                                self.bench = None;
+                                self.bench_error = Some(format!(
+                                    "Suite completed, but immutable persistence failed and the transient result was discarded: {error}"
+                                ));
                                 self.project_notice = Some((
                                     format!(
-                                        "Suite completed, but its immutable project run was not recorded: {error}"
+                                        "Suite completed, but its immutable project run was not recorded; the transient result was discarded: {error}"
                                     ),
                                     true,
                                 ));
                             }
                         }
-                        self.bench = Some(b);
-                        self.bench_error = None;
-                        self.engine_ok = true;
-                        self.select_bench_cell(0, 0);
                     } else {
                         self.bench_error = Some(
                             "discarded a suite result after its model or seed controls changed"
@@ -569,17 +1449,27 @@ impl eframe::App for ReynApp {
                     });
                     if belongs_to_selection {
                         self.bench_inspector_pending = false;
-                        if let Err(error) = self.persist_benchmark_inspector(&cell) {
-                            self.project_notice = Some((
-                                format!(
-                                    "Cell evidence remains visible, but its project link was not recorded: {error}"
-                                ),
-                                true,
-                            ));
+                        match retain_after_persistence(cell, |inspector| {
+                            self.persist_benchmark_inspector(inspector)
+                        }) {
+                            Ok(((), inspector)) => {
+                                self.bench_inspector = Some(inspector);
+                                self.bench_inspector_error = None;
+                                self.bench_tex.clear();
+                            }
+                            Err(error) => {
+                                self.bench_inspector = None;
+                                self.bench_inspector_error = Some(format!(
+                                    "Cell computation completed, but immutable persistence failed and the transient evidence was discarded: {error}"
+                                ));
+                                self.project_notice = Some((
+                                    format!(
+                                        "Cell evidence was not recorded and its transient result was discarded: {error}"
+                                    ),
+                                    true,
+                                ));
+                            }
                         }
-                        self.bench_inspector = Some(cell);
-                        self.bench_inspector_error = None;
-                        self.bench_tex.clear();
                     } else if self.bench_inspector_pending {
                         self.bench_inspector_pending = false;
                         self.bench_inspector_error =
@@ -602,7 +1492,15 @@ impl eframe::App for ReynApp {
                     if let Some(case) = &mut self.cad {
                         if case.pending {
                             case.pending = false;
+                            case.pending_request_id = None;
+                            case.pending_run = None;
                             case.workflow.stage = engineering::CaseStage::Ready;
+                        }
+                        // A failed playback fetch is recorded per step so the
+                        // view can say that step is unavailable, not blank out.
+                        if let Some((step, _)) = case.playback.fetching.take() {
+                            case.playback.failed.insert(step);
+                            case.playback.playing = false;
                         }
                     }
                     if inspector_failed {
@@ -615,29 +1513,60 @@ impl eframe::App for ReynApp {
                 }
             }
         }
+        if engine_messages == ENGINE_MESSAGES_PER_FRAME {
+            ui.ctx().request_repaint();
+        }
         if self.is_research_sandbox() && ui.input(|i| i.key_pressed(egui::Key::G)) {
             self.regenerate();
         }
         if self.nav == Nav::Benchmark {
             self.bench_keyboard(ui);
         }
+        self.handle_viewport_shortcuts(ui);
+        self.advance_horizon_playback(ui.ctx());
+        self.handle_case_edit_shortcuts(ui);
         self.handle_project_shortcuts(ui);
-        let available_model_hashes: Vec<String> = self
-            .models
-            .iter()
-            .filter(|model| model.status != "invalid")
-            .map(|model| model.checkpoint_sha256.clone())
-            .collect();
-        self.project.reconcile_dependencies(
-            self.engine_ok,
-            available_model_hashes.iter().map(String::as_str),
-        );
+        if self.dependencies_dirty {
+            self.project.reconcile_dependencies(
+                self.engine_ok,
+                self.models
+                    .iter()
+                    .filter(|model| model.status != "invalid")
+                    .map(|model| model.checkpoint_sha256.as_str()),
+            );
+            self.dependencies_dirty = false;
+        }
         let now = now_utc_unix();
-        if let Err(error) = self
-            .project
-            .autosave_if_due(now, self.settings.autosave_interval_seconds as u64)
+        let orientation_blocks_persistence =
+            self.orientation_draft.is_some() || self.orientation_pending.is_some();
+        if self.has_unsaved_project_work()
+            && !orientation_blocks_persistence
+            && now >= self.next_autosave_utc_unix
         {
-            self.project_notice = Some((format!("Recovery snapshot failed: {error}"), true));
+            let recovery_result = self.flush_project_drafts_for_persistence().and_then(|_| {
+                self.project
+                    .autosave_if_due(now, self.settings.autosave_interval_seconds as u64)
+                    .map_err(|error| error.to_string())
+            });
+            let completed_utc_unix = now_utc_unix();
+            match recovery_result {
+                Ok(_) => {
+                    self.next_autosave_utc_unix = autosave_deadline_after_attempt(
+                        completed_utc_unix,
+                        self.settings.autosave_interval_seconds as u64,
+                        true,
+                    );
+                }
+                Err(error) => {
+                    self.project_notice =
+                        Some((format!("Recovery snapshot failed: {error}"), true));
+                    // Match the lifecycle's bounded retry without an idle poll:
+                    // schedule one exact wake five seconds after the failed
+                    // persistence work completed.
+                    self.next_autosave_utc_unix =
+                        autosave_deadline_after_attempt(completed_utc_unix, 0, false);
+                }
+            }
         }
         if ui.input(|input| input.viewport().close_requested()) && !self.allow_close {
             ui.ctx()
@@ -668,21 +1597,26 @@ impl eframe::App for ReynApp {
         self.viewport(ui);
         self.command_palette(ui.ctx());
         self.show_unsaved_changes_dialog(ui.ctx());
-        // Repaint discipline (§5.4): full-rate only while engine work or the
-        // sandbox loop is in flight; otherwise poll the engine channel at a
-        // low cadence. Widget animations schedule their own repaints.
-        let engine_busy = !self.engine_ok
-            || self.f2d_pending
-            || self.bench_running
-            || self.bench_inspector_pending
-            || self.library.busy
-            || self.live
-            || self.cad.as_ref().is_some_and(|case| case.pending);
-        if engine_busy {
+        self.show_project_conflict_dialog(ui.ctx());
+        // A project mutation can occur inside the UI callbacks above, after
+        // this frame's reconciliation phase. Schedule exactly one follow-up
+        // frame so availability is current without restoring idle polling.
+        if self.dependencies_dirty {
             ui.ctx().request_repaint();
-        } else {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        // Engine delivery is event-driven, widgets/animations own their own
+        // cadence, and the sandbox live loop is intentionally low-frequency.
+        // A dirty project wakes exactly for its next recovery deadline.
+        let repaint_now = now_utc_unix();
+        let (live_delay, autosave_delay) = background_repaint_delays(
+            self.live,
+            self.has_unsaved_project_work(),
+            orientation_blocks_persistence,
+            repaint_now,
+            self.next_autosave_utc_unix,
+        );
+        for delay in [live_delay, autosave_delay].into_iter().flatten() {
+            ui.ctx().request_repaint_after(delay);
         }
     }
 }
@@ -756,6 +1690,7 @@ impl ReynApp {
 
     fn invalidate_active_case_result(&mut self) {
         self.invalidate_cad_section();
+        self.probe3d = None;
         if let Some(case) = &mut self.cad {
             if case.workflow.result.is_some() {
                 case.workflow.parent_run_id = case.active_run_id.clone();
@@ -763,19 +1698,893 @@ impl ReynApp {
             case.workflow.result = None;
             case.workflow.stage = engineering::CaseStage::Setup;
             case.surf = None;
+            case.surf_mask_source = None;
             case.velocity.clear();
             case.pressure.clear();
             case.cp.clear();
             case.traction.clear();
             case.result_grid = 0;
+            case.dt_frame = 0.0;
             case.pending = false;
             case.pending_request_id = None;
             case.pending_run = None;
+            // Preview frames belong to the contract that produced them.
+            case.playback.reset();
         }
         self.surface_on = false;
     }
 
+    fn active_case_draft_scope(&self) -> Option<engineering::CaseDraftScope> {
+        let case = self.cad.as_ref()?;
+        Some(engineering::CaseDraftScope::new(
+            self.project.manifest().project_id(),
+            &case.workflow.case_id,
+            case.workflow.source_revision_id.clone(),
+            &case.workflow.preflight.source_sha256,
+        ))
+    }
+
+    fn rebase_case_draft_history(&mut self) {
+        self.case_edit_transaction = None;
+        match self.active_case_draft_scope() {
+            Some(scope) => self.case_draft_history.rebase(scope),
+            None => self.case_draft_history.clear(),
+        }
+    }
+
+    fn case_history_gate_reason(&self, action: CaseHistoryAction) -> Option<String> {
+        if self.nav != Nav::Case {
+            return Some("Open Case Setup to edit its draft.".into());
+        }
+        let Some(case) = self.cad.as_ref() else {
+            return Some("No external-flow case draft is active.".into());
+        };
+        if self.project.availability().is_read_only_evidence() {
+            return Some("This project is in read-only evidence mode.".into());
+        }
+        if case.pending {
+            return Some("Cancel the in-flight run before changing its draft.".into());
+        }
+        let Some(scope) = self.active_case_draft_scope() else {
+            return Some("No external-flow case draft is active.".into());
+        };
+        let available = match action {
+            CaseHistoryAction::Undo => self.case_draft_history.can_undo(&scope),
+            CaseHistoryAction::Redo => self.case_draft_history.can_redo(&scope),
+        };
+        (!available).then(|| {
+            format!(
+                "No reversible draft edit to {}. Immutable identity is excluded.",
+                match action {
+                    CaseHistoryAction::Undo => "undo",
+                    CaseHistoryAction::Redo => "redo",
+                }
+            )
+        })
+    }
+
+    fn apply_case_history_action(&mut self, action: CaseHistoryAction) {
+        if let Some(reason) = self.case_history_gate_reason(action) {
+            self.project_notice = Some((reason, false));
+            return;
+        }
+        let Some(scope) = self.active_case_draft_scope() else {
+            return;
+        };
+        let Some(current) = self
+            .cad
+            .as_ref()
+            .map(|case| engineering::CaseDraftSnapshot::capture(&case.workflow))
+        else {
+            return;
+        };
+        let restored = match action {
+            CaseHistoryAction::Undo => self.case_draft_history.undo(scope, current),
+            CaseHistoryAction::Redo => self.case_draft_history.redo(scope, current),
+        };
+        let Some(restored) = restored else {
+            return;
+        };
+        if let Some(case) = self.cad.as_mut() {
+            restored.restore(&mut case.workflow);
+        }
+        self.case_edit_transaction = None;
+        self.mark_case_draft_dirty();
+        // Exactly the normal case-edit pathway: previews/current display state
+        // become stale, readiness is recalculated from the restored draft, and
+        // completed runs/evidence in the project manifest remain untouched.
+        self.invalidate_active_case_result();
+        self.project_notice = Some((
+            format!(
+                "{} case-draft edit. Completed runs and evidence remain immutable; readiness gates were re-evaluated.",
+                match action {
+                    CaseHistoryAction::Undo => "Undid",
+                    CaseHistoryAction::Redo => "Redid",
+                }
+            ),
+            false,
+        ));
+    }
+
+    fn record_case_draft_change(
+        &mut self,
+        before: engineering::CaseDraftSnapshot,
+        after: engineering::CaseDraftSnapshot,
+        changed_transaction: Option<CaseEditTransaction>,
+        active_transaction: Option<CaseEditTransaction>,
+    ) {
+        if self.project.availability().is_read_only_evidence() {
+            self.rebase_case_draft_history();
+            return;
+        }
+        let Some(scope) = self.active_case_draft_scope() else {
+            self.case_draft_history.clear();
+            self.case_edit_transaction = None;
+            return;
+        };
+        let coalesce =
+            changed_transaction.is_some() && changed_transaction == self.case_edit_transaction;
+        self.case_draft_history
+            .record_change(scope, before, &after, coalesce);
+        self.case_edit_transaction = active_transaction;
+        self.mark_case_draft_dirty();
+    }
+
+    fn handle_case_edit_shortcuts(&mut self, ui: &mut egui::Ui) {
+        if self.nav != Nav::Case || self.palette_open {
+            return;
+        }
+        // Let ordinary text fields own their native text undo. A focused case
+        // numeric editor is tracked above and intentionally routes to the case
+        // transaction instead.
+        if ui.ctx().egui_wants_keyboard_input() && self.case_edit_transaction.is_none() {
+            return;
+        }
+        let action = ui.input_mut(|input| {
+            if input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ) {
+                return Some(CaseHistoryAction::Redo);
+            }
+            #[cfg(not(target_os = "macos"))]
+            if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) {
+                return Some(CaseHistoryAction::Redo);
+            }
+            input
+                .consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
+                .then_some(CaseHistoryAction::Undo)
+        });
+        if let Some(action) = action {
+            self.apply_case_history_action(action);
+        }
+    }
+
+    /// Stop waiting for the in-flight run. The engine is a single blocking
+    /// sidecar, so the model pass it has already started cannot be interrupted;
+    /// what cancelling guarantees is that its result is discarded on arrival and
+    /// never becomes a run, a result, or evidence. The UI says exactly that.
+    fn cancel_external_flow(&mut self) {
+        let Some(case) = self.cad.as_mut() else {
+            return;
+        };
+        let Some(request_id) = case.pending_request_id.clone() else {
+            return;
+        };
+        case.pending = false;
+        case.pending_request_id = None;
+        case.pending_run = None;
+        case.workflow.stage = if case.workflow.ready() {
+            engineering::CaseStage::Ready
+        } else {
+            engineering::CaseStage::Setup
+        };
+        self.cancelled_requests.push(request_id.clone());
+        // One entry per cancelled run; a handful is all the notice text needs.
+        if self.cancelled_requests.len() > 16 {
+            self.cancelled_requests.remove(0);
+        }
+        self.engine_status = "○ Run cancelled".into();
+        self.project_notice = Some((
+            format!(
+                "Cancelled run {}. Its result will be discarded when the engine returns; no run, result, or evidence was recorded.",
+                short_id(&request_id)
+            ),
+            false,
+        ));
+    }
+
+    /// Ask the engine for one horizon step of the completed case, for playback.
+    /// The engine caches the solver warmup per mask and Reynolds number, so this
+    /// is about one model pass, and every fetched step is cached here.
+    fn request_horizon_step(&mut self, step: u32) {
+        if self.project.availability().is_read_only_evidence() {
+            self.project_notice = Some((
+                "Uncomputed horizon previews are unavailable in read-only evidence mode. Stored run fields remain inspectable."
+                    .into(),
+                true,
+            ));
+            return;
+        }
+        if !self.engine_ok {
+            self.project_notice = Some((
+                "The local engine is unavailable, so uncomputed horizon steps cannot be fetched. Stored steps remain viewable.".into(),
+                true,
+            ));
+            return;
+        }
+        let Some(case) = self.cad.as_mut() else {
+            return;
+        };
+        if case.pending || case.workflow.result.is_none() {
+            return;
+        }
+        if step == 0 || step > case.workflow.model_max_steps {
+            return;
+        }
+        if step == case.steps || case.playback.frames.contains_key(&step) {
+            return;
+        }
+        if case.playback.fetching.is_some() {
+            return; // one preview pass in flight at a time
+        }
+        let scale = case
+            .workflow
+            .operating
+            .length_unit
+            .meters_per_unit()
+            .unwrap_or(1.0);
+        let request_id = format!("cad-horizon-{}", uuid::Uuid::new_v4());
+        let request = engine::Cmd::CadPredict {
+            request_id: request_id.clone(),
+            model: case.model.clone(),
+            steps: step,
+            mask: case.mask.clone(),
+            reynolds: case.workflow.operating.reynolds().unwrap_or_default() as f32,
+            characteristic_length_solver: case.workflow.preflight.solver_characteristic_length
+                as f32,
+            reference_length_m: (case.workflow.operating.reference_length * scale) as f32,
+            velocity_mps: case.workflow.operating.velocity as f32,
+            density_kg_m3: case.workflow.operating.density as f32,
+            reference_pressure_pa: case.workflow.operating.reference_pressure as f32,
+        };
+        if self.engine.tx.send(request).is_err() {
+            case.playback.failed.insert(step);
+            self.project_notice = Some(("Engine request channel is unavailable.".into(), true));
+            return;
+        }
+        case.playback.failed.remove(&step);
+        case.playback.fetching = Some((step, request_id));
+    }
+
+    /// Move playback to `step`, fetching it if it is not cached yet.
+    fn show_horizon_step(&mut self, step: u32) {
+        let Some(case) = self.cad.as_mut() else {
+            return;
+        };
+        let max = case.workflow.model_max_steps.max(case.steps).max(1);
+        let step = step.clamp(1, max);
+        if case.display_step() == step {
+            return;
+        }
+        case.playback.step = step;
+        case.playback.trim(case.steps);
+        self.probe3d = None;
+        self.invalidate_cad_section();
+        if self
+            .cad
+            .as_ref()
+            .is_some_and(|case| case.display_fields().is_some())
+        {
+            self.refresh_display_layers();
+        } else {
+            self.request_horizon_step(step);
+        }
+    }
+
+    /// Advance playback while it is playing. One step per 500 ms of wall clock:
+    /// this is a sequence of model predictions, not a real-time simulation, so
+    /// the rate is a reading rate and is labeled as such.
+    fn advance_horizon_playback(&mut self, ctx: &egui::Context) {
+        let Some(case) = self.cad.as_ref() else {
+            return;
+        };
+        if !case.playback.playing || case.workflow.result.is_none() {
+            return;
+        }
+        let horizon_max = case.workflow.model_max_steps.max(case.steps).max(1);
+        let current = case.display_step();
+        let waiting = case.playback.fetching.is_some();
+        let now = ctx.input(|input| input.time);
+        let due = now - case.playback.last_advance >= 0.5;
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        if waiting || !due {
+            return;
+        }
+        let next = if current >= horizon_max {
+            1
+        } else {
+            current + 1
+        };
+        if let Some(case) = self.cad.as_mut() {
+            case.playback.last_advance = now;
+        }
+        self.show_horizon_step(next);
+    }
+
+    /// Cache a fetched playback step and, if it is the step on screen, show it.
+    /// Preview frames never touch `workflow.result`, the content store, or the
+    /// run ledger: the recorded run stays exactly as it was recorded.
+    fn install_horizon_frame(&mut self, step: u32, field: engine::CadField) {
+        let Some(case) = self.cad.as_mut() else {
+            return;
+        };
+        case.playback.fetching = None;
+        case.playback.failed.remove(&step);
+        // The engine echoes the request mask. Preserve Arc identity when it is
+        // byte-for-byte the active geometry so downstream display refresh can
+        // reuse the already-transposed GPU mask and its upload version.
+        let frame_mask = if field.mask.as_slice() == case.mask.as_slice() {
+            case.mask.clone()
+        } else {
+            std::sync::Arc::new(field.mask)
+        };
+        case.playback.frames.insert(
+            step,
+            HorizonFrame {
+                n: field.n,
+                velocity: field.vel,
+                pressure: field.pressure,
+                cp: field.cp.clone(),
+                traction: field.traction,
+                mask: frame_mask,
+                force_coefficients: field.force_coefficients,
+                cp_min: field.cp.iter().copied().fold(f32::INFINITY, f32::min),
+                cp_max: field.cp.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+            },
+        );
+        let recorded = case.steps;
+        case.playback.trim(recorded);
+        self.engine_ok = true;
+        if self.cad.as_ref().map(CadCase::display_step) == Some(step) {
+            self.invalidate_cad_section();
+            self.refresh_display_layers();
+            self.engine_status = format!("● Horizon step {step} · model prediction preview");
+        }
+    }
+
+    /// Rebuild the 3D layers (particles, vorticity volume, insight markers, and
+    /// the surface texture) from whichever horizon step is displayed.
+    fn refresh_display_layers(&mut self) {
+        let Some((
+            particles,
+            volume,
+            insights,
+            new_mask_bytes,
+            reused_mask,
+            displayed_mask_source,
+            cp_bytes,
+            n,
+        )) = self.cad.as_ref().and_then(|case| {
+            let fields = case.display_fields()?;
+            let shape = [3usize, fields.n, fields.n, fields.n];
+            let particles = flow::from_field(&shape, fields.velocity);
+            let volume = flow::vorticity_volume(&shape, fields.velocity);
+            let mut insights = flow::insights3d(&shape, fields.velocity);
+            insights.extend(cad::surface_insights(fields.mask, fields.cp, fields.n));
+            let n = fields.n;
+            let displayed_mask_source = if fields.recorded {
+                case.mask.clone()
+            } else {
+                case.playback.frames.get(&fields.step)?.mask.clone()
+            };
+            let cp_scale = fields
+                .cp
+                .iter()
+                .fold(0.0f32, |scale, value| scale.max(value.abs()))
+                .max(1e-6);
+            let reused_mask = case
+                .surf
+                .as_ref()
+                .filter(|surface| {
+                    surface.dims == [n as u32; 3]
+                        && case.surf_mask_source.as_ref().is_some_and(|source| {
+                            std::sync::Arc::ptr_eq(source, &displayed_mask_source)
+                        })
+                })
+                .map(|surface| (surface.mask.clone(), surface.mask_version));
+            let mut mask_u8 = reused_mask.is_none().then(|| vec![0u8; n * n * n]);
+            let mut cp_u8 = vec![128u8; n * n * n];
+            if let Some(mask_u8) = mask_u8.as_mut() {
+                for i in 0..n {
+                    for j in 0..n {
+                        for k in 0..n {
+                            let source = i * n * n + j * n + k;
+                            let target = (k * n + j) * n + i;
+                            mask_u8[target] = (fields.mask[source].clamp(0.0, 1.0) * 255.0) as u8;
+                        }
+                    }
+                }
+            }
+            for i in 0..n {
+                for j in 0..n {
+                    for k in 0..n {
+                        let source = i * n * n + j * n + k;
+                        let target = (k * n + j) * n + i;
+                        let normalized = (fields.cp[source] / cp_scale) * 0.5 + 0.5;
+                        cp_u8[target] = (normalized.clamp(0.0, 1.0) * 255.0) as u8;
+                    }
+                }
+            }
+            Some((
+                particles,
+                volume,
+                insights,
+                mask_u8,
+                reused_mask,
+                displayed_mask_source,
+                cp_u8,
+                n,
+            ))
+        })
+        else {
+            return;
+        };
+        if !particles.is_empty() {
+            self.particles = particles;
+        }
+        if let Some((data, dims)) = volume {
+            self.volume_data = std::sync::Arc::new(data);
+            self.volume_dims = dims;
+            self.volume_version = self.volume_version.wrapping_add(1);
+        }
+        self.insights3d = insights;
+        self.cad_version = self.cad_version.wrapping_add(1);
+        let (mask, mask_version) = match reused_mask {
+            Some(reused) => reused,
+            None => (
+                std::sync::Arc::new(
+                    new_mask_bytes.expect("a non-reused surface mask was converted"),
+                ),
+                self.cad_version,
+            ),
+        };
+        let surface = gpu::SurfaceData {
+            mask,
+            pressure: std::sync::Arc::new(cp_bytes),
+            dims: [n as u32; 3],
+            mask_version,
+            pressure_version: self.cad_version,
+        };
+        if let Some(case) = self.cad.as_mut() {
+            case.surf = Some(surface);
+            case.surf_mask_source = Some(displayed_mask_source);
+        }
+    }
+
+    /// Physical seconds per horizon step for the active case, when the run
+    /// reported the frame interval and the operating point is complete.
+    fn seconds_per_horizon_step(&self) -> Option<f64> {
+        let case = self.cad.as_ref()?;
+        let scale = case.workflow.operating.length_unit.meters_per_unit()?;
+        engineering::seconds_per_horizon_step(
+            case.dt_frame as f64,
+            case.workflow.preflight.solver_characteristic_length,
+            case.workflow.operating.reference_length * scale,
+            case.workflow.operating.velocity,
+        )
+    }
+
+    /// Report the surface values under a 3D click: march the displayed mask to
+    /// the first solid cell, then read the adjacent fluid cell the diffuse-
+    /// interface loads are defined on — the same cells the 2D probe reads.
+    fn probe_surface_at(&mut self, rect: Rect, screen: egui::Pos2) {
+        let slice = [
+            self.slice[0].then(|| self.slice_pos[0] * 2.0 - 1.0),
+            self.slice[1].then(|| self.slice_pos[1] * 2.0 - 1.0),
+            self.slice[2].then(|| self.slice_pos[2] * 2.0 - 1.0),
+        ];
+        let (origin, direction) = self.cam.ray(rect, screen);
+        let probe = self.cad.as_ref().and_then(|case| {
+            let fields = case.display_fields()?;
+            let (_, surface) =
+                cad::pick_solid_voxel(fields.mask, fields.n, origin, direction, slice)?;
+            let index = surface[0] * fields.n * fields.n + surface[1] * fields.n + surface[2];
+            let solver_point = std::array::from_fn(|axis| {
+                (surface[axis] as f64 + 0.5) * std::f64::consts::TAU / fields.n as f64
+            });
+            let meters_per_source_unit = case
+                .workflow
+                .operating
+                .length_unit
+                .meters_per_unit()
+                .unwrap_or(1.0);
+            Some(SurfaceProbe {
+                anchor: cad::voxel_center(surface, fields.n),
+                cell: surface,
+                source_m: engineering::solver_point_to_source_m(
+                    solver_point,
+                    case.workflow.preflight.transform_4x4,
+                    meters_per_source_unit,
+                )
+                .ok(),
+                cp: fields.cp.get(index).copied().unwrap_or(f32::NAN),
+                pressure_pa: fields.pressure.get(index).copied().unwrap_or(f32::NAN),
+                traction_pa: std::array::from_fn(|axis| {
+                    fields
+                        .traction
+                        .get(axis * fields.n.pow(3) + index)
+                        .copied()
+                        .unwrap_or(f32::NAN)
+                }),
+                step: fields.step,
+                recorded: fields.recorded,
+            })
+        });
+        match probe {
+            Some(probe) => self.probe3d = Some(probe),
+            None => {
+                self.probe3d = None;
+                if self
+                    .cad
+                    .as_ref()
+                    .is_some_and(|case| case.display_fields().is_some())
+                {
+                    self.project_notice = Some((
+                        "No body surface under that point — the probe reports values only where the stored mask is solid.".into(),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Queue a body-attitude re-voxelization without running mesh parsing or the
+    /// O(N³) classification on egui's thread. The latest request replaces the
+    /// active generation; queued generations are coalesced by the worker and a
+    /// generation that was already computing is discarded when it arrives.
+    fn apply_body_orientation(&mut self, angles: [f64; 3]) {
+        if self.reject_project_mutation("Changing body orientation") {
+            return;
+        }
+        let Some(case) = self.cad.as_ref() else {
+            return;
+        };
+        if case.pending {
+            self.project_notice = Some((
+                "A run is in flight. Cancel it before changing body orientation.".into(),
+                true,
+            ));
+            return;
+        }
+        let digest = case.workflow.preflight.source_sha256.clone();
+        let grid = case.workflow.preflight.target_grid;
+        let case_id = case.workflow.case_id.clone();
+        let Some(bytes) = self.project.content_bytes(&digest).map(<[u8]>::to_vec) else {
+            self.project_notice = Some((
+                format!(
+                    "Geometry object {} must be relinked before orientation can be re-applied.",
+                    short_hash(&digest)
+                ),
+                true,
+            ));
+            return;
+        };
+        if self.orientation_worker.is_none() {
+            self.orientation_worker = match OrientationWorker::spawn(self.repaint_context.clone()) {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    self.next_autosave_utc_unix =
+                        autosave_deadline_after_attempt(now_utc_unix(), 0, false);
+                    self.project_notice = Some((error, true));
+                    return;
+                }
+            };
+        }
+        self.orientation_generation = self.orientation_generation.wrapping_add(1).max(1);
+        let generation = self.orientation_generation;
+        let request_id = format!("orientation-{generation}-{}", uuid::Uuid::new_v4().simple());
+        let request = OrientationWorkRequest {
+            generation,
+            request_id: request_id.clone(),
+            case_id: case_id.clone(),
+            source_sha256: digest.clone(),
+            angles,
+            grid,
+            source_bytes: bytes,
+        };
+        let sent = self
+            .orientation_worker
+            .as_ref()
+            .expect("orientation worker was initialized")
+            .request_tx
+            .send(request);
+        if sent.is_err() {
+            self.orientation_worker = None;
+            self.next_autosave_utc_unix = autosave_deadline_after_attempt(now_utc_unix(), 0, false);
+            self.project_notice = Some((
+                "Body orientation was not queued because the re-voxelization worker stopped. The existing mask and immutable evidence were not changed."
+                    .into(),
+                true,
+            ));
+            return;
+        }
+        self.orientation_pending = Some(PendingOrientation {
+            generation,
+            request_id: request_id.clone(),
+            case_id,
+            source_sha256: digest,
+            angles,
+            started_at: std::time::Instant::now(),
+            kind: PendingOrientationKind::Draft,
+        });
+        self.engine_status = format!(
+            "● Re-voxelizing body orientation · request {}",
+            short_id(&request_id)
+        );
+        self.project_notice = Some((
+            "Body orientation re-voxelization is running off the UI thread. Progress is indeterminate; runs, saves, and recovery snapshots remain gated until the matching generation completes."
+                .into(),
+            false,
+        ));
+    }
+
+    fn handle_orientation_results(&mut self) {
+        let completed: Vec<_> = self
+            .orientation_worker
+            .as_ref()
+            .map(|worker| worker.result_rx.try_iter().collect())
+            .unwrap_or_default();
+        for mut completed in completed {
+            let current_case = self.cad.as_ref().map(|case| {
+                (
+                    case.workflow.case_id.as_str(),
+                    case.workflow.preflight.source_sha256.as_str(),
+                )
+            });
+            match classify_orientation_result(
+                &completed,
+                self.orientation_pending.as_ref(),
+                current_case,
+            ) {
+                OrientationResultDisposition::DiscardStale => {
+                    let completed_was_active =
+                        self.orientation_pending.as_ref().is_some_and(|pending| {
+                            pending.generation == completed.generation
+                                && pending.request_id == completed.request_id
+                        });
+                    if completed_was_active {
+                        let mutates_project = self
+                            .orientation_pending
+                            .as_ref()
+                            .is_some_and(PendingOrientation::mutates_project);
+                        self.orientation_pending = None;
+                        if mutates_project {
+                            self.next_autosave_utc_unix = autosave_deadline_after_attempt(
+                                completed.completed_utc_unix,
+                                0,
+                                false,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                OrientationResultDisposition::Failed => {
+                    let error = completed
+                        .result
+                        .err()
+                        .unwrap_or_else(|| "unknown orientation worker failure".into());
+                    let pending = self
+                        .orientation_pending
+                        .take()
+                        .expect("current orientation failure has pending state");
+                    match pending.kind {
+                        PendingOrientationKind::Draft => self.finish_orientation_failure(
+                            completed.completed_utc_unix,
+                            &completed.request_id,
+                            &error,
+                        ),
+                        PendingOrientationKind::Hydrate(_) => {
+                            self.finish_orientation_hydration_failure(&completed.request_id, &error)
+                        }
+                    }
+                }
+                OrientationResultDisposition::Apply => {
+                    let vm = std::mem::replace(
+                        &mut completed.result,
+                        Err("orientation result was already consumed".into()),
+                    )
+                    .expect("successful orientation disposition has a voxel mask");
+                    let pending = self
+                        .orientation_pending
+                        .take()
+                        .expect("current orientation completion has pending state");
+                    match pending.kind {
+                        PendingOrientationKind::Draft => {
+                            self.install_body_orientation(completed, vm)
+                        }
+                        PendingOrientationKind::Hydrate(hydration) => {
+                            self.install_hydrated_body_orientation(*hydration, completed, vm)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_orientation_failure(
+        &mut self,
+        completed_utc_unix: u64,
+        request_id: &str,
+        error: &str,
+    ) {
+        self.orientation_pending = None;
+        self.next_autosave_utc_unix = autosave_deadline_after_attempt(completed_utc_unix, 0, false);
+        self.engine_status = "○ Body orientation re-voxelization failed".into();
+        self.project_notice = Some((
+            format!(
+                "Oriented voxel preflight {} failed: {error}. The prior mask, result view, immutable runs, and evidence remain unchanged; the draft angles are still pending.",
+                short_id(request_id)
+            ),
+            true,
+        ));
+    }
+
+    fn finish_orientation_hydration_failure(&mut self, request_id: &str, error: &str) {
+        self.orientation_pending = None;
+        self.engine_status = "○ Stored case geometry reconstruction failed".into();
+        self.project_notice = Some((
+            format!(
+                "Stored case geometry request {} could not be reconstructed: {error}. The project manifest and immutable evidence remain available and unchanged.",
+                short_id(request_id)
+            ),
+            true,
+        ));
+    }
+
+    /// Install only the currently requested generation. Result invalidation and
+    /// lineage changes occur here, after successful voxelization, so failed or
+    /// stale work cannot erase the last valid geometry/result.
+    fn install_body_orientation(&mut self, completed: OrientationWorkResult, vm: cad::VoxelMask) {
+        if let Err(error) = self.project_write_access("Completing body orientation") {
+            self.finish_orientation_failure(
+                completed.completed_utc_unix,
+                &completed.request_id,
+                &format!(
+                    "{error} The completed geometry was discarded before it could mutate the case"
+                ),
+            );
+            return;
+        }
+        if self.cad.as_ref().is_some_and(|case| case.pending) {
+            self.finish_orientation_failure(
+                completed.completed_utc_unix,
+                &completed.request_id,
+                "a run entered flight before completion; the completed geometry was discarded",
+            );
+            return;
+        }
+        let Some(case) = self.cad.as_mut() else {
+            self.finish_orientation_failure(
+                completed.completed_utc_unix,
+                &completed.request_id,
+                "the active case no longer exists",
+            );
+            return;
+        };
+        let preflight = &mut case.workflow.preflight;
+        // Record the attitude the mask was actually built with, not the request.
+        let applied = vm.orientation.to_degrees();
+        preflight.angle_of_attack_deg = applied[0];
+        preflight.yaw_deg = applied[1];
+        preflight.roll_deg = applied[2];
+        preflight.proposed_scale = vm.scale;
+        preflight.solver_characteristic_length = vm.char_len as f64;
+        preflight.transform_4x4 = vm.transform_4x4;
+        preflight.solid_voxels = vm.solid_voxels;
+        preflight.voxel_components = vm.components;
+        preflight.minimum_cells_across = vm.minimum_cells_across;
+        preflight.boundary_clearance_cells = vm.boundary_clearance_cells;
+        preflight.voxel_axis_disagreement_fraction = vm.axis_disagreement_fraction;
+        preflight.voxel_odd_crossing_rows = vm.odd_crossing_rows;
+        preflight.voxel_classification_version = vm.classification_version;
+        // Approval covers units, orientation, scale, and placement, so a new
+        // attitude is a new thing to approve.
+        preflight.transform_approved = false;
+        case.mask_bounds = cad::mask_bounds(&vm.mask, vm.n);
+        case.mask = std::sync::Arc::new(vm.mask);
+        let summary = case.workflow.preflight.body_orientation_summary();
+        self.orientation_pending = None;
+        self.invalidate_active_case_result();
+        if let Some(case) = &mut self.cad {
+            case.workflow.stage = engineering::CaseStage::Preflight;
+        }
+        self.mark_case_draft_dirty();
+        if self.orientation_draft == Some(completed.angles) {
+            self.orientation_draft = None;
+        }
+        let revision_result = self.commit_active_case_revision();
+        self.next_autosave_utc_unix = autosave_deadline_after_attempt(
+            completed.completed_utc_unix,
+            self.settings.autosave_interval_seconds as u64,
+            revision_result.is_ok(),
+        );
+        if let Err(error) = revision_result {
+            self.project_notice = Some((
+                format!(
+                    "Body orientation request {} completed and the old result was invalidated, but the case revision was not recorded: {error}",
+                    short_id(&completed.request_id)
+                ),
+                true,
+            ));
+            return;
+        }
+        self.engine_status = format!("● Body orientation: {summary} · re-approve the transform");
+        self.project_notice = Some((
+            format!(
+                "Body re-oriented ({summary}) against the fixed +X stream. Transform approval re-opened and results cleared."
+            ),
+            false,
+        ));
+    }
+
+    /// Complete recovery/open reconstruction without changing the persisted
+    /// preflight or creating lineage. The stored transform remains
+    /// authoritative; this worker result supplies only its deterministic mask.
+    fn install_hydrated_body_orientation(
+        &mut self,
+        hydration: PendingOrientationHydration,
+        completed: OrientationWorkResult,
+        vm: cad::VoxelMask,
+    ) {
+        let workflow = hydration.workflow;
+        let model = workflow.model_id.clone();
+        let name = workflow.source_name.clone();
+        let steps = workflow.operating.horizon_steps;
+        let has_result = workflow.result.is_some();
+        let mask_bounds = cad::mask_bounds(&vm.mask, vm.n);
+        let mask = std::sync::Arc::new(vm.mask);
+        self.orientation_pending = None;
+        self.orientation_draft = None;
+        self.current_model = model.clone();
+        self.invalidate_cad_section();
+        self.cad = Some(CadCase {
+            mask,
+            mask_bounds,
+            model,
+            steps,
+            surf: None,
+            surf_mask_source: None,
+            name: name.clone(),
+            workflow,
+            velocity: Vec::new(),
+            pressure: Vec::new(),
+            cp: Vec::new(),
+            traction: Vec::new(),
+            result_grid: 0,
+            dt_frame: hydration.dt_frame,
+            active_run_id: hydration.selected_run_id,
+            pending: false,
+            pending_request_id: None,
+            pending_run: None,
+            playback: HorizonPlayback::default(),
+        });
+        self.rebase_case_draft_history();
+        self.nav = if has_result { Nav::Evidence } else { Nav::Case };
+        self.engine_status = format!(
+            "● Reconstructed stored case {name} @ {}³ · request {}",
+            vm.n,
+            short_id(&completed.request_id)
+        );
+        self.project_notice = Some((
+            "Stored body orientation and voxel mask were reconstructed off the UI thread. The project manifest, case lineage, runs, and evidence were not mutated."
+                .into(),
+            false,
+        ));
+    }
+
     fn commit_active_case_revision(&mut self) -> Result<(), String> {
+        self.project_write_access("Recording the Case Setup draft")?;
         let case = self
             .cad
             .as_ref()
@@ -842,6 +2651,9 @@ impl ReynApp {
                 "voxel_components": workflow.preflight.voxel_components,
                 "minimum_cells_across": workflow.preflight.minimum_cells_across,
                 "boundary_clearance_cells": workflow.preflight.boundary_clearance_cells,
+                "axis_disagreement_fraction": workflow.preflight.voxel_axis_disagreement_fraction,
+                "odd_crossing_rows_xyz": workflow.preflight.voxel_odd_crossing_rows,
+                "classification_version": workflow.preflight.voxel_classification_version,
                 "transform_4x4": workflow.preflight.transform_4x4,
         });
         let outputs = serde_json::json!({
@@ -871,6 +2683,7 @@ impl ReynApp {
             && active_case.active_revision().discretization == discretization
             && active_case.active_revision().outputs == outputs;
         if unchanged {
+            self.case_draft_dirty = false;
             return Ok(());
         }
         let revision_id = format!("case-revision-{}", uuid::Uuid::new_v4());
@@ -889,29 +2702,32 @@ impl ReynApp {
             outputs,
         };
         let case_id = workflow.case_id.clone();
-        self.project
-            .transact(now_utc_unix(), move |manifest| {
+        self.transact_project(
+            "Recording the Case Setup draft",
+            now_utc_unix(),
+            move |manifest| {
                 if let Some(source) = approved_source {
                     manifest.add_source_revision(source, now_utc_unix())?;
                 }
                 manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
                 Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+            },
+        )?;
+        self.dependencies_dirty = true;
         if let Some(case) = &mut self.cad {
             case.workflow.case_revision_id = Some(revision_id);
             case.workflow.source_revision_id = workflow.source_revision_id;
         }
+        // A persisted revision/source transition is a history boundary. Undo
+        // remains draft-only and never walks lineage backwards.
+        self.rebase_case_draft_history();
+        self.case_draft_dirty = false;
         Ok(())
     }
 
     fn run_external_flow(&mut self) {
-        if !self.engine_ok {
-            self.project_notice = Some((
-                "The local engine is unavailable. Stored evidence remains readable, but a new run cannot start."
-                    .into(),
-                true,
-            ));
+        if let Some(reason) = self.run_gate_reason() {
+            self.project_notice = Some((reason, true));
             return;
         }
         let issues = match self.cad.as_ref() {
@@ -929,6 +2745,9 @@ impl ReynApp {
             self.project_notice = Some((format!("Run revision was not persisted: {error}"), true));
             return;
         }
+        // Once execution starts, the inputs are a persisted revision rather
+        // than an editable history branch. A later edit starts a fresh stack.
+        self.rebase_case_draft_history();
         let Some(case) = &mut self.cad else {
             return;
         };
@@ -984,6 +2803,7 @@ impl ReynApp {
     }
 
     fn persist_external_flow_run(&mut self, field: &engine::CadField) -> Result<String, String> {
+        self.project_write_access("Recording the completed immutable run")?;
         let case = self
             .cad
             .as_ref()
@@ -999,6 +2819,7 @@ impl ReynApp {
                 )
             })?;
         let workflow = pending.workflow.clone();
+        let active_run_id = case.active_run_id.clone();
         let runtime_ms = pending.started_at.elapsed().as_millis() as u64;
         let case_revision_id = workflow
             .case_revision_id
@@ -1015,13 +2836,12 @@ impl ReynApp {
                 traction_pa: field.traction.clone(),
             })?;
         let field_sha256 = format!("{:x}", Sha256::digest(&field_bytes));
-        self.project
-            .add_content_with_digest(
-                field_bytes,
-                "application/vnd.reyn.engineering-field.f32le",
-                &field_sha256,
-            )
-            .map_err(|error| error.to_string())?;
+        self.add_project_content(
+            "Recording the completed immutable run",
+            field_bytes,
+            "application/vnd.reyn.engineering-field.f32le",
+            &field_sha256,
+        )?;
         let result_json = serde_json::json!({
             "schema": engineering::ENGINEERING_RESULT_SCHEMA,
             "field_schema": engineering::ENGINEERING_FIELD_SCHEMA,
@@ -1060,13 +2880,12 @@ impl ReynApp {
         let result_bytes =
             serde_json::to_vec_pretty(&result_json).map_err(|error| error.to_string())?;
         let result_sha256 = format!("{:x}", Sha256::digest(&result_bytes));
-        self.project
-            .add_content_with_digest(
-                result_bytes,
-                "application/vnd.reyn.engineering-result+json",
-                &result_sha256,
-            )
-            .map_err(|error| error.to_string())?;
+        self.add_project_content(
+            "Recording the completed immutable run",
+            result_bytes,
+            "application/vnd.reyn.engineering-result+json",
+            &result_sha256,
+        )?;
         let scalar = |key: &str, value: f32, units: &str| project::ScalarOutput {
             key: key.into(),
             value: value as f64,
@@ -1084,10 +2903,7 @@ impl ReynApp {
             scalar("wake_deficit_peak", field.wake_deficit_peak, "1"),
             scalar("wake_deficit_mean", field.wake_deficit_mean, "1"),
         ];
-        let parent_run_id = workflow
-            .parent_run_id
-            .clone()
-            .or_else(|| case.active_run_id.clone());
+        let parent_run_id = workflow.parent_run_id.clone().or(active_run_id);
         let parent_run = parent_run_id.as_deref().and_then(|parent_id| {
             self.project
                 .manifest()
@@ -1116,7 +2932,7 @@ impl ReynApp {
             }),
             model: Some(project::VersionedComponent {
                 name: workflow.model_id.clone(),
-                version: "checkpoint".into(),
+                version: "reynmodel-bundle-v1".into(),
                 sha256: workflow
                     .model_sha256
                     .clone()
@@ -1208,8 +3024,10 @@ impl ReynApp {
             calibrated_views,
         };
         let case_id = workflow.case_id;
-        self.project
-            .transact(now_utc_unix(), |project_manifest| {
+        self.transact_project(
+            "Recording the completed immutable run",
+            now_utc_unix(),
+            |project_manifest| {
                 project_manifest.append_run(&case_id, run, now_utc_unix())?;
                 project_manifest.append_evidence(evidence, now_utc_unix())?;
                 project_manifest.set_selection(
@@ -1222,23 +3040,74 @@ impl ReynApp {
                     now_utc_unix(),
                 )?;
                 Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+            },
+        )?;
+        self.dependencies_dirty = true;
         Ok(run_id)
+    }
+
+    fn engineering_notice(&self, ui: &mut egui::Ui) {
+        let Some((message, is_error)) = &self.project_notice else {
+            return;
+        };
+        let color = if *is_error { DANGER } else { OK };
+        Frame::NONE
+            .fill(if *is_error {
+                tint_fill(DANGER)
+            } else {
+                SURFACE_LOW
+            })
+            .stroke(Stroke::new(
+                1.0,
+                if *is_error {
+                    tint_hairline(DANGER)
+                } else {
+                    HAIRLINE
+                },
+            ))
+            .corner_radius(CornerRadius::same(R1))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        RichText::new(if *is_error { "!" } else { "✓" })
+                            .text_style(mono_s())
+                            .color(color),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(message).text_style(caption()).color(TEXT_DIM),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
+        ui.add_space(10.0);
     }
 
     fn controls_engineering_case(&mut self, ui: &mut egui::Ui) {
         let model_inventory = self.models.clone();
         let mut waiver_draft = std::mem::take(&mut self.waiver_draft);
         let mut waiver_code = self.waiver_code.take();
+        let read_only = self.project.availability().is_read_only_evidence();
         ui.label(title_text("External-Flow Case"));
         ui.label(
             RichText::new("source → preflight → contract → run")
                 .size(11.0)
                 .color(TEXT_MUTE),
         );
-        ui.add_space(16.0);
-        let Some(case) = self.cad.as_mut() else {
+        ui.add_space(12.0);
+        if read_only {
+            ui.label(
+                RichText::new(
+                    "READ-ONLY EVIDENCE · Case Setup and run controls are locked. Stored runs, fields, and evidence remain inspectable.",
+                )
+                .text_style(caption())
+                .color(WARN),
+            );
+            ui.add_space(8.0);
+        }
+        if self.cad.is_none() {
             card(ui, |ui| {
                 ui.label(RichText::new("No geometry imported").color(TEXT));
                 ui.label(
@@ -1250,151 +3119,195 @@ impl ReynApp {
                 );
             });
             ui.add_space(10.0);
-            if ui.button("Import Geometry…").clicked() {
+            if ui
+                .add_enabled(!read_only, egui::Button::new("Import Geometry…"))
+                .on_disabled_hover_text(
+                    "Geometry import is blocked while the project is in read-only evidence mode.",
+                )
+                .clicked()
+            {
                 self.import_cad();
             }
             return;
-        };
+        }
+        let undo_reason = self.case_history_gate_reason(CaseHistoryAction::Undo);
+        let redo_reason = self.case_history_gate_reason(CaseHistoryAction::Redo);
+        let mut history_action = None;
+        Frame::NONE
+            .fill(SURFACE_LOW)
+            .corner_radius(CornerRadius::same(R1))
+            .inner_margin(Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(overline_text("Draft edits"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let redo =
+                            ui.add_enabled(redo_reason.is_none(), egui::Button::new("Redo  ⇧⌘Z"));
+                        if redo.clicked() {
+                            history_action = Some(CaseHistoryAction::Redo);
+                        }
+                        if let Some(reason) = &redo_reason {
+                            redo.on_disabled_hover_text(reason);
+                        }
+                        let undo =
+                            ui.add_enabled(undo_reason.is_none(), egui::Button::new("Undo  ⌘Z"));
+                        if undo.clicked() {
+                            history_action = Some(CaseHistoryAction::Undo);
+                        }
+                        if let Some(reason) = &undo_reason {
+                            undo.on_disabled_hover_text(reason);
+                        }
+                    });
+                });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Setup inputs only · source, run, and evidence identity never rewind.",
+                        )
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    )
+                    .wrap(),
+                );
+            });
+        ui.add_space(10.0);
+        if let Some(action) = history_action {
+            self.apply_case_history_action(action);
+        }
+        self.engineering_notice(ui);
+        let had_unsaved_work = self.has_unsaved_project_work();
+        let mut schedule_orientation_autosave = false;
+        let orientation_pending = self
+            .orientation_pending
+            .as_ref()
+            .map(PendingOrientation::view);
+        let case = self.cad.as_mut().expect("checked above");
+        let draft_before = engineering::CaseDraftSnapshot::capture(&case.workflow);
+        let mut changed_transaction = None;
+        let mut active_transaction = None;
+        let mut identity_changed = false;
+        // Honest in-flight state: the engine is a blocking single pass, so there
+        // is no true fraction to show. Say what is happening, show elapsed time,
+        // and offer a real Cancel. Rendered before `ui.disable()` so Cancel stays
+        // live while the rest of the contract is locked.
+        let mut cancel_run = false;
         if case.pending {
+            let elapsed = case
+                .pending_run
+                .as_ref()
+                .map(|pending| pending.started_at.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            let horizon = case
+                .pending_run
+                .as_ref()
+                .map(|pending| pending.workflow.operating.horizon_steps)
+                .unwrap_or(case.steps);
+            let request_id = case.pending_request_id.clone();
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(13.0));
+                    ui.label(RichText::new("RUN IN FLIGHT").strong().color(BRAND));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{elapsed:.0} s elapsed"))
+                                .text_style(mono_s())
+                                .color(TEXT_DIM),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Developing the flow around this mask, then one model pass at horizon step {horizon}. The engine reports no intermediate progress, so this state is indeterminate — no percentage is shown because none would be real."
+                    ))
+                    .text_style(caption())
+                    .color(TEXT_MUTE),
+                );
+                if let Some(request_id) = &request_id {
+                    diag(ui, "Request", &short_hash(request_id), TEXT_MUTE);
+                }
+                ui.add_space(6.0);
+                cancel_run = ui
+                    .button("Cancel run")
+                    .on_hover_text(
+                        "Stop waiting for this run. The engine pass already started cannot be interrupted, but its result is discarded on arrival and never becomes a run, a result, or evidence.",
+                    )
+                    .clicked();
+            });
+            ui.add_space(10.0);
+        }
+        if let Some(pending) = &orientation_pending {
+            let elapsed = pending.started_at.elapsed().as_secs_f64();
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(13.0));
+                    ui.label(RichText::new("RE-VOXELIZING").strong().color(BRAND));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{elapsed:.0} s elapsed"))
+                                .text_style(mono_s())
+                                .color(TEXT_DIM),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Rotating the source geometry and rebuilding its three-axis occupancy mask off the UI thread. The classifier reports no intermediate progress, so this state is indeterminate.",
+                    )
+                    .text_style(caption())
+                    .color(TEXT_MUTE),
+                );
+                diag(ui, "Request", &short_id(&pending.request_id), TEXT_MUTE);
+                diag(
+                    ui,
+                    "Attitude",
+                    &format!(
+                        "α {:+.2}° · β {:+.2}° · φ {:+.2}°",
+                        pending.angles[0], pending.angles[1], pending.angles[2]
+                    ),
+                    TEXT_DIM,
+                );
+                ui.label(
+                    RichText::new(
+                        "Runs, saves, and recovery snapshots are gated. Applying newer angles supersedes this generation; a stale completion cannot mutate the case.",
+                    )
+                    .text_style(caption())
+                    .color(TEXT_MUTE),
+                );
+            });
+            ui.add_space(10.0);
+        }
+        if case.pending || read_only {
             ui.disable();
         }
         let mut changed = false;
+        let mut template_view_changed = false;
         card(ui, |ui| {
-            ui.label(caps("Source & transform"));
-            diag(ui, "File", &case.workflow.source_name, TEXT);
-            diag(
-                ui,
-                "SHA-256",
-                &short_hash(&case.workflow.preflight.source_sha256),
-                TEXT_MUTE,
-            );
-            diag(
-                ui,
-                "Triangles",
-                &case.workflow.preflight.triangles.to_string(),
-                TEXT_DIM,
-            );
-            // Bounding box in the declared units (SI echo when not meters);
-            // before units are declared, it is honestly labeled "source units".
-            let extents = case.workflow.preflight.source_extents;
-            let unit = case.workflow.operating.length_unit;
-            let extents_text = match unit.meters_per_unit() {
-                Some(scale) => {
-                    let si = if (scale - 1.0).abs() > 1e-12 {
-                        format!(
-                            "  ({:.4} × {:.4} × {:.4} m)",
-                            extents[0] * scale,
-                            extents[1] * scale,
-                            extents[2] * scale
-                        )
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "{:.4} × {:.4} × {:.4} {}{si}",
-                        extents[0],
-                        extents[1],
-                        extents[2],
-                        unit.symbol()
-                    )
-                }
-                None => format!(
-                    "{:.4} × {:.4} × {:.4} source units — declare units below",
-                    extents[0], extents[1], extents[2]
-                ),
+            ui.label(caps("Setup gate"));
+            let units_known =
+                case.workflow.operating.length_unit != engineering::LengthUnit::Unknown;
+            let approved = case.workflow.preflight.transform_approved;
+            let (color, glyph, message) = if !units_known {
+                (
+                    WARN,
+                    "!",
+                    "Declare the geometry units before this case can run.",
+                )
+            } else if !approved {
+                (
+                    WARN,
+                    "!",
+                    "Review and approve units, orientation, scale, and solver placement.",
+                )
+            } else {
+                (
+                    OK,
+                    "✓",
+                    "Source units and preprocessing transform are approved.",
+                )
             };
-            diag(
-                ui,
-                "Bounding box",
-                &extents_text,
-                if unit.meters_per_unit().is_some() {
-                    TEXT_DIM
-                } else {
-                    WARN
-                },
-            );
-            diag(
-                ui,
-                "Surface components",
-                &case.workflow.preflight.components.to_string(),
-                TEXT_DIM,
-            );
-            // Watertightness verdict in words (never color-only).
-            let watertight = case.workflow.preflight.boundary_edges == 0
-                && case.workflow.preflight.non_manifold_edges == 0;
-            diag(
-                ui,
-                "Watertight",
-                if watertight {
-                    "yes · closed manifold surface"
-                } else {
-                    "no · open or non-manifold edges"
-                },
-                if watertight { SUCCESS } else { WARN },
-            );
-            diag(
-                ui,
-                "Defects",
-                &format!(
-                    "{} degenerate · {} open · {} non-manifold",
-                    case.workflow.preflight.degenerate_triangles,
-                    case.workflow.preflight.boundary_edges,
-                    case.workflow.preflight.non_manifold_edges
-                ),
-                if case.workflow.preflight.degenerate_triangles == 0 && watertight {
-                    SUCCESS
-                } else {
-                    WARN
-                },
-            );
-            diag(
-                ui,
-                "Grid",
-                &format!("{}³", case.workflow.preflight.target_grid),
-                BRAND,
-            );
-            diag(
-                ui,
-                "Proposed scale",
-                &format!("{:.6}", case.workflow.preflight.proposed_scale),
-                TEXT_DIM,
-            );
-            diag(
-                ui,
-                "Solver characteristic length",
-                &format!(
-                    "{:.6} solver units",
-                    case.workflow.preflight.solver_characteristic_length
-                ),
-                TEXT_DIM,
-            );
-            diag(
-                ui,
-                "Voxel adequacy",
-                &format!(
-                    "{} solid · {} cells thick · {} cells clear",
-                    case.workflow.preflight.solid_voxels,
-                    case.workflow.preflight.minimum_cells_across,
-                    case.workflow.preflight.boundary_clearance_cells
-                ),
-                TEXT_DIM,
-            );
-            ui.collapsing("Preprocessing transform 4×4", |ui| {
-                for row in 0..4 {
-                    ui.label(
-                        RichText::new(format!(
-                            "{:>10.5} {:>10.5} {:>10.5} {:>10.5}",
-                            case.workflow.preflight.transform_4x4[row],
-                            case.workflow.preflight.transform_4x4[4 + row],
-                            case.workflow.preflight.transform_4x4[8 + row],
-                            case.workflow.preflight.transform_4x4[12 + row],
-                        ))
-                        .text_style(mono_s())
-                        .color(TEXT_MUTE),
-                    );
-                }
-            });
-            ui.add_space(8.0);
+            alert_line(ui, color, glyph, message);
             egui::ComboBox::from_id_salt("engineering.length-unit")
                 .selected_text(case.workflow.operating.length_unit.label())
                 .width(ui.available_width())
@@ -1415,14 +3328,352 @@ impl ReynApp {
                     "Approve units, orientation, scale, and solver placement",
                 )
                 .changed();
-            for warning in &case.workflow.preflight.warnings {
+        });
+        ui.add_space(8.0);
+        inspector_group(
+            ui,
+            "case-source-preflight",
+            "Source & preflight details",
+            false,
+            |ui| {
+                diag(ui, "File", &case.workflow.source_name, TEXT);
+                diag(
+                    ui,
+                    "SHA-256",
+                    &short_hash(&case.workflow.preflight.source_sha256),
+                    TEXT_MUTE,
+                );
+                diag(
+                    ui,
+                    "Triangles",
+                    &case.workflow.preflight.triangles.to_string(),
+                    TEXT_DIM,
+                );
+                // Bounding box in the declared units (SI echo when not meters);
+                // before units are declared, it is honestly labeled "source units".
+                let extents = case.workflow.preflight.source_extents;
+                let unit = case.workflow.operating.length_unit;
+                let extents_text = match unit.meters_per_unit() {
+                    Some(scale) => {
+                        let si = if (scale - 1.0).abs() > 1e-12 {
+                            format!(
+                                "  ({:.4} × {:.4} × {:.4} m)",
+                                extents[0] * scale,
+                                extents[1] * scale,
+                                extents[2] * scale
+                            )
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "{:.4} × {:.4} × {:.4} {}{si}",
+                            extents[0],
+                            extents[1],
+                            extents[2],
+                            unit.symbol()
+                        )
+                    }
+                    None => format!(
+                        "{:.4} × {:.4} × {:.4} source units — declare units below",
+                        extents[0], extents[1], extents[2]
+                    ),
+                };
+                diag(
+                    ui,
+                    "Bounding box",
+                    &extents_text,
+                    if unit.meters_per_unit().is_some() {
+                        TEXT_DIM
+                    } else {
+                        WARN
+                    },
+                );
+                diag(
+                    ui,
+                    "Surface components",
+                    &case.workflow.preflight.components.to_string(),
+                    TEXT_DIM,
+                );
+                // Watertightness verdict in words (never color-only).
+                let watertight = case.workflow.preflight.boundary_edges == 0
+                    && case.workflow.preflight.non_manifold_edges == 0;
+                diag(
+                    ui,
+                    "Watertight",
+                    if watertight {
+                        "yes · closed manifold surface"
+                    } else {
+                        "no · open or non-manifold edges"
+                    },
+                    if watertight { SUCCESS } else { WARN },
+                );
+                diag(
+                    ui,
+                    "Defects",
+                    &format!(
+                        "{} degenerate · {} open · {} non-manifold · {} winding · {} intersections",
+                        case.workflow.preflight.degenerate_triangles,
+                        case.workflow.preflight.boundary_edges,
+                        case.workflow.preflight.non_manifold_edges,
+                        case.workflow.preflight.inconsistent_winding_edges,
+                        case.workflow.preflight.self_intersection_pairs
+                    ),
+                    if case.workflow.preflight.degenerate_triangles == 0
+                        && case.workflow.preflight.inconsistent_winding_edges == 0
+                        && case.workflow.preflight.self_intersection_pairs == 0
+                        && watertight
+                    {
+                        SUCCESS
+                    } else {
+                        WARN
+                    },
+                );
+                diag(
+                    ui,
+                    "Source winding",
+                    &format!(
+                        "signed volume {:+.6e} source³ · {}",
+                        case.workflow.preflight.source_signed_volume,
+                        if case.workflow.preflight.source_signed_volume < 0.0 {
+                            "inward source orientation; mask-gradient loads unaffected"
+                        } else {
+                            "outward source orientation"
+                        }
+                    ),
+                    if case.workflow.preflight.inconsistent_winding_edges == 0 {
+                        TEXT_DIM
+                    } else {
+                        DANGER
+                    },
+                );
+                diag(
+                    ui,
+                    "Grid",
+                    &format!("{}³", case.workflow.preflight.target_grid),
+                    BRAND,
+                );
+                diag(
+                    ui,
+                    "Proposed scale",
+                    &format!("{:.6}", case.workflow.preflight.proposed_scale),
+                    TEXT_DIM,
+                );
+                diag(
+                    ui,
+                    "Solver characteristic length",
+                    &format!(
+                        "{:.6} solver units",
+                        case.workflow.preflight.solver_characteristic_length
+                    ),
+                    TEXT_DIM,
+                );
+                diag(
+                    ui,
+                    "Voxel adequacy",
+                    &format!(
+                        "{} solid · {}-cell resolved core · {} cells clear",
+                        case.workflow.preflight.solid_voxels,
+                        case.workflow.preflight.minimum_cells_across,
+                        case.workflow.preflight.boundary_clearance_cells
+                    ),
+                    TEXT_DIM,
+                );
+                diag(
+                    ui,
+                    "Axis agreement",
+                    &format!(
+                        "{:.2}% disagree · odd rows X/Y/Z {} / {} / {} · classifier v{}",
+                        case.workflow.preflight.voxel_axis_disagreement_fraction * 100.0,
+                        case.workflow.preflight.voxel_odd_crossing_rows[0],
+                        case.workflow.preflight.voxel_odd_crossing_rows[1],
+                        case.workflow.preflight.voxel_odd_crossing_rows[2],
+                        case.workflow.preflight.voxel_classification_version,
+                    ),
+                    if case.workflow.preflight.voxel_axis_disagreement_fraction
+                        <= engineering::GeometryPreflight::MAX_AXIS_DISAGREEMENT_FRACTION
+                    {
+                        SUCCESS
+                    } else {
+                        DANGER
+                    },
+                );
+                ui.collapsing("Preprocessing transform 4×4", |ui| {
+                    for row in 0..4 {
+                        ui.label(
+                            RichText::new(format!(
+                                "{:>10.5} {:>10.5} {:>10.5} {:>10.5}",
+                                case.workflow.preflight.transform_4x4[row],
+                                case.workflow.preflight.transform_4x4[4 + row],
+                                case.workflow.preflight.transform_4x4[8 + row],
+                                case.workflow.preflight.transform_4x4[12 + row],
+                            ))
+                            .text_style(mono_s())
+                            .color(TEXT_MUTE),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+                for warning in &case.workflow.preflight.warnings {
+                    ui.label(
+                        RichText::new(format!("NOTICE · {warning}"))
+                            .text_style(caption())
+                            .color(WARN),
+                    );
+                }
+            },
+        );
+        ui.add_space(4.0);
+        // Body attitude. The model's free stream is fixed on +X and cannot be
+        // rotated, so attitude is applied to the geometry before voxelization.
+        let applied_orientation = case.workflow.preflight.body_orientation_degrees();
+        let mut draft = self.orientation_draft.unwrap_or(applied_orientation);
+        let mut apply_orientation = false;
+        let mut reset_orientation = false;
+        let orientation_open =
+            !case.workflow.preflight.body_is_aligned() || self.orientation_draft.is_some();
+        inspector_group(
+            ui,
+            "case-body-orientation",
+            "Body orientation",
+            orientation_open,
+            |ui| {
                 ui.label(
-                    RichText::new(format!("NOTICE · {warning}"))
+                RichText::new(
+                    "The free stream is fixed on +X, so attitude is applied by rotating the body before voxelization — exactly what is computed. Angles are recorded in the case revision and folded into the preprocessing transform.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+                ui.add_space(8.0);
+                let angle_row = |ui: &mut egui::Ui, label: &str, hint: &str, value: &mut f64| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).text_style(caption()).color(TEXT_MUTE))
+                            .on_hover_text(hint);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::DragValue::new(value)
+                                    .speed(0.25)
+                                    .range(-180.0..=180.0)
+                                    .fixed_decimals(2)
+                                    .suffix("°"),
+                            )
+                            .on_hover_text(hint);
+                        });
+                    });
+                };
+                angle_row(
+                    ui,
+                    "Angle of attack α",
+                    "Nose-up pitch about +Y. Positive α lifts the nose into the +X stream.",
+                    &mut draft[0],
+                );
+                angle_row(
+                    ui,
+                    "Yaw β",
+                    "Sideslip about +Z. Positive β swings the nose toward +Y.",
+                    &mut draft[1],
+                );
+                angle_row(
+                    ui,
+                    "Roll φ",
+                    "Bank about the +X stream axis.",
+                    &mut draft[2],
+                );
+                ui.add_space(4.0);
+                diag(
+                    ui,
+                    "Applied",
+                    &case.workflow.preflight.body_orientation_summary(),
+                    if case.workflow.preflight.body_is_aligned() {
+                        TEXT_DIM
+                    } else {
+                        BRAND
+                    },
+                );
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Coefficient frame").color(TEXT_DIM));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(mono("wind axes · fixed stream", TEXT_DIM)).truncate(),
+                        )
+                        .on_hover_text(engineering::COEFFICIENT_REFERENCE_FRAME);
+                    });
+                });
+                // The auto-fit sizes the rotated silhouette into the training band,
+                // so a pitched body lands at a different solver scale. Say so here
+                // rather than letting the preflight number change silently.
+                ui.label(
+                RichText::new(
+                    "Applying an attitude refits the rotated silhouette into the trained size band, so the proposed scale above changes with it.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+                ui.add_space(7.0);
+                let dirty = draft
+                    .iter()
+                    .zip(applied_orientation.iter())
+                    .any(|(next, current)| (next - current).abs() > 1e-9);
+                let request_matches_draft = orientation_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.angles == draft);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                let apply = ui.add_enabled(
+                    dirty && !request_matches_draft,
+                    egui::Button::new(if orientation_pending.is_some() && !request_matches_draft {
+                        "Apply newer orientation"
+                    } else {
+                        "Apply orientation"
+                    }),
+                );
+                apply_orientation = apply.clicked();
+                if request_matches_draft {
+                    apply.on_disabled_hover_text(
+                        "These exact angles are already re-voxelizing. Completion will wake the UI.",
+                    );
+                } else if dirty {
+                    apply.on_hover_text(
+                        "Re-voxelize the body at this attitude. Re-opens transform approval and clears any result.",
+                    );
+                } else {
+                    apply.on_hover_text("These angles are already applied to the voxel mask.");
+                }
+                if !case.workflow.preflight.body_is_aligned() || dirty {
+                    reset_orientation = ui
+                        .button("Level")
+                        .on_hover_text("Return the body to its imported attitude (0°, 0°, 0°).")
+                        .clicked();
+                }
+            });
+                if dirty {
+                    ui.label(
+                        RichText::new(
+                            if request_matches_draft {
+                                "RE-VOXELIZING · these angles are not in the mask until this request completes."
+                            } else if orientation_pending.is_some() {
+                                "PENDING · these edited angles are not queued. Apply to supersede the in-flight generation."
+                            } else {
+                                "PENDING · these angles are not in the mask yet. Apply to re-voxelize."
+                            },
+                        )
                         .text_style(caption())
                         .color(WARN),
-                );
+                    );
+                }
+            },
+        );
+        if reset_orientation {
+            draft = [0.0; 3];
+            apply_orientation = true;
+        }
+        let next_orientation_draft = (draft != applied_orientation).then_some(draft);
+        if self.orientation_draft != next_orientation_draft {
+            if self.orientation_draft.is_none() && next_orientation_draft.is_some() {
+                schedule_orientation_autosave = !had_unsaved_work;
             }
-        });
+            self.orientation_draft = next_orientation_draft;
+        }
         ui.add_space(10.0);
         card(ui, |ui| {
             ui.label(caps("Operating point"));
@@ -1462,6 +3713,9 @@ impl ReynApp {
                                 scenario: model.scenario.clone(),
                                 physics_contract: model.physics_contract.clone(),
                             };
+                            // Model hashes are immutable identity, not undo
+                            // payload. Rebase draft history at this boundary.
+                            identity_changed = true;
                             changed = true;
                         }
                     }
@@ -1507,21 +3761,25 @@ impl ReynApp {
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut case.workflow.operating.reference_length)
-                        .speed(0.01)
-                        .range(1e-9..=1e9)
-                        .suffix(format!(" {}", case.workflow.operating.length_unit.symbol())),
-                )
-                .changed();
+            let response = ui.add(
+                egui::DragValue::new(&mut case.workflow.operating.reference_length)
+                    .speed(0.01)
+                    .range(1e-9..=1e9)
+                    .suffix(format!(" {}", case.workflow.operating.length_unit.symbol())),
+            );
+            track_case_edit_response(
+                &response,
+                CaseEditTransaction::ReferenceLength,
+                &mut changed,
+                &mut changed_transaction,
+                &mut active_transaction,
+            );
             // Preflight suggestion: the largest cross-flow extent (the frontal
             // dimensions for a +X free stream), stated with its rationale.
             let suggested_reference = case.workflow.preflight.source_extents[1]
                 .max(case.workflow.preflight.source_extents[2]);
             if suggested_reference > 0.0
-                && (case.workflow.operating.reference_length - suggested_reference).abs()
-                    > 1e-12
+                && (case.workflow.operating.reference_length - suggested_reference).abs() > 1e-12
             {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -1537,6 +3795,74 @@ impl ReynApp {
                         changed = true;
                     }
                 });
+            }
+            ui.separator();
+            ui.label(caps("Starting defaults"));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Case template")
+                    .text_style(caption())
+                    .color(TEXT_MUTE),
+            );
+            egui::ComboBox::from_id_salt("engineering.case-template")
+                .selected_text("Apply template…")
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    let templates = self.settings.case_templates.clone();
+                    if templates.is_empty() {
+                        ui.label(
+                            RichText::new("No saved templates · create one below")
+                                .text_style(caption())
+                                .color(TEXT_MUTE),
+                        );
+                    }
+                    for template in templates {
+                        let availability = template.validate();
+                        let response = ui.add_enabled(
+                            availability.is_ok(),
+                            egui::Button::selectable(false, &template.name),
+                        );
+                        if response.clicked() {
+                            match template.apply_to(
+                                &mut case.workflow.operating,
+                                case.workflow.model_max_steps,
+                            ) {
+                                Ok(operating_changed) => {
+                                    changed |= operating_changed;
+                                    let preferred = template.preferred_view;
+                                    template_view_changed |= self.section_axis
+                                        != preferred.section_axis
+                                        || self.section_quantity != preferred.section_quantity;
+                                    self.section_axis = preferred.section_axis;
+                                    self.section_quantity = preferred.section_quantity;
+                                    self.template_notice = Some((
+                                        format!(
+                                            "Template “{}” applied to this draft. Readiness gates remain active.",
+                                            template.name
+                                        ),
+                                        false,
+                                    ));
+                                }
+                                Err(error) => {
+                                    self.template_notice =
+                                        Some((format!("Template was not applied: {error}"), true));
+                                }
+                            }
+                        }
+                        if let Err(error) = availability {
+                            response.on_disabled_hover_text(error);
+                        }
+                    }
+                });
+            if let Some((message, is_error)) = &self.template_notice {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(message)
+                            .text_style(caption())
+                            .color(if *is_error { WARN } else { SUCCESS }),
+                    )
+                    .wrap(),
+                );
             }
             ui.label(
                 RichText::new("Operating preset")
@@ -1562,12 +3888,15 @@ impl ReynApp {
                         }
                     }
                 });
+            ui.separator();
+            ui.label(caps("Operating values"));
+            ui.add_space(4.0);
             ui.label(
                 RichText::new("Free-stream speed")
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            changed |= unit_value_input(
+            let response = unit_value_input(
                 ui,
                 "engineering.unit.velocity",
                 &mut case.workflow.operating.velocity,
@@ -1575,12 +3904,19 @@ impl ReynApp {
                 0.1,
                 1e-6..=1e5,
             );
+            track_case_edit_response(
+                &response,
+                CaseEditTransaction::Velocity,
+                &mut changed,
+                &mut changed_transaction,
+                &mut active_transaction,
+            );
             ui.label(
                 RichText::new("Density")
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            changed |= unit_value_input(
+            let response = unit_value_input(
                 ui,
                 "engineering.unit.density",
                 &mut case.workflow.operating.density,
@@ -1588,12 +3924,19 @@ impl ReynApp {
                 0.001,
                 1e-9..=1e5,
             );
+            track_case_edit_response(
+                &response,
+                CaseEditTransaction::Density,
+                &mut changed,
+                &mut changed_transaction,
+                &mut active_transaction,
+            );
             ui.label(
                 RichText::new("Dynamic viscosity")
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            changed |= unit_value_input(
+            let response = unit_value_input(
                 ui,
                 "engineering.unit.viscosity",
                 &mut case.workflow.operating.viscosity,
@@ -1601,12 +3944,19 @@ impl ReynApp {
                 1e-6,
                 1e-12..=1e3,
             );
+            track_case_edit_response(
+                &response,
+                CaseEditTransaction::Viscosity,
+                &mut changed,
+                &mut changed_transaction,
+                &mut active_transaction,
+            );
             ui.label(
                 RichText::new("Reference pressure")
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            changed |= unit_value_input(
+            let response = unit_value_input(
                 ui,
                 "engineering.unit.pressure",
                 &mut case.workflow.operating.reference_pressure,
@@ -1614,20 +3964,32 @@ impl ReynApp {
                 10.0,
                 0.0..=1e9,
             );
+            track_case_edit_response(
+                &response,
+                CaseEditTransaction::ReferencePressure,
+                &mut changed,
+                &mut changed_transaction,
+                &mut active_transaction,
+            );
             ui.label(
                 RichText::new("Prediction horizon")
                     .text_style(caption())
                     .color(TEXT_MUTE),
             );
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut case.workflow.operating.horizon_steps,
-                        1..=case.workflow.model_max_steps.max(1),
-                    )
-                    .suffix(" steps"),
+            let response = ui.add(
+                egui::Slider::new(
+                    &mut case.workflow.operating.horizon_steps,
+                    1..=case.workflow.model_max_steps.max(1),
                 )
-                .changed();
+                .suffix(" steps"),
+            );
+            track_case_edit_response(
+                &response,
+                CaseEditTransaction::Horizon,
+                &mut changed,
+                &mut changed_transaction,
+                &mut active_transaction,
+            );
             let reynolds = case.workflow.operating.reynolds();
             diag(
                 ui,
@@ -1660,16 +4022,35 @@ impl ReynApp {
                 TEXT_DIM,
             );
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.preset_name_draft)
-                        .hint_text("Preset name")
-                        .desired_width((ui.available_width() - 100.0).max(80.0)),
-                );
-                let named = !self.preset_name_draft.trim().is_empty();
-                if ui
+            inspector_group(
+                ui,
+                "case-save-defaults",
+                "Save defaults for reuse",
+                false,
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Presets store the fluid state and speed. Portable case templates also store the horizon and preferred section view. Neither can include geometry, identity, waivers, runs, or evidence.",
+                            )
+                            .text_style(caption())
+                            .color(TEXT_MUTE),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.preset_name_draft)
+                                .hint_text("Preset name")
+                                .desired_width((ui.available_width() - 100.0).max(80.0)),
+                        );
+                        let named = !self.preset_name_draft.trim().is_empty();
+                        if ui
                     .add_enabled(named, egui::Button::new("Save preset"))
-                    .on_hover_text("Save this fluid state and speed as a named preset (Settings › Workflow)")
+                    .on_hover_text(
+                        "Save this fluid state and speed as a named preset (Settings › Workflow)",
+                    )
                     .clicked()
                 {
                     let name = self.preset_name_draft.trim().to_string();
@@ -1684,22 +4065,82 @@ impl ReynApp {
                         .operating_presets
                         .retain(|existing| existing.name != name);
                     self.settings.operating_presets.push(preset);
-                    self.settings_draft.operating_presets =
-                        self.settings.operating_presets.clone();
+                    self.settings_draft.operating_presets = self.settings.operating_presets.clone();
                     self.preset_notice = Some(match self.settings.save() {
                         Ok(_) => (format!("Preset \u{201c}{name}\u{201d} saved."), false),
                         Err(error) => (format!("Preset was not saved: {error}"), true),
                     });
                     self.preset_name_draft.clear();
                 }
-            });
-            if let Some((message, is_error)) = &self.preset_notice {
-                ui.label(
-                    RichText::new(message)
-                        .text_style(caption())
-                        .color(if *is_error { WARN } else { SUCCESS }),
+                    });
+                    if let Some((message, is_error)) = &self.preset_notice {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(message)
+                                    .text_style(caption())
+                                    .color(if *is_error { WARN } else { SUCCESS }),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    ui.separator();
+                    ui.label(
+                RichText::new(
+                    "Save a reusable case template · SI operating defaults + preferred section view",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+                    ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.template_name_draft)
+                        .hint_text("Template name")
+                        .desired_width((ui.available_width() - 112.0).max(80.0)),
                 );
-            }
+                let named = !self.template_name_draft.trim().is_empty();
+                if ui
+                    .add_enabled(named, egui::Button::new("Save template"))
+                    .on_hover_text(
+                        "Save defaults only. Geometry, model identity, transforms, waivers, runs, and evidence are excluded.",
+                    )
+                    .clicked()
+                {
+                    let name = self.template_name_draft.trim().to_owned();
+                    let template = settings::CaseTemplate::from_draft(
+                        &name,
+                        &case.workflow.operating,
+                        self.section_axis,
+                        self.section_quantity,
+                    );
+                    let mut candidate = self.settings.clone();
+                    self.template_notice = Some(match candidate.upsert_case_template(template) {
+                        Ok(()) => match candidate.save() {
+                            Ok(_) => {
+                                self.settings = candidate;
+                                self.settings_draft.case_templates =
+                                    self.settings.case_templates.clone();
+                                (
+                                    format!(
+                                        "Template “{name}” saved. Export it from Settings › Workflow."
+                                    ),
+                                    false,
+                                )
+                            }
+                            Err(error) => (format!("Template was not saved: {error}"), true),
+                        },
+                        Err(error) => (format!("Template was not saved: {error}"), true),
+                    });
+                    if self
+                        .template_notice
+                        .as_ref()
+                        .is_some_and(|(_, is_error)| !*is_error)
+                    {
+                        self.template_name_draft.clear();
+                    }
+                }
+            });
+                },
+            );
         });
         ui.add_space(10.0);
         let issues = case.workflow.readiness_issues();
@@ -1775,37 +4216,73 @@ impl ReynApp {
         }
         ui.add_space(10.0);
         let running = case.pending;
-        let ready = case.workflow.ready() && !running;
-        if ui
-            .add_enabled(
-                ready,
-                egui::Button::new(
-                    RichText::new(if running {
-                        "Running…"
-                    } else {
-                        "Run qualified analysis"
-                    })
-                    .color(ON_EMBER),
-                )
-                .fill(EMBER),
+        let orientation_run_gate = orientation_geometry_gate(
+            "Starting a new run",
+            self.orientation_draft,
+            self.orientation_pending.as_ref(),
+        );
+        let ready = case.workflow.ready() && !running && orientation_run_gate.is_none();
+        let mut run = ui.add_enabled(
+            ready,
+            egui::Button::new(
+                RichText::new(if running {
+                    "Running…"
+                } else {
+                    "Run qualified analysis"
+                })
+                .color(ON_EMBER),
             )
-            .clicked()
-        {
-            self.run_external_flow();
+            .fill(EMBER),
+        );
+        if let Some(reason) = &orientation_run_gate {
+            run = run.on_disabled_hover_text(reason);
         }
+        let run_requested = run.clicked();
+        let draft_after = engineering::CaseDraftSnapshot::capture(&case.workflow);
         if changed {
+            if identity_changed {
+                self.mark_case_draft_dirty();
+                self.rebase_case_draft_history();
+            } else {
+                self.record_case_draft_change(
+                    draft_before,
+                    draft_after,
+                    changed_transaction,
+                    active_transaction,
+                );
+            }
             self.invalidate_active_case_result();
             self.project_notice = Some((
                 "Case contract changed. Completed runs remain immutable; the draft requires a new run."
                     .into(),
                 false,
             ));
+        } else if self.case_edit_transaction != active_transaction {
+            // A focus/drag transition with no value change ends the prior
+            // coalescing transaction without pre-opening a new one.
+            self.case_edit_transaction = None;
+        }
+        if run_requested {
+            self.run_external_flow();
+        }
+        if template_view_changed {
+            self.invalidate_cad_section();
+        }
+        if apply_orientation {
+            self.apply_body_orientation(draft);
+        }
+        if cancel_run {
+            self.cancel_external_flow();
         }
         self.waiver_draft = waiver_draft;
         self.waiver_code = waiver_code;
+        if schedule_orientation_autosave {
+            self.schedule_autosave_from_now();
+        }
     }
 
     fn controls_engineering_results(&mut self, ui: &mut egui::Ui) {
+        self.engineering_notice(ui);
         let comparison = self.cad.as_ref().and_then(|active| {
             let case = self
                 .project
@@ -1916,6 +4393,22 @@ impl ReynApp {
         let mut copied_summary = false;
         card(ui, |ui| {
             ui.label(caps("Loads & derived quantities"));
+            // The frame is part of the number: state it before the values.
+            ui.label(
+                RichText::new(engineering::COEFFICIENT_REFERENCE_FRAME)
+                    .text_style(caption())
+                    .color(TEXT_MUTE),
+            );
+            if !case.workflow.preflight.body_is_aligned() {
+                ui.label(
+                    RichText::new(format!(
+                        "Body held at {} — the geometry is rotated, these axes are not.",
+                        case.workflow.preflight.body_orientation_summary()
+                    ))
+                    .text_style(caption())
+                    .color(GOLD),
+                );
+            }
             ui.add_space(8.0);
             let fmt = |value: f64| units::format_value(value, value_format);
             let vector = |si: [f64; 3], quantity: units::Quantity| -> (String, &'static str) {
@@ -1939,7 +4432,7 @@ impl ReynApp {
                 "Cd · drag (+X)",
                 &fmt(result.force_coefficients[0]),
                 "–",
-                "MODEL",
+                "DERIVED",
                 BRAND,
             )
             .on_hover_text("Streamwise force coefficient; +X is the free-stream direction.");
@@ -1948,7 +4441,7 @@ impl ReynApp {
                 "Cs · side (+Y)",
                 &fmt(result.force_coefficients[1]),
                 "–",
-                "MODEL",
+                "DERIVED",
                 BRAND,
             );
             measure_row(
@@ -1956,11 +4449,11 @@ impl ReynApp {
                 "Cl · vertical (+Z)",
                 &fmt(result.force_coefficients[2]),
                 "–",
-                "MODEL",
+                "DERIVED",
                 BRAND,
             );
             let (force_text, force_unit) = vector(result.force_newtons, units::Quantity::Force);
-            measure_row(ui, "Fluid force", &force_text, force_unit, "MODEL", BRAND);
+            measure_row(ui, "Fluid force", &force_text, force_unit, "DERIVED", BRAND);
             measure_row(
                 ui,
                 "Moment coefficients",
@@ -1971,7 +4464,7 @@ impl ReynApp {
                     fmt(result.moment_coefficients[2])
                 ),
                 "–",
-                "MODEL",
+                "DERIVED",
                 BRAND,
             );
             let (moment_text, moment_unit) =
@@ -1981,17 +4474,17 @@ impl ReynApp {
                 "Fluid moment · surface centroid",
                 &moment_text,
                 moment_unit,
-                "MODEL",
+                "DERIVED",
                 BRAND,
             );
-            // Cp keeps its recovered-pressure honesty (N5X-PHYS-01): the
+            // Cp is derived from recovered pressure (N5X-PHYS-01): the
             // nondimensionalization note sits on hover, one disclosure away.
             measure_row(
                 ui,
                 "Cp range",
                 &format!("{} … {}", fmt(result.cp_min), fmt(result.cp_max)),
                 "–",
-                "RECOVERED",
+                "DERIVED",
                 GOLD,
             )
             .on_hover_text(
@@ -2005,7 +4498,7 @@ impl ReynApp {
                 "Diffuse surface area",
                 &fmt(area_value),
                 area_unit,
-                "MODEL",
+                "DERIVED",
                 TEXT_DIM,
             );
             measure_row(
@@ -2013,7 +4506,7 @@ impl ReynApp {
                 "Pressure share · component norms",
                 &format!("{:.1}", result.pressure_force_fraction * 100.0),
                 "%",
-                "MODEL",
+                "DERIVED",
                 TEXT_DIM,
             );
             measure_row(
@@ -2021,7 +4514,7 @@ impl ReynApp {
                 "Divergence RMS",
                 &format!("{:.3e}", result.divergence_rms),
                 "–",
-                "MODEL",
+                "DERIVED",
                 TEXT_DIM,
             );
             measure_row(
@@ -2033,7 +4526,7 @@ impl ReynApp {
                     fmt(result.wake_deficit_mean)
                 ),
                 "–",
-                "MODEL",
+                "DERIVED",
                 TEXT_DIM,
             );
         });
@@ -2107,9 +4600,10 @@ impl ReynApp {
             }
         });
         if copied_summary {
-            self.project_notice =
-                Some(("Results summary copied to the clipboard.".into(), false));
+            self.project_notice = Some(("Results summary copied to the clipboard.".into(), false));
         }
+        ui.add_space(12.0);
+        self.horizon_playback_card(ui);
         if let Some((parent_run_id, current_run_id, rows)) = comparison {
             ui.add_space(12.0);
             card(ui, |ui| {
@@ -2284,29 +4778,32 @@ impl ReynApp {
             );
         });
         ui.add_space(12.0);
-        if ui.button("Create Operating-Point Variant").clicked() {
+        if ui
+            .add_enabled(
+                !self.project.availability().is_read_only_evidence(),
+                egui::Button::new("Create Operating-Point Variant"),
+            )
+            .on_disabled_hover_text(
+                "Case variants are blocked while the project is in read-only evidence mode.",
+            )
+            .clicked()
+            && !self.reject_project_mutation("Creating an operating-point variant")
+        {
             self.invalidate_active_case_result();
+            self.rebase_case_draft_history();
             self.nav = Nav::Case;
         }
         // §4.4: one quiet export entry point; the disabled item explains
         // itself (UX-AC-01) instead of disappearing.
         let mut export_fea = false;
+        let mut export_field = false;
         let mut export_report = false;
         let mut export_section = false;
         let mut export_viewport = false;
         let has_section = !self.volumetric && self.section_data.is_some();
-        ui.menu_button("Export…", |ui| {
-            if ui
-                .add_enabled(
-                    can_export_fea,
-                    egui::Button::new("Surface loads for FEA (CSV)…"),
-                )
-                .on_disabled_hover_text("A durable immutable run is required for provenance.")
-                .clicked()
-            {
-                export_fea = true;
-                ui.close();
-            }
+        ui.menu_button("Export evidence…", |ui| {
+            ui.label(overline_text("Immutable run artifacts"));
+            ui.add_space(4.0);
             if ui
                 .add_enabled(
                     can_export_fea,
@@ -2322,6 +4819,35 @@ impl ReynApp {
                 export_report = true;
                 ui.close();
             }
+            if ui
+                .add_enabled(
+                    can_export_fea,
+                    egui::Button::new("Surface loads for FEA (CSV)…"),
+                )
+                .on_disabled_hover_text("A durable immutable run is required for provenance.")
+                .clicked()
+            {
+                export_fea = true;
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    can_export_fea,
+                    egui::Button::new("Full field evidence (VTK)…"),
+                )
+                .on_disabled_hover_text("A durable immutable run is required for provenance.")
+                .on_hover_text(
+                    "ParaView-readable structured grid in the approved source frame: velocity, \
+                     recovered pressure, Cp, fluid traction, occupancy, and provenance.",
+                )
+                .clicked()
+            {
+                export_field = true;
+                ui.close();
+            }
+            ui.separator();
+            ui.label(overline_text("Current view"));
+            ui.add_space(4.0);
             if ui
                 .add_enabled(has_section, egui::Button::new("Section view (PNG)…"))
                 .on_disabled_hover_text("Open a 2D section in Results first.")
@@ -2341,6 +4867,9 @@ impl ReynApp {
         });
         if export_fea {
             self.export_fea_loads();
+        }
+        if export_field {
+            self.export_vtk_field();
         }
         if export_report {
             self.export_engineering_report();
@@ -2389,7 +4918,18 @@ impl ReynApp {
             selected_evidence_id,
             selected_view_id: None,
         };
-        match self.project.transact(now_utc_unix(), |manifest| {
+        if self.project.availability().is_read_only_evidence() {
+            self.review_selection = Some(selection);
+            self.hydrate_project_runtime();
+            self.project_notice = Some((
+                "Opened immutable run evidence with a session-only review selection; the read-only project was not changed."
+                    .into(),
+                false,
+            ));
+            return;
+        }
+        self.review_selection = None;
+        match self.transact_project("Selecting an immutable run", now_utc_unix(), |manifest| {
             manifest.set_selection(selection, now_utc_unix())
         }) {
             Ok(()) => self.hydrate_project_runtime(),
@@ -2410,7 +4950,9 @@ impl ReynApp {
                 .color(TEXT_MUTE),
         );
         ui.add_space(14.0);
+        self.engineering_notice(ui);
         if let Some(case) = &self.cad {
+            let has_persisted_run = case.active_run_id.is_some();
             card(ui, |ui| {
                 diag(
                     ui,
@@ -2448,16 +4990,47 @@ impl ReynApp {
                 );
             });
             ui.add_space(10.0);
-            if ui
-                .add_enabled(
-                    case.active_run_id.is_some(),
-                    egui::Button::new("Export surface loads for FEA…"),
-                )
-                .on_disabled_hover_text("A durable immutable run is required for provenance.")
-                .clicked()
-            {
+            let mut export_report = false;
+            let mut export_fea = false;
+            let mut export_field = false;
+            let export_menu = ui.add_enabled_ui(has_persisted_run, |ui| {
+                ui.menu_button("Export evidence…", |ui| {
+                    ui.label(overline_text("Immutable run artifacts"));
+                    ui.add_space(4.0);
+                    if ui.button("Engineering report (HTML)…").clicked() {
+                        export_report = true;
+                        ui.close();
+                    }
+                    if ui.button("Surface loads for FEA (CSV)…").clicked() {
+                        export_fea = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button("Full field evidence (VTK)…")
+                        .on_hover_text(
+                            "ParaView-readable structured grid in the approved source frame; \
+                             previews and draft fields are never used.",
+                        )
+                        .clicked()
+                    {
+                        export_field = true;
+                        ui.close();
+                    }
+                });
+            });
+            export_menu
+                .response
+                .on_disabled_hover_text("A durable immutable run is required for provenance.");
+            if export_report {
+                self.export_engineering_report();
+            }
+            if export_fea {
                 self.export_fea_loads();
             }
+            if export_field {
+                self.export_vtk_field();
+            }
+            ui.add_space(4.0);
             if ui.button("Save project").clicked() {
                 self.save_project_dialog();
             }
@@ -2506,24 +5079,29 @@ impl ReynApp {
                         display_text(&case.workflow.name),
                     );
                     ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · source revision {} · case revision {}",
-                            case.workflow.source_name,
-                            case.workflow
-                                .source_revision_id
-                                .as_deref()
-                                .map(short_id)
-                                .unwrap_or_else(|| "unknown".into()),
-                            case.workflow
-                                .case_revision_id
-                                .as_deref()
-                                .map(short_id)
-                                .unwrap_or_else(|| "unknown".into())
-                        ))
-                        .text_style(mono_s())
-                        .color(TEXT_MUTE),
+                    let lineage = format!(
+                        "{} · source revision {} · case revision {}",
+                        case.workflow.source_name,
+                        case.workflow
+                            .source_revision_id
+                            .as_deref()
+                            .map(short_id)
+                            .unwrap_or_else(|| "unknown".into()),
+                        case.workflow
+                            .case_revision_id
+                            .as_deref()
+                            .map(short_id)
+                            .unwrap_or_else(|| "unknown".into())
                     );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&lineage)
+                                .text_style(mono_s())
+                                .color(TEXT_MUTE),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(lineage);
                     ui.add_space(24.0);
                     self.case_stage_spine(ui);
                     ui.add_space(28.0);
@@ -2918,6 +5496,60 @@ impl ReynApp {
         );
     }
 
+    fn engineering_results_empty_view(&mut self, ui: &mut egui::Ui) {
+        let has_case = self.cad.is_some();
+        let (title, detail, action) = if has_case {
+            (
+                "No completed engineering result",
+                "This case has no current immutable run. Review the setup gates, then run the qualified case.",
+                "Review Case Setup",
+            )
+        } else {
+            (
+                "No engineering result",
+                "Start with a fixed-body STL. Results appear here only after the supported case completes.",
+                "Start in Case Setup",
+            )
+        };
+        let mut go_to_case = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            content_column(ui, CONTENT_MAX_WIDTH, |ui| {
+                ui.add_space(48.0);
+                ui.label(display_text("Engineering results"));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Applicability, physical loads, and source-labeled fields from an immutable run.",
+                    )
+                    .text_style(caption())
+                    .color(TEXT_MUTE),
+                );
+                ui.add_space(24.0);
+                card(ui, |ui| {
+                    ui.label(title_text(title));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(detail).text_style(caption()).color(TEXT_DIM),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(12.0);
+                    go_to_case = ui
+                        .add(
+                            egui::Button::new(RichText::new(action).color(ON_EMBER))
+                                .fill(EMBER)
+                                .min_size(Vec2::new(160.0, 34.0)),
+                        )
+                        .clicked();
+                });
+            });
+        });
+        if go_to_case {
+            self.nav = Nav::Case;
+        }
+    }
+
     fn engineering_evidence_view(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // One shared content column (§3.2, QA G3/G4).
@@ -2948,10 +5580,38 @@ impl ReynApp {
                         });
                         ui.add_space(14.0);
                     }
-                    let Some(case) = &self.cad else {
-                        ui.label(RichText::new("No active case.").color(TEXT_MUTE));
+                    if self.cad.is_none() {
+                        let mut go_to_case = false;
+                        card(ui, |ui| {
+                            ui.label(title_text("No case evidence yet"));
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Start an engineering case. Source and draft lineage appear here before the first run; immutable artifacts follow after completion.",
+                                    )
+                                    .text_style(caption())
+                                    .color(TEXT_DIM),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(12.0);
+                            go_to_case = ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Start in Case Setup").color(ON_EMBER),
+                                    )
+                                    .fill(EMBER)
+                                    .min_size(Vec2::new(160.0, 34.0)),
+                                )
+                                .clicked();
+                        });
+                        if go_to_case {
+                            self.nav = Nav::Case;
+                        }
                         return;
-                    };
+                    }
+                    let case = self.cad.as_ref().expect("checked above");
                     // Lineage as a scannable ledger (§4.5): level-0 rows,
                     // hairline separated — source → case revision → run →
                     // model hash. Hash rows truncate to 12 chars with the
@@ -3061,6 +5721,257 @@ impl ReynApp {
                     }
                     ui.add_space(28.0);
                 });
+        });
+    }
+
+    /// Reconstruct a neutral field export strictly from the selected persisted
+    /// run and its content-addressed field blob. The in-memory result view and
+    /// horizon-preview cache are deliberately not export inputs.
+    fn persisted_vtk_export(&self) -> Result<(String, vtk_export::VtkFieldExport), String> {
+        let run_id = self
+            .project
+            .manifest()
+            .selection()
+            .selected_run_id
+            .as_deref()
+            .ok_or_else(|| "Select a completed persisted engineering run first.".to_string())?;
+        if self
+            .cad
+            .as_ref()
+            .and_then(|case| case.active_run_id.as_deref())
+            != Some(run_id)
+        {
+            return Err(
+                "The visible field is not the selected persisted run; reopen that run before exporting evidence."
+                    .into(),
+            );
+        }
+        let (case_record, run) = self
+            .project
+            .manifest()
+            .cases()
+            .iter()
+            .find_map(|case| {
+                case.runs()
+                    .iter()
+                    .find(|run| run.run_id() == run_id)
+                    .map(|run| (case, run))
+            })
+            .ok_or_else(|| {
+                "The selected run is absent from the persisted run ledger.".to_string()
+            })?;
+        if !matches!(
+            run.state(),
+            project::LifecycleState::Complete | project::LifecycleState::EvidenceLocked
+        ) {
+            return Err(
+                "Neutral field evidence requires a completed persisted run; draft, running, stale, and failed runs are rejected."
+                    .into(),
+            );
+        }
+        let contract = &run.manifest().exact_contract;
+        let contract_kind = contract
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "The selected run has no persisted contract kind.".to_string())?;
+        if contract_kind != engineering::EXTERNAL_FLOW_CONTRACT {
+            return Err("Only completed external-flow fields can be exported to VTK.".into());
+        }
+        let source_revision_id = contract
+            .get("source_revision_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "The selected run has no persisted source revision.".to_string())?;
+        let contract_case_revision = contract
+            .get("case_revision_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "The selected run has no contract case revision.".to_string())?;
+        if contract_case_revision != run.case_revision_id() {
+            return Err(
+                "The selected run's contract and immutable ledger disagree on case revision."
+                    .into(),
+            );
+        }
+        let source_revision = self
+            .project
+            .manifest()
+            .source_revisions()
+            .iter()
+            .find(|source| source.source_revision_id == source_revision_id)
+            .ok_or_else(|| {
+                "The selected run's source revision is absent from the project manifest."
+                    .to_string()
+            })?;
+        let preflight: engineering::GeometryPreflight =
+            serde_json::from_value(contract.get("preflight").cloned().ok_or_else(|| {
+                "The selected run has no persisted geometry preflight.".to_string()
+            })?)
+            .map_err(|error| {
+                format!("The selected run's geometry preflight is malformed: {error}")
+            })?;
+        if !preflight.transform_approved {
+            return Err("The selected run does not carry an approved source transform.".into());
+        }
+        if !preflight
+            .source_sha256
+            .eq_ignore_ascii_case(&source_revision.content_sha256)
+        {
+            return Err(
+                "The selected run's preflight and source revision disagree on source SHA-256."
+                    .into(),
+            );
+        }
+        let operating: engineering::OperatingPoint = serde_json::from_value(
+            contract
+                .get("operating_point")
+                .cloned()
+                .ok_or_else(|| "The selected run has no persisted operating point.".to_string())?,
+        )
+        .map_err(|error| format!("The selected run's operating point is malformed: {error}"))?;
+        let meters_per_source_unit = operating.length_unit.meters_per_unit().ok_or_else(|| {
+            "The selected run has no canonical source-unit conversion.".to_string()
+        })?;
+
+        let model_sha256 = run
+            .manifest()
+            .model
+            .as_ref()
+            .and_then(|model| model.sha256.as_deref())
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                "The completed run has no canonical model SHA-256; it cannot become exported evidence."
+                    .to_string()
+            })?;
+        let contract_model_sha256 = contract
+            .pointer("/model/sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "The selected run contract has no model SHA-256.".to_string())?;
+        if !model_sha256.eq_ignore_ascii_case(contract_model_sha256) {
+            return Err(
+                "The selected run's contract and manifest disagree on model SHA-256.".into(),
+            );
+        }
+
+        let result_artifact = self
+            .project
+            .manifest()
+            .evidence_for_run(run_id)
+            .into_iter()
+            .rev()
+            .find(|artifact| {
+                artifact
+                    .metadata
+                    .get("schema")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(engineering::ENGINEERING_RESULT_SCHEMA)
+            })
+            .ok_or_else(|| {
+                "The completed run has no persisted engineering-result evidence.".to_string()
+            })?;
+        let summary = self.stored_artifact_snapshot(result_artifact)?;
+        if summary
+            .get("field_schema")
+            .and_then(serde_json::Value::as_str)
+            != Some(engineering::ENGINEERING_FIELD_SCHEMA)
+        {
+            return Err("The completed run's field schema is unsupported for VTK export.".into());
+        }
+        if summary.get("run_id").and_then(serde_json::Value::as_str) != Some(run_id) {
+            return Err(
+                "The engineering-result evidence does not identify the selected run.".into(),
+            );
+        }
+        let field_sha256 = summary
+            .get("field_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                "The completed run does not identify a persisted field artifact.".to_string()
+            })?;
+        if !run
+            .manifest()
+            .output_sha256
+            .iter()
+            .any(|digest| digest.eq_ignore_ascii_case(field_sha256))
+        {
+            return Err(
+                "The field artifact is not recorded among the immutable run outputs.".into(),
+            );
+        }
+        if self.project.content_state(field_sha256) != project::ContentState::Available {
+            return Err(
+                "The selected run's field artifact is missing or corrupt; the manifest remains reviewable but no field evidence can be exported."
+                    .into(),
+            );
+        }
+        let field_bytes = self
+            .project
+            .content_bytes(field_sha256)
+            .ok_or_else(|| "The verified field artifact became unavailable.".to_string())?;
+        let actual_field_sha256 = format!("{:x}", Sha256::digest(field_bytes));
+        if !actual_field_sha256.eq_ignore_ascii_case(field_sha256) {
+            return Err("The selected run's field artifact failed SHA-256 verification.".into());
+        }
+        let field = engineering::decode_engineering_field(field_bytes)?;
+        if field.n != preflight.target_grid {
+            return Err(format!(
+                "The persisted field grid {} does not match the approved {}³ discretization.",
+                field.n, preflight.target_grid
+            ));
+        }
+        let traction_method = summary
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .filter(|method| !method.trim().is_empty())
+            .ok_or_else(|| "The completed run has no recorded traction method.".to_string())?;
+        let export = vtk_export::VtkFieldExport {
+            field,
+            source_to_solver_transform_4x4: preflight.transform_4x4,
+            meters_per_source_unit,
+            transform_approved: preflight.transform_approved,
+            run_state: run.state(),
+            provenance: vtk_export::VtkFieldProvenance {
+                source_revision_id: source_revision_id.to_owned(),
+                case_revision_id: run.case_revision_id().to_owned(),
+                run_id: run_id.to_owned(),
+                model_sha256: model_sha256.to_owned(),
+                contract_kind: contract_kind.to_owned(),
+                field_sha256: field_sha256.to_owned(),
+                traction_method: traction_method.to_owned(),
+            },
+        };
+        let file_name = vtk_export::default_file_name(case_record.name(), run_id, model_sha256);
+        Ok((file_name, export))
+    }
+
+    fn export_vtk_field(&mut self) {
+        let (file_name, export) = match self.persisted_vtk_export() {
+            Ok(export) => export,
+            Err(error) => {
+                self.project_notice = Some((error, true));
+                return;
+            }
+        };
+        let points = export.field.n.saturating_pow(3);
+        let run_id = export.provenance.run_id.clone();
+        let Some(path) = self
+            .export_dialog(&file_name)
+            .add_filter("Legacy VTK StructuredGrid", &["vtk"])
+            .save_file()
+        else {
+            return;
+        };
+        self.project_notice = Some(match vtk_export::write_atomic(&path, &export) {
+            Ok(()) => (
+                format!(
+                    "Exported {points} source-frame field points from immutable run {} to {}.",
+                    short_id(&run_id),
+                    path.display()
+                ),
+                false,
+            ),
+            Err(error) => (format!("VTK field evidence was not written: {error}"), true),
         });
     }
 
@@ -3232,6 +6143,70 @@ impl ReynApp {
         });
     }
 
+    /// Dev/QA hook (REYN_STUDIO_IMPORT=path.stl): run the ordinary import after
+    /// a brief inventory wait. If no qualified model appears, the same
+    /// model-independent diagnostic preflight used by a hand-import is shown.
+    /// Failures surface as the normal import notice.
+    fn handle_qa_import(&mut self) {
+        const INVENTORY_WAIT_FRAMES: u32 = 30;
+        if self.qa_import_path.is_none() {
+            return;
+        }
+        if self.models.is_empty() {
+            self.qa_import_waited = self.qa_import_waited.saturating_add(1);
+            if self.qa_import_waited < INVENTORY_WAIT_FRAMES {
+                return;
+            }
+        }
+        let Some(path) = self.qa_import_path.take() else {
+            return;
+        };
+        eprintln!("REYN_STUDIO_IMPORT importing: {}", path.display());
+        self.import_cad_path(path);
+    }
+
+    /// Dev/QA hook (REYN_STUDIO_SHOT=path): once the UI has had a few frames
+    /// to settle, request a composited screenshot and write the full window
+    /// to the given path. Complements REYN_STUDIO_WINDOW/START_NAV and avoids
+    /// depending on OS screen-recording permission during visual audits.
+    fn handle_qa_shot(&mut self, ctx: &egui::Context) {
+        const SETTLE_FRAMES: u32 = 20;
+        let Some(path) = self.qa_shot_path.clone() else {
+            return;
+        };
+        ctx.request_repaint();
+        // A queued QA import has to land first, or the capture would show the
+        // pre-import screen. The settle window starts after it.
+        if self.qa_import_path.is_some() {
+            return;
+        }
+        self.qa_shot_frames = self.qa_shot_frames.saturating_add(1);
+        if self.qa_shot_frames < SETTLE_FRAMES {
+            return;
+        }
+        // Re-request every 30 frames: a request sent before the wgpu surface
+        // is fully ready can be dropped without an event.
+        if self.qa_shot_frames % 30 == SETTLE_FRAMES % 30 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+        let image = ctx.input(|input| {
+            input.events.iter().rev().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let Some(image) = image else { return };
+        self.qa_shot_path = None;
+        spawn_screenshot_write(
+            self.screenshot_result_tx.clone(),
+            ctx.clone(),
+            image,
+            None,
+            path,
+            ScreenshotWriteKind::Qa,
+        );
+    }
+
     /// Ask the windowing backend for a composited frame (includes the wgpu 3D
     /// pass) and save the current render-viewport region on arrival.
     fn request_viewport_png(&mut self, ctx: &egui::Context) {
@@ -3258,8 +6233,9 @@ impl ReynApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
     }
 
-    /// Consume a completed screenshot event: crop to the render viewport and
-    /// write the pending PNG.
+    /// Consume a completed screenshot event and transfer ownership to a worker.
+    /// Crop, RGBA conversion, PNG compression, and disk I/O stay off the UI
+    /// thread; completion wakes egui through the result channel.
     fn handle_screenshot_events(&mut self, ctx: &egui::Context) {
         if self.pending_viewport_shot.is_none() {
             return;
@@ -3275,18 +6251,36 @@ impl ReynApp {
             return;
         };
         let pixels_per_point = ctx.pixels_per_point();
-        let cropped = self
-            .last_render_rect
-            .map(|rect| image.region(&rect, Some(pixels_per_point)))
-            .unwrap_or_else(|| (*image).clone());
-        self.project_notice = Some(
-            match color_image_png_bytes(&cropped, 0)
-                .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()))
-            {
-                Ok(()) => (format!("Viewport exported to {}.", path.display()), false),
-                Err(error) => (format!("Viewport PNG failed: {error}"), true),
-            },
+        spawn_screenshot_write(
+            self.screenshot_result_tx.clone(),
+            ctx.clone(),
+            image,
+            self.last_render_rect.map(|rect| (rect, pixels_per_point)),
+            path,
+            ScreenshotWriteKind::Viewport,
         );
+    }
+
+    fn handle_screenshot_write_results(&mut self) {
+        while let Ok(completion) = self.screenshot_result_rx.try_recv() {
+            match completion.kind {
+                ScreenshotWriteKind::Viewport => {
+                    self.project_notice = Some(match completion.result {
+                        Ok(()) => (
+                            format!("Viewport exported to {}.", completion.path.display()),
+                            false,
+                        ),
+                        Err(error) => (format!("Viewport PNG failed: {error}"), true),
+                    });
+                }
+                ScreenshotWriteKind::Qa => match completion.result {
+                    Ok(()) => {
+                        eprintln!("REYN_STUDIO_SHOT written: {}", completion.path.display())
+                    }
+                    Err(error) => eprintln!("REYN_STUDIO_SHOT failed: {error}"),
+                },
+            }
+        }
     }
 
     /// Export the self-contained HTML engineering report for the active
@@ -3398,6 +6392,12 @@ impl ReynApp {
                         project_lifecycle::DeferredProjectAction::Quit,
                         ctx,
                     ),
+                    MenuCommand::UndoCaseEdit => {
+                        self.apply_case_history_action(CaseHistoryAction::Undo)
+                    }
+                    MenuCommand::RedoCaseEdit => {
+                        self.apply_case_history_action(CaseHistoryAction::Redo)
+                    }
                     MenuCommand::ResetControls => self.reset_controls(),
                     MenuCommand::ResetCamera => self.cam = viewport::Camera::default(),
                     MenuCommand::ToggleDimension => self.volumetric = !self.volumetric,
@@ -3422,7 +6422,20 @@ impl ReynApp {
                         }
                     }
                     MenuCommand::OpenDocs => {
-                        open_url(concat!("file://", env!("CARGO_MANIFEST_DIR"), "/PRD.md"));
+                        self.project_notice = Some(
+                            match resolve_docs_path().and_then(|path| {
+                                open_path(&path)?;
+                                Ok(path)
+                            }) {
+                                Ok(path) => (
+                                    format!("Opened local documentation from {}.", path.display()),
+                                    false,
+                                ),
+                                Err(error) => {
+                                    (format!("Documentation could not be opened: {error}"), true)
+                                }
+                            },
+                        );
                     }
                 },
                 MenuSignal::OpenRecent(path) => self.request_project_action(
@@ -3432,7 +6445,13 @@ impl ReynApp {
             }
         }
         let sync = MenuSyncState {
-            can_save: self.project.is_dirty() || self.project.path().is_none(),
+            can_save: self.has_unsaved_project_work() || self.project.path().is_none(),
+            can_undo_case_edit: self
+                .case_history_gate_reason(CaseHistoryAction::Undo)
+                .is_none(),
+            can_redo_case_edit: self
+                .case_history_gate_reason(CaseHistoryAction::Redo)
+                .is_none(),
             analysis_available: matches!(self.nav, Nav::Case | Nav::Results),
             sandbox_enabled: self.settings.developer_research_sandbox,
             sandbox_live: self.live,
@@ -3452,8 +6471,21 @@ impl ReynApp {
     /// truth for the top-bar Run button, the command palette, and anything
     /// else that gates on runnability (UX-AC-01: reasons, not dead controls).
     fn run_gate_reason(&self) -> Option<String> {
+        if let Some(reason) = project_mutation_rejection(
+            self.project.availability().access_mode,
+            "Starting a new run",
+        ) {
+            return Some(reason);
+        }
         if self.cad.as_ref().is_some_and(|case| case.pending) {
             return Some("An immutable run attempt is already in flight.".to_owned());
+        }
+        if let Some(reason) = orientation_geometry_gate(
+            "Starting a new run",
+            self.orientation_draft,
+            self.orientation_pending.as_ref(),
+        ) {
+            return Some(reason);
         }
         if !self.engine_ok {
             return Some(
@@ -3494,6 +6526,8 @@ impl ReynApp {
         // Build the gated entry list from live state.
         enum PaletteAction {
             Nav(Nav),
+            UndoCaseEdit,
+            RedoCaseEdit,
             Run,
             ImportGeometry,
             OpenProject,
@@ -3540,6 +6574,16 @@ impl ReynApp {
                 "Run analysis".into(),
                 PaletteAction::Run,
                 self.run_gate_reason(),
+            ),
+            (
+                "Undo last safe case-draft edit".into(),
+                PaletteAction::UndoCaseEdit,
+                self.case_history_gate_reason(CaseHistoryAction::Undo),
+            ),
+            (
+                "Redo last safe case-draft edit".into(),
+                PaletteAction::RedoCaseEdit,
+                self.case_history_gate_reason(CaseHistoryAction::Redo),
             ),
             (
                 "Import geometry (STL)…".into(),
@@ -3691,6 +6735,12 @@ impl ReynApp {
                         self.request_2d();
                     }
                 }
+                PaletteAction::UndoCaseEdit => {
+                    self.apply_case_history_action(CaseHistoryAction::Undo)
+                }
+                PaletteAction::RedoCaseEdit => {
+                    self.apply_case_history_action(CaseHistoryAction::Redo)
+                }
                 PaletteAction::Run => self.run_external_flow(),
                 PaletteAction::ImportGeometry => self.import_cad(),
                 PaletteAction::OpenProject => self.open_project_dialog(ctx),
@@ -3709,7 +6759,7 @@ impl ReynApp {
     /// identity + truthful dirty state, and the contextual run action. The
     /// bar itself is a window drag region.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let dirty = self.project.is_dirty();
+        let dirty = self.has_unsaved_project_work();
         let window_title = format!(
             "{}{} — Reyn Studio",
             self.project.display_name(),
@@ -3840,7 +6890,12 @@ impl ReynApp {
                         }
                         ui.add_space(14.0);
                         // 2D | 3D VOLUMETRIC segmented toggle (left-to-right order)
-                        if matches!(self.nav, Nav::Results | Nav::Metrics) {
+                        let has_result = self
+                            .cad
+                            .as_ref()
+                            .and_then(|case| case.workflow.result.as_ref())
+                            .is_some();
+                        if self.nav == Nav::Metrics || (self.nav == Nav::Results && has_result) {
                             // Concentric radii: thumb r-1 = 4 inside container
                             // r-2 = 6 with a 2px inset (§3.5).
                             Frame::NONE
@@ -3877,6 +6932,7 @@ impl ReynApp {
     /// long-operation progress, and the active model — replaces the floating
     /// engine pill that hovered over the viewport.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut cancel_run = false;
         let status_response = egui::Panel::bottom("status")
             .exact_size(24.0)
             .resizable(false)
@@ -3903,14 +6959,25 @@ impl ReynApp {
                         )
                         .on_hover_text(&self.engine_status);
                     });
-                    let busy = if self.cad.as_ref().is_some_and(|case| case.pending) {
-                        Some("◐ running immutable attempt…")
+                    // Elapsed time is the only honest progress an opaque single
+                    // pass can report, so the run says how long it has waited
+                    // rather than implying a fraction.
+                    let run_elapsed = self.cad.as_ref().filter(|case| case.pending).map(|case| {
+                        case.pending_run
+                            .as_ref()
+                            .map(|pending| pending.started_at.elapsed().as_secs_f64())
+                            .unwrap_or(0.0)
+                    });
+                    let busy = if let Some(elapsed) = run_elapsed {
+                        Some(format!(
+                            "◐ running immutable attempt · {elapsed:.0} s elapsed · no per-step progress reported"
+                        ))
                     } else if self.bench_running {
-                        Some("◐ benchmark suite running…")
+                        Some("◐ benchmark suite running…".to_owned())
                     } else if self.f2d_pending {
-                        Some("◐ 2D prediction pending…")
+                        Some("◐ 2D prediction pending…".to_owned())
                     } else if self.library.busy {
-                        Some("◐ checkpoint operation in progress…")
+                        Some("◐ model-bundle operation in progress…".to_owned())
                     } else {
                         None
                     };
@@ -3919,6 +6986,18 @@ impl ReynApp {
                         // Busy is passive status — WARN, never the ember
                         // action accent (QA C6).
                         ui.label(RichText::new(busy).text_style(mono_s()).color(WARN));
+                        if run_elapsed.is_some() {
+                            ui.add_space(8.0);
+                            cancel_run = ui
+                                .small_button("Cancel")
+                                .on_hover_text(
+                                    "Stop waiting for this run. The pass already under way in the engine cannot be interrupted, but its result is discarded on arrival and never becomes evidence.",
+                                )
+                                .clicked();
+                        }
+                        // The elapsed counter has to keep counting.
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(250));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
@@ -3948,6 +7027,9 @@ impl ReynApp {
             rect.top() + 0.5,
             Stroke::new(1.0, OUTLINE_VARIANT),
         );
+        if cancel_run {
+            self.cancel_external_flow();
+        }
     }
 
     /// Left rail (§4.1): project identity, then two visibly distinct groups —
@@ -3980,7 +7062,7 @@ impl ReynApp {
                 );
                 let (project_state, project_state_color) = if self.project.is_recovered() {
                     ("RECOVERED · UNSAVED", WARN)
-                } else if self.project.is_dirty() {
+                } else if self.has_unsaved_project_work() {
                     ("UNSAVED CHANGES", WARN)
                 } else if self.project.path().is_some() {
                     ("SAVED LOCALLY", SUCCESS)
@@ -4084,9 +7166,16 @@ impl ReynApp {
     }
 
     fn right_controls(&mut self, ui: &mut egui::Ui) {
-        // Model Library owns its whole screen (§4.6) — the 330px rail is
-        // dissolved into the screen's own toolbar and header.
-        if self.nav == Nav::Models {
+        let has_case = self.cad.is_some();
+        let has_result = self
+            .cad
+            .as_ref()
+            .and_then(|case| case.workflow.result.as_ref())
+            .is_some();
+        // Model Library owns its whole screen (§4.6). Empty Results/Evidence
+        // states do too: one composed center state is clearer than duplicate
+        // absence copy in a narrow, otherwise empty detail rail.
+        if !should_show_detail_rail(self.nav, has_case, has_result) {
             return;
         }
         let rail_response = egui::Panel::right("controls")
@@ -4227,10 +7316,19 @@ impl ReynApp {
                 &mut self.shadows,
                 RichText::new("Volumetric Shadows").color(TEXT_DIM),
             );
-            ui.checkbox(
-                &mut self.streamlines,
-                RichText::new("Show Streamlines").color(TEXT_DIM),
-            );
+            // HAZARD GATE (viewport::analytic_streamlines): these ribbons advect
+            // a closed-form demo field, never model velocity, so the control
+            // names that in place and renders only inside the sandbox.
+            ui.add_enabled_ui(self.is_research_sandbox(), |ui| {
+                ui.checkbox(
+                    &mut self.streamlines,
+                    RichText::new("Streamlines · analytic demo field").color(TEXT_DIM),
+                )
+                .on_hover_text(viewport::ANALYTIC_STREAMLINE_LABEL)
+                .on_disabled_hover_text(
+                    "Quarantined: the streamline overlay is not driven by model velocity, so it is unavailable outside the research sandbox.",
+                );
+            });
             ui.add_enabled_ui(self.volumetric, |ui| {
                 ui.checkbox(
                     &mut self.render_volume,
@@ -4309,7 +7407,12 @@ impl ReynApp {
                                     .color(DANGER),
                             );
                         }
-                        ui.label(RichText::new(message).text_style(caption()).color(TEXT_DIM));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(message).text_style(caption()).color(TEXT_DIM),
+                            )
+                            .wrap(),
+                        );
                     });
                 });
             ui.add_space(12.0);
@@ -4337,14 +7440,14 @@ impl ReynApp {
             );
             let state = if self.project.is_recovered() {
                 "RECOVERED · SAVE REQUIRED"
-            } else if self.project.is_dirty() {
+            } else if self.has_unsaved_project_work() {
                 "UNSAVED CHANGES"
             } else if self.project.path().is_some() {
                 "SAVED LOCALLY"
             } else {
                 "NO UNSAVED CHANGES"
             };
-            ui.label(chip_text(state).color(if self.project.is_dirty() {
+            ui.label(chip_text(state).color(if self.has_unsaved_project_work() {
                 WARN
             } else {
                 SUCCESS
@@ -4358,12 +7461,17 @@ impl ReynApp {
             ui.label(caps("Project identity"));
             ui.add_space(7.0);
             name_changed = ui
-                .add(
+                .add_enabled(
+                    !availability.is_read_only_evidence(),
                     egui::TextEdit::singleline(&mut self.project_name_draft)
                         .char_limit(120)
                         .desired_width(ui.available_width()),
                 )
-                .on_hover_text("Stored project name; edits create unsaved project metadata.")
+                .on_hover_text(if availability.is_read_only_evidence() {
+                    "Project identity is locked in read-only evidence mode."
+                } else {
+                    "Stored project name; edits create unsaved project metadata."
+                })
                 .changed();
             ui.label(
                 RichText::new(project_id)
@@ -4371,7 +7479,7 @@ impl ReynApp {
                     .color(TEXT_MUTE),
             );
         });
-        if name_changed {
+        if name_changed && !self.reject_project_mutation("Renaming the project") {
             self.project
                 .rename_project(self.project_name_draft.clone(), now_utc_unix());
             self.project_notice = Some(("Project name changed; save is required.".into(), false));
@@ -4780,7 +7888,7 @@ impl ReynApp {
                                     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                                         let (state, color) = if self.project.is_recovered() {
                                             ("RECOVERED · UNSAVED", WARN)
-                                        } else if self.project.is_dirty() {
+                                        } else if self.has_unsaved_project_work() {
                                             ("UNSAVED CHANGES", WARN)
                                         } else if self.project.path().is_some() {
                                             ("SAVED LOCALLY ✓", SUCCESS)
@@ -5473,6 +8581,88 @@ impl ReynApp {
         }
     }
 
+    /// Viewport and playback keys. Unmodified single keys, so they are only read
+    /// on the 3D screens and never while a text field has the keyboard.
+    fn handle_viewport_shortcuts(&mut self, ui: &mut egui::Ui) {
+        if !matches!(self.nav, Nav::Results | Nav::Metrics) || ui.ctx().egui_wants_keyboard_input()
+        {
+            return;
+        }
+        if self.nav == Nav::Results
+            && self
+                .cad
+                .as_ref()
+                .and_then(|case| case.workflow.result.as_ref())
+                .is_none()
+        {
+            return;
+        }
+        enum Key {
+            Fit,
+            View(viewport::StandardView),
+            PlayPause,
+            Step(i64),
+        }
+        let pressed = ui.input_mut(|input| {
+            if input.modifiers.any() {
+                return None;
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::F) {
+                return Some(Key::Fit);
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
+                return Some(Key::PlayPause);
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::Comma) {
+                return Some(Key::Step(-1));
+            }
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::Period) {
+                return Some(Key::Step(1));
+            }
+            for (index, view) in viewport::StandardView::ALL.iter().enumerate() {
+                let key = match index {
+                    0 => egui::Key::Num1,
+                    1 => egui::Key::Num2,
+                    2 => egui::Key::Num3,
+                    3 => egui::Key::Num4,
+                    4 => egui::Key::Num5,
+                    5 => egui::Key::Num6,
+                    _ => egui::Key::Num7,
+                };
+                if input.consume_key(egui::Modifiers::NONE, key) {
+                    return Some(Key::View(*view));
+                }
+            }
+            None
+        });
+        match pressed {
+            Some(Key::Fit) => self.view_fit = true,
+            Some(Key::View(view)) => self.view_snap = Some(view),
+            Some(Key::PlayPause) => self.toggle_horizon_playback(),
+            Some(Key::Step(delta)) => {
+                if let Some(case) = self.cad.as_ref() {
+                    let current = case.display_step() as i64;
+                    self.show_horizon_step((current + delta).max(1) as u32);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn toggle_horizon_playback(&mut self) {
+        let can_play = self
+            .cad
+            .as_ref()
+            .is_some_and(|case| case.workflow.result.is_some() && !case.pending);
+        if !can_play {
+            return;
+        }
+        if let Some(case) = self.cad.as_mut() {
+            case.playback.playing = !case.playback.playing;
+            case.playback.last_advance = f64::NEG_INFINITY;
+        }
+    }
+
     fn handle_project_shortcuts(&mut self, ui: &mut egui::Ui) {
         enum Shortcut {
             New,
@@ -5540,16 +8730,46 @@ impl ReynApp {
             .path()
             .expect("project path checked above")
             .to_path_buf();
+        let orientation_applied = match self.flush_project_drafts_for_persistence() {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.project_notice = Some((
+                    format!(
+                        "Project was not saved because its visible draft is not durable: {error}"
+                    ),
+                    true,
+                ));
+                return false;
+            }
+        };
         match self.project.save(now_utc_unix()) {
             Ok(warning) => {
                 self.project_name_draft = self.project.display_name().to_owned();
+                self.project_conflict = None;
+                self.schedule_autosave_from_now();
                 self.project_notice = Some((
-                    warning.unwrap_or_else(|| format!("Saved atomically to {}", path.display())),
+                    warning.unwrap_or_else(|| {
+                        format!(
+                            "Saved atomically to {}.{}",
+                            path.display(),
+                            if orientation_applied {
+                                " Pending body orientation was applied and recorded before save"
+                            } else {
+                                ""
+                            }
+                        )
+                    }),
                     false,
                 ));
                 true
             }
             Err(error) => {
+                if is_project_write_conflict(&error) {
+                    self.project_conflict = Some(ProjectWriteConflict {
+                        path: path.clone(),
+                        detail: error.to_string(),
+                    });
+                }
                 self.project_notice = Some((format!("Project was not saved: {error}"), true));
                 false
             }
@@ -5568,24 +8788,140 @@ impl ReynApp {
             return false;
         };
         let path = with_project_extension(path);
-        match self.project.save_as(&path, now_utc_unix()) {
+        self.save_project_as_path(&path)
+    }
+
+    fn save_project_as_path(&mut self, path: &std::path::Path) -> bool {
+        let orientation_applied = match self.flush_project_drafts_for_persistence() {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.project_notice = Some((
+                    format!(
+                        "Project was not saved as {} because its visible draft is not durable: {error}",
+                        path.display()
+                    ),
+                    true,
+                ));
+                return false;
+            }
+        };
+        match self.project.save_as(path, now_utc_unix()) {
             Ok(warning) => {
                 self.project_name_draft = self.project.display_name().to_owned();
+                self.project_conflict = None;
+                self.schedule_autosave_from_now();
                 self.project_notice = Some((
                     warning.unwrap_or_else(|| {
-                        format!("Saved a new atomic project at {}", path.display())
+                        format!(
+                            "Saved a new atomic project at {}.{}",
+                            path.display(),
+                            if orientation_applied {
+                                " Pending body orientation was applied and recorded before save"
+                            } else {
+                                ""
+                            }
+                        )
                     }),
                     false,
                 ));
                 true
             }
             Err(error) => {
+                if is_project_write_conflict(&error) {
+                    self.project_conflict = Some(ProjectWriteConflict {
+                        path: path.to_path_buf(),
+                        detail: error.to_string(),
+                    });
+                }
                 self.project_notice = Some((
                     format!("Project was not saved as {}: {error}", path.display()),
                     true,
                 ));
                 false
             }
+        }
+    }
+
+    fn show_project_conflict_dialog(&mut self, ctx: &egui::Context) {
+        let Some(conflict) = self.project_conflict.clone() else {
+            return;
+        };
+        let mut action = None;
+        egui::Window::new("Project changed on disk")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(500.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Another writer changed this project after it was opened. Reyn refused to overwrite those bytes.",
+                    )
+                    .color(TEXT),
+                );
+                ui.label(
+                    RichText::new(&conflict.detail)
+                        .text_style(mono_s())
+                        .color(TEXT_MUTE),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Reload opens the disk version and discards this in-memory draft. Save As keeps the draft at a path you choose. Conflict copy writes a timestamped sibling without touching the changed project.",
+                    )
+                    .text_style(caption())
+                    .color(TEXT_DIM),
+                );
+                ui.add_space(14.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Dismiss").clicked() {
+                        action = Some(ProjectConflictAction::Dismiss);
+                    }
+                    if ui.button("Reload disk version").clicked() {
+                        action = Some(ProjectConflictAction::Reload);
+                    }
+                    if ui.button("Save As…").clicked() {
+                        action = Some(ProjectConflictAction::SaveAs);
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Save conflict copy").color(ON_EMBER),
+                            )
+                            .fill(EMBER),
+                        )
+                        .clicked()
+                    {
+                        action = Some(ProjectConflictAction::ConflictCopy);
+                    }
+                });
+            });
+        let resolution = action.map(|action| {
+            let unique = if action == ProjectConflictAction::ConflictCopy {
+                uuid::Uuid::new_v4().simple().to_string()
+            } else {
+                String::new()
+            };
+            resolve_project_conflict_action(action, &conflict.path, now_utc_unix(), unique.as_str())
+        });
+        match resolution {
+            Some(ProjectConflictResolution::Reload(path)) => {
+                self.project_conflict = None;
+                self.execute_project_action(
+                    project_lifecycle::DeferredProjectAction::Open(path),
+                    ctx,
+                );
+            }
+            Some(ProjectConflictResolution::PromptSaveAs) => {
+                self.save_project_as_dialog();
+            }
+            Some(ProjectConflictResolution::SaveConflictCopy(path)) => {
+                self.save_project_as_path(&path);
+            }
+            Some(ProjectConflictResolution::Dismiss) => {
+                self.project_conflict = None;
+            }
+            None => {}
         }
     }
 
@@ -5599,6 +8935,7 @@ impl ReynApp {
         };
         match self.project.relink_content(expected_digest, &path) {
             Ok(insert) => {
+                self.dependencies_dirty = true;
                 self.project_notice = Some((
                     format!(
                         "{} content {} from {}. Immutable runs and evidence records were not changed; save the project to retain the portable object.",
@@ -5643,7 +8980,10 @@ impl ReynApp {
         action: project_lifecycle::DeferredProjectAction,
         ctx: &egui::Context,
     ) {
-        match self.project_guard.request(action, self.project.is_dirty()) {
+        match self
+            .project_guard
+            .request(action, self.has_unsaved_project_work())
+        {
             project_lifecycle::GuardRequest::Execute(action) => {
                 self.execute_project_action(action, ctx);
             }
@@ -5828,17 +9168,23 @@ impl ReynApp {
         self.active_benchmark_run_id = None;
         if let Some(cad) = &mut self.cad {
             cad.surf = None;
+            cad.surf_mask_source = None;
         }
         self.surface_on = false;
     }
 
     fn reset_project_runtime(&mut self) {
         self.invalidate_engine_results();
+        self.project_conflict = None;
+        self.case_draft_dirty = false;
+        self.review_selection = None;
+        self.orientation_draft = None;
+        self.orientation_pending = None;
         self.live = false;
         self.live_timer = 0.0;
         self.seed = 1;
-        self.current_model = "flow3d_obs_v1.pth".into();
-        self.f2d_model = "obstacle_v2_shapes.pth".into();
+        self.current_model = self.settings.default_3d_model.clone();
+        self.f2d_model = self.settings.default_2d_model.clone();
         self.f2d_var = FieldVar::Vorticity;
         self.f2d_horizon = 8;
         self.f2d_truth = false;
@@ -5848,6 +9194,8 @@ impl ReynApp {
         self.f2d_scale = 1.0;
         self.f2d_signed = true;
         self.cad = None;
+        self.case_draft_history.clear();
+        self.case_edit_transaction = None;
         self.f2d_painted = None;
         self.paint = painter::PaintField::default();
         self.paint_tex = None;
@@ -5864,13 +9212,17 @@ impl ReynApp {
         // Replacing the handle drops the prior receiver, so an in-flight result
         // from the previous project cannot repopulate a cleared viewport.
         self.engine = engine::EngineHandle::spawn_with_config(self.settings.engine_config());
+        self.attach_engine_repaint_wake();
         self.engine_ok = false;
+        self.dependencies_dirty = true;
+        self.schedule_autosave_from_now();
         self.engine_status = "○ Project context changed · revalidating engine…".into();
         self.library.busy = true;
         let _ = self.engine.tx.send(engine::Cmd::ListModels);
     }
 
     fn prepare_benchmark_case(&mut self, clear_selection: bool) -> Result<String, String> {
+        self.project_write_access("Preparing a benchmark run")?;
         let model = self
             .models
             .iter()
@@ -5884,12 +9236,31 @@ impl ReynApp {
             })?;
         if !is_sha256(&model.checkpoint_sha256) {
             return Err(format!(
-                "{} has no valid checkpoint SHA-256; an evidence run cannot be created",
+                "{} has no valid model-bundle SHA-256; an evidence run cannot be created",
                 model.name
+            ));
+        }
+        if model.authenticity_status != "verified" {
+            return Err(format!(
+                "{} does not have verified publisher authenticity. {}",
+                model.name,
+                engine::TRUSTED_MODEL_CONVERSION_GUIDANCE
             ));
         }
         let now = now_utc_unix();
         let checkpoint_sha256 = model.checkpoint_sha256.to_ascii_lowercase();
+        let model_id_path = std::path::PathBuf::from(&model.id);
+        let model_path = if model_id_path.is_absolute() {
+            model_id_path
+        } else {
+            std::path::PathBuf::from(&self.settings.research_dir).join(model_id_path)
+        };
+        engine::require_model_signature(&model_path).map_err(|error| {
+            format!(
+                "model bundle {} cannot be used without its detached signature: {error}",
+                model.name
+            )
+        })?;
         let existing_source = self
             .project
             .manifest()
@@ -5898,15 +9269,9 @@ impl ReynApp {
         let bundled_model_bytes = if self.project.content_bytes(&checkpoint_sha256).is_some() {
             None
         } else {
-            let model_id_path = std::path::PathBuf::from(&model.id);
-            let model_path = if model_id_path.is_absolute() {
-                model_id_path
-            } else {
-                std::path::PathBuf::from(&self.settings.research_dir).join(model_id_path)
-            };
             let bytes = std::fs::read(&model_path).map_err(|error| {
                 format!(
-                    "checkpoint {} cannot be bundled from {}: {error}",
+                    "model bundle {} cannot be copied from {}: {error}",
                     model.name,
                     model_path.display()
                 )
@@ -5914,7 +9279,7 @@ impl ReynApp {
             let actual = project_sha256(&bytes);
             if actual != checkpoint_sha256 {
                 return Err(format!(
-                    "checkpoint {} changed after validation: expected {}, received {}",
+                    "model bundle {} changed after validation: expected {}, received {}",
                     model.name,
                     short_hash(&checkpoint_sha256),
                     short_hash(&actual)
@@ -5949,6 +9314,10 @@ impl ReynApp {
             "model_id": model.id,
             "model_checkpoint_sha256": checkpoint_sha256,
             "model_source_sha256": model.source_digest,
+            "model_authenticity_status": model.authenticity_status,
+            "model_publisher_key_id": model.publisher_key_id,
+            "model_publisher_key_sha256": model.publisher_key_sha256,
+            "model_release_sequence": model.release_sequence,
             "dimension": model.dimension,
             "input_channels": model.in_channels,
             "output_channels": model.out_channels,
@@ -6001,39 +9370,22 @@ impl ReynApp {
         let revision_id = uuid::Uuid::new_v4().to_string();
         let source_id_for_edit = source_id.clone();
         let case_id_for_edit = case_id.clone();
-        self.project
-            .transact(now, move |manifest| {
-                if let Some(source) = new_source {
-                    manifest.add_source_revision(source, now)?;
-                }
-                if let Some(case) = existing_case {
-                    let active = case.active_revision();
-                    if active.source_revision_ids != [source_id_for_edit.clone()]
-                        || active.contract != contract
-                        || active.discretization != discretization
-                        || active.outputs != outputs
-                    {
-                        manifest.append_case_revision(
-                            &case_id_for_edit,
-                            project::CaseRevision {
-                                case_revision_id: revision_id,
-                                parent_revision_id: Some(active.case_revision_id.clone()),
-                                created_utc_unix: now,
-                                source_revision_ids: vec![source_id_for_edit],
-                                contract,
-                                discretization,
-                                outputs,
-                            },
-                            now,
-                        )?;
-                    }
-                } else {
-                    manifest.create_case(
-                        case_id_for_edit.clone(),
-                        "Model qualification",
+        self.transact_project("Preparing a benchmark run", now, move |manifest| {
+            if let Some(source) = new_source {
+                manifest.add_source_revision(source, now)?;
+            }
+            if let Some(case) = existing_case {
+                let active = case.active_revision();
+                if active.source_revision_ids != [source_id_for_edit.clone()]
+                    || active.contract != contract
+                    || active.discretization != discretization
+                    || active.outputs != outputs
+                {
+                    manifest.append_case_revision(
+                        &case_id_for_edit,
                         project::CaseRevision {
                             case_revision_id: revision_id,
-                            parent_revision_id: None,
+                            parent_revision_id: Some(active.case_revision_id.clone()),
                             created_utc_unix: now,
                             source_revision_ids: vec![source_id_for_edit],
                             contract,
@@ -6043,31 +9395,48 @@ impl ReynApp {
                         now,
                     )?;
                 }
-                if clear_selection {
-                    manifest.set_selection(
-                        project::ProjectSelection {
-                            active_case_id: Some(case_id_for_edit.clone()),
-                            ..Default::default()
-                        },
-                        now,
-                    )?;
-                }
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+            } else {
+                manifest.create_case(
+                    case_id_for_edit.clone(),
+                    "Model qualification",
+                    project::CaseRevision {
+                        case_revision_id: revision_id,
+                        parent_revision_id: None,
+                        created_utc_unix: now,
+                        source_revision_ids: vec![source_id_for_edit],
+                        contract,
+                        discretization,
+                        outputs,
+                    },
+                    now,
+                )?;
+            }
+            if clear_selection {
+                manifest.set_selection(
+                    project::ProjectSelection {
+                        active_case_id: Some(case_id_for_edit.clone()),
+                        ..Default::default()
+                    },
+                    now,
+                )?;
+            }
+            Ok(())
+        })?;
         if let Some(bytes) = bundled_model_bytes {
-            self.project
-                .add_content_with_digest(
-                    bytes,
-                    "application/vnd.pytorch.checkpoint",
-                    &checkpoint_sha256,
-                )
-                .map_err(|error| format!("checkpoint bundle: {error}"))?;
+            self.add_project_content(
+                "Preparing a benchmark run",
+                bytes,
+                "application/vnd.reyn.model-bundle",
+                &checkpoint_sha256,
+            )
+            .map_err(|error| format!("model bundle: {error}"))?;
         }
+        self.dependencies_dirty = true;
         Ok(case_id)
     }
 
     fn persist_benchmark_run(&mut self, benchmark: &engine::BenchResult) -> Result<String, String> {
+        self.project_write_access("Recording a benchmark run")?;
         let case_id = self.prepare_benchmark_case(false)?;
         let now = now_utc_unix();
         let model = self
@@ -6222,29 +9591,28 @@ impl ReynApp {
         let selected_view_id = suite_view.view_id;
         let case_id_for_edit = case_id.clone();
         let run_id_for_edit = run_id.clone();
-        self.project
-            .transact(now, move |manifest| {
-                manifest.append_run(&case_id_for_edit, run, now)?;
-                manifest.append_evidence(evidence, now)?;
-                manifest.set_selection(
-                    project::ProjectSelection {
-                        active_case_id: Some(case_id_for_edit),
-                        selected_run_id: Some(run_id_for_edit),
-                        selected_evidence_id: Some(evidence_id),
-                        selected_view_id: Some(selected_view_id),
-                    },
-                    now,
-                )?;
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
-        self.project
-            .add_content_with_digest(
-                snapshot_bytes,
-                "application/vnd.reyn.benchmark-suite+json",
-                &output_sha256,
-            )
-            .map_err(|error| format!("suite artifact bundle: {error}"))?;
+        self.transact_project("Recording a benchmark run", now, move |manifest| {
+            manifest.append_run(&case_id_for_edit, run, now)?;
+            manifest.append_evidence(evidence, now)?;
+            manifest.set_selection(
+                project::ProjectSelection {
+                    active_case_id: Some(case_id_for_edit),
+                    selected_run_id: Some(run_id_for_edit),
+                    selected_evidence_id: Some(evidence_id),
+                    selected_view_id: Some(selected_view_id),
+                },
+                now,
+            )?;
+            Ok(())
+        })?;
+        self.add_project_content(
+            "Recording a benchmark run",
+            snapshot_bytes,
+            "application/vnd.reyn.benchmark-suite+json",
+            &output_sha256,
+        )
+        .map_err(|error| format!("suite artifact bundle: {error}"))?;
+        self.dependencies_dirty = true;
         Ok(run_id)
     }
 
@@ -6252,6 +9620,7 @@ impl ReynApp {
         &mut self,
         inspector: &engine::BenchInspector,
     ) -> Result<(), String> {
+        self.project_write_access("Recording benchmark cell evidence")?;
         let run_id = self
             .active_benchmark_run_id
             .clone()
@@ -6355,28 +9724,27 @@ impl ReynApp {
             calibrated_views,
         };
         let now = now_utc_unix();
-        self.project
-            .transact(now, move |manifest| {
-                manifest.append_evidence(evidence, now)?;
-                manifest.set_selection(
-                    project::ProjectSelection {
-                        active_case_id: Some(case_id),
-                        selected_run_id: Some(run_id),
-                        selected_evidence_id: Some(evidence_id),
-                        selected_view_id: Some(selected_view_id),
-                    },
-                    now,
-                )?;
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
-        self.project
-            .add_content_with_digest(
-                snapshot_bytes,
-                "application/vnd.reyn.benchmark-cell+json",
-                &snapshot_sha256,
-            )
-            .map_err(|error| format!("selected-cell artifact bundle: {error}"))?;
+        self.transact_project("Recording benchmark cell evidence", now, move |manifest| {
+            manifest.append_evidence(evidence, now)?;
+            manifest.set_selection(
+                project::ProjectSelection {
+                    active_case_id: Some(case_id),
+                    selected_run_id: Some(run_id),
+                    selected_evidence_id: Some(evidence_id),
+                    selected_view_id: Some(selected_view_id),
+                },
+                now,
+            )?;
+            Ok(())
+        })?;
+        self.add_project_content(
+            "Recording benchmark cell evidence",
+            snapshot_bytes,
+            "application/vnd.reyn.benchmark-cell+json",
+            &snapshot_sha256,
+        )
+        .map_err(|error| format!("selected-cell artifact bundle: {error}"))?;
+        self.dependencies_dirty = true;
         Ok(())
     }
 
@@ -6558,7 +9926,7 @@ impl ReynApp {
                 .unwrap_or(0.0),
             warnings,
         };
-        let shape = vec![3usize, field.n, field.n, field.n];
+        let shape = [3usize, field.n, field.n, field.n];
         self.particles = flow::from_field(&shape, &field.velocity);
         if let Some((volume, dims)) = flow::vorticity_volume(&shape, &field.velocity) {
             self.volume_data = std::sync::Arc::new(volume);
@@ -6592,7 +9960,8 @@ impl ReynApp {
             mask: std::sync::Arc::new(mask_u8),
             pressure: std::sync::Arc::new(cp_u8),
             dims: [field.n as u32; 3],
-            version: self.cad_version,
+            mask_version: self.cad_version,
+            pressure_version: self.cad_version,
         };
         let workflow = engineering::ExternalFlowCase {
             stage: engineering::CaseStage::Results,
@@ -6621,11 +9990,16 @@ impl ReynApp {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(workflow.operating.horizon_steps as u64) as u32;
         self.invalidate_cad_section();
+        let mask_bounds = cad::mask_bounds(&field.mask, field.n);
+        let mask = std::sync::Arc::new(field.mask);
+        self.orientation_pending = None;
         self.cad = Some(CadCase {
-            mask: std::sync::Arc::new(field.mask),
+            mask: mask.clone(),
+            mask_bounds,
             model: model_id,
             steps: horizon,
             surf: Some(surface),
+            surf_mask_source: Some(mask),
             name: source_name,
             workflow,
             velocity: field.velocity,
@@ -6633,11 +10007,17 @@ impl ReynApp {
             cp: field.cp,
             traction: field.traction_pa,
             result_grid: field.n,
+            dt_frame: summary
+                .get("dt_frame")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0) as f32,
             active_run_id: Some(run_id.to_owned()),
             pending: false,
             pending_request_id: None,
             pending_run: None,
+            playback: HorizonPlayback::default(),
         });
+        self.rebase_case_draft_history();
         self.surface_on = true;
         self.volumetric = true;
         self.render_volume = true;
@@ -6725,16 +10105,6 @@ impl ReynApp {
                 true,
             ));
             return false;
-        };
-        let mesh = match cad::parse_stl(&source_bytes) {
-            Ok(mesh) => mesh,
-            Err(error) => {
-                self.project_notice = Some((
-                    format!("Stored geometry could not be reconstructed: {error}"),
-                    true,
-                ));
-                return false;
-            }
         };
         let preflight = match serde_json::from_value::<engineering::GeometryPreflight>(
             contract
@@ -6855,20 +10225,12 @@ impl ReynApp {
             .and_then(serde_json::Value::as_str)
             .and_then(|digest| self.project.content_bytes(digest))
             .and_then(|bytes| engineering::decode_engineering_field(bytes).ok());
-        let voxel = if field_blob.is_none() {
-            match cad::voxelize(&mesh, preflight.target_grid) {
-                Ok(voxel) => Some(voxel),
-                Err(error) => {
-                    self.project_notice = Some((
-                        format!("Stored case geometry could not be voxelized: {error}"),
-                        true,
-                    ));
-                    return false;
-                }
-            }
-        } else {
-            None
-        };
+        let dt_frame = result_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("dt_frame"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        let source_sha256 = source.content_sha256.clone();
         let workflow = engineering::ExternalFlowCase {
             stage: if result.is_some() {
                 engineering::CaseStage::Results
@@ -6895,20 +10257,81 @@ impl ReynApp {
             result,
             parent_run_id: selected_run_id.clone(),
         };
-        let (mask, pressure, cp, traction, result_grid, velocity) = if let Some(field) = field_blob
-        {
-            (
-                field.mask,
-                field.pressure_pa,
-                field.cp,
-                field.traction_pa,
-                field.n,
-                Some(field.velocity),
-            )
-        } else {
-            let voxel = voxel.expect("voxel is present without a field blob");
-            (voxel.mask, Vec::new(), Vec::new(), Vec::new(), 0, None)
+        let Some(field) = field_blob else {
+            if self.orientation_worker.is_none() {
+                self.orientation_worker =
+                    match OrientationWorker::spawn(self.repaint_context.clone()) {
+                        Ok(worker) => Some(worker),
+                        Err(error) => {
+                            self.project_notice = Some((error, true));
+                            return false;
+                        }
+                    };
+            }
+            self.orientation_generation = self.orientation_generation.wrapping_add(1).max(1);
+            let generation = self.orientation_generation;
+            let request_id = format!(
+                "orientation-hydrate-{generation}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let angles = workflow.preflight.body_orientation_degrees();
+            let request = OrientationWorkRequest {
+                generation,
+                request_id: request_id.clone(),
+                case_id: workflow.case_id.clone(),
+                source_sha256: source_sha256.clone(),
+                angles,
+                grid: workflow.preflight.target_grid,
+                source_bytes,
+            };
+            if self
+                .orientation_worker
+                .as_ref()
+                .expect("orientation worker was initialized")
+                .request_tx
+                .send(request)
+                .is_err()
+            {
+                self.orientation_worker = None;
+                self.project_notice = Some((
+                    "Stored case geometry was not queued because the reconstruction worker stopped. The project manifest and immutable evidence remain available."
+                        .into(),
+                    true,
+                ));
+                return false;
+            }
+            self.orientation_pending = Some(PendingOrientation {
+                generation,
+                request_id: request_id.clone(),
+                case_id: workflow.case_id.clone(),
+                source_sha256,
+                angles,
+                started_at: std::time::Instant::now(),
+                kind: PendingOrientationKind::Hydrate(Box::new(PendingOrientationHydration {
+                    workflow,
+                    selected_run_id,
+                    dt_frame,
+                })),
+            });
+            self.engine_status = format!(
+                "● Reconstructing stored body orientation · request {}",
+                short_id(&request_id)
+            );
+            self.project_notice = Some((
+                "Stored case geometry is being re-voxelized off the UI thread. The project manifest and immutable evidence remain inspectable while reconstruction is pending."
+                    .into(),
+                false,
+            ));
+            return true;
         };
+        let (mask, pressure, cp, traction, result_grid, velocity) = (
+            field.mask,
+            field.pressure_pa,
+            field.cp,
+            field.traction_pa,
+            field.n,
+            Some(field.velocity),
+        );
         let mut surf = None;
         if result_grid > 0 && cp.len() == result_grid * result_grid * result_grid {
             let scale = cp
@@ -6934,11 +10357,12 @@ impl ReynApp {
                 mask: std::sync::Arc::new(mask_u8),
                 pressure: std::sync::Arc::new(cp_u8),
                 dims: [result_grid as u32; 3],
-                version: self.cad_version,
+                mask_version: self.cad_version,
+                pressure_version: self.cad_version,
             });
         }
         if let Some(velocity) = velocity.as_deref() {
-            let shape = vec![3usize, result_grid, result_grid, result_grid];
+            let shape = [3usize, result_grid, result_grid, result_grid];
             let particles = flow::from_field(&shape, velocity);
             if !particles.is_empty() {
                 self.particles = particles;
@@ -6956,11 +10380,22 @@ impl ReynApp {
         }
         self.current_model = model_id.clone();
         self.invalidate_cad_section();
+        let bounds_grid = if result_grid >= 3 {
+            result_grid
+        } else {
+            workflow.preflight.target_grid
+        };
+        let mask_bounds = cad::mask_bounds(&mask, bounds_grid);
+        let mask = std::sync::Arc::new(mask);
+        let surf_mask_source = surf.as_ref().map(|_| mask.clone());
+        self.orientation_pending = None;
         self.cad = Some(CadCase {
-            mask: std::sync::Arc::new(mask),
+            mask,
+            mask_bounds,
             model: model_id,
             steps: workflow.operating.horizon_steps,
             surf,
+            surf_mask_source,
             name: workflow.source_name.clone(),
             workflow,
             velocity: velocity.unwrap_or_default(),
@@ -6968,11 +10403,14 @@ impl ReynApp {
             cp,
             traction,
             result_grid,
+            dt_frame,
             active_run_id: selected_run_id,
             pending: false,
             pending_request_id: None,
             pending_run: None,
+            playback: HorizonPlayback::default(),
         });
+        self.rebase_case_draft_history();
         self.nav = if self
             .cad
             .as_ref()
@@ -6987,6 +10425,10 @@ impl ReynApp {
     }
 
     fn hydrate_project_runtime(&mut self) {
+        // Opening/recovering/selecting a persisted case is a scope transition;
+        // prior session draft edits cannot cross it.
+        self.case_draft_history.clear();
+        self.case_edit_transaction = None;
         self.nav = Nav::Projects;
         self.bench = None;
         self.bench_selected = None;
@@ -6997,7 +10439,10 @@ impl ReynApp {
         self.bench_tex.clear();
         self.active_benchmark_run_id = None;
 
-        let selection = self.project.manifest().selection().clone();
+        let selection = self
+            .review_selection
+            .clone()
+            .unwrap_or_else(|| self.project.manifest().selection().clone());
         let Some(run_id) = selection.selected_run_id.clone() else {
             let _ = self.hydrate_external_flow_runtime(&selection);
             return;
@@ -7134,17 +10579,28 @@ impl ReynApp {
             });
         let now = now_utc_unix();
         let run_id = run_id.to_owned();
-        if let Err(error) = self.project.transact(now, move |manifest| {
-            manifest.set_selection(
-                project::ProjectSelection {
-                    active_case_id: Some(case_id),
-                    selected_run_id: Some(run_id),
-                    selected_evidence_id,
-                    selected_view_id,
-                },
-                now,
-            )
-        }) {
+        let selection = project::ProjectSelection {
+            active_case_id: Some(case_id),
+            selected_run_id: Some(run_id),
+            selected_evidence_id,
+            selected_view_id,
+        };
+        if self.project.availability().is_read_only_evidence() {
+            self.review_selection = Some(selection);
+            self.hydrate_project_runtime();
+            self.project_notice = Some((
+                "Opened immutable evidence with a session-only review selection; the read-only project was not changed."
+                    .into(),
+                false,
+            ));
+            return;
+        }
+        self.review_selection = None;
+        if let Err(error) =
+            self.transact_project("Selecting stored run evidence", now, move |manifest| {
+                manifest.set_selection(selection, now)
+            })
+        {
             self.project_notice =
                 Some((format!("Stored run could not be selected: {error}"), true));
             return;
@@ -7153,21 +10609,33 @@ impl ReynApp {
     }
 
     fn persist_benchmark_view_selection(&mut self) {
-        let current = self.project.manifest().selection().clone();
+        let current = self
+            .review_selection
+            .clone()
+            .unwrap_or_else(|| self.project.manifest().selection().clone());
         if current.selected_run_id.is_none() || current.selected_evidence_id.is_none() {
             return;
         }
         let selected_view_id = format!("benchmark.{}.model", self.bench_var.key());
+        if self.project.availability().is_read_only_evidence() {
+            self.review_selection = Some(project::ProjectSelection {
+                selected_view_id: Some(selected_view_id),
+                ..current
+            });
+            return;
+        }
         let now = now_utc_unix();
-        if let Err(error) = self.project.transact(now, move |manifest| {
-            manifest.set_selection(
-                project::ProjectSelection {
-                    selected_view_id: Some(selected_view_id),
-                    ..current
-                },
-                now,
-            )
-        }) {
+        if let Err(error) =
+            self.transact_project("Selecting a calibrated view", now, move |manifest| {
+                manifest.set_selection(
+                    project::ProjectSelection {
+                        selected_view_id: Some(selected_view_id),
+                        ..current
+                    },
+                    now,
+                )
+            })
+        {
             self.project_notice = Some((
                 format!("Selected calibrated view was not saved: {error}"),
                 true,
@@ -7241,12 +10709,7 @@ impl ReynApp {
     /// normalization would hide amplitude errors).
     fn ensure_f2d_textures(&mut self, ctx: &egui::Context) {
         let Some(f) = &self.f2d else { return };
-        let var_id = match self.f2d_var {
-            FieldVar::Velocity => 0,
-            FieldVar::Vorticity => 1,
-            FieldVar::Pressure => 2,
-        };
-        let sig = self.f2d_gen.wrapping_mul(131) ^ (var_id << 1) ^ ((self.f2d_truth as u64) << 4);
+        let sig = field2d_cache_signature(self.f2d_gen, self.f2d_var, self.f2d_truth);
         if sig == self.f2d_sig && !self.f2d_tex.is_empty() {
             return;
         }
@@ -7282,6 +10745,27 @@ impl ReynApp {
         self.f2d_signed = signed;
     }
 
+    /// Critical-point extraction scans full N² maps. Keep it off the paint hot
+    /// path until the field generation, displayed variable, or reference
+    /// visibility changes.
+    fn ensure_f2d_insights(&mut self) {
+        if !self.insights_on {
+            return;
+        }
+        let key = (self.f2d_gen, self.f2d_var, self.f2d_truth);
+        if self.f2d_insights_key == Some(key) {
+            return;
+        }
+        let Some(field) = self.f2d.as_ref() else {
+            self.f2d_insights.clear();
+            self.f2d_insights_key = Some(key);
+            return;
+        };
+        let truth = self.f2d_truth.then_some(field.truth.as_deref()).flatten();
+        self.f2d_insights = field2d::insights(field, &field.ai, truth, self.f2d_var);
+        self.f2d_insights_key = Some(key);
+    }
+
     /// Import an STL, voxelize it onto the 3D model's grid, and send it to the
     /// engine (which develops the flow with the real solver, then predicts).
     fn import_cad(&mut self) {
@@ -7296,6 +10780,9 @@ impl ReynApp {
 
     /// Shared import path for the file dialog and the landing drop target.
     fn import_cad_path(&mut self, path: std::path::PathBuf) {
+        if self.reject_project_mutation("Importing a geometry revision") {
+            return;
+        }
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -7317,17 +10804,64 @@ impl ReynApp {
             }
         };
         let mesh_diagnostics = cad::diagnose_mesh(&mesh);
-        // pick the best geometry-conditioned 3D checkpoint we have (grid must match)
-        let (model, n) = if self
+        // Use only an inventoried, verified geometry-conditioned 3D bundle.
+        // Prefer the persisted selection, then the highest declared grid.
+        let compatible = |card: &&engine::ModelCard| {
+            card.status != "invalid"
+                && engine::is_model_bundle_id(&card.id)
+                && card.authenticity_status == "verified"
+                && card.dimension == 3
+                && card.in_channels > card.out_channels
+                && card.grid > 0
+        };
+        let model_card = self
             .models
             .iter()
-            .any(|model| model.id == "flow3d_obs_unified_64.pth")
+            .filter(compatible)
+            .find(|card| card.id == self.settings.default_3d_model)
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .filter(compatible)
+                    .max_by_key(|card| card.grid)
+            })
+            .cloned();
+        let (model, model_sha256, model_max_steps, model_support, n, model_warning) = if let Some(
+            model_card,
+        ) =
+            model_card
         {
-            ("flow3d_obs_unified_64.pth".to_string(), 64)
+            (
+                model_card.id,
+                Some(model_card.checkpoint_sha256),
+                model_card.max_steps,
+                engineering::ModelSupport {
+                    status: model_card.status,
+                    dimension: model_card.dimension,
+                    grid: model_card.grid,
+                    input_channels: model_card.in_channels,
+                    output_channels: model_card.out_channels,
+                    scenario: model_card.scenario,
+                    physics_contract: model_card.physics_contract,
+                },
+                model_card.grid as usize,
+                None,
+            )
         } else {
-            ("flow3d_obs_v1.pth".to_string(), 32)
+            (
+                    String::new(),
+                    None,
+                    0,
+                    engineering::ModelSupport {
+                        status: "unavailable".into(),
+                        ..Default::default()
+                    },
+                    DIAGNOSTIC_PREFLIGHT_GRID,
+                    Some(format!(
+                        "MODEL GATE · Geometry was inspected on the model-independent {DIAGNOSTIC_PREFLIGHT_GRID}³ diagnostic grid. Inference remains blocked until a compatible verified 3D .reynmodel bundle with a matching grid is selected."
+                    )),
+                )
         };
-        let model_card = self.models.iter().find(|card| card.id == model).cloned();
         match cad::voxelize(&mesh, n) {
             Ok(vm) => {
                 let mask = std::sync::Arc::new(vm.mask);
@@ -7357,12 +10891,24 @@ impl ReynApp {
                             .map(|source| source.revision + 1)
                     })
                     .unwrap_or(1);
-                let mut warnings = Vec::new();
+                let mut warnings = model_warning.into_iter().collect::<Vec<_>>();
                 if mesh_diagnostics.inconsistent_winding_edges > 0 {
                     warnings.push(format!(
                         "{} edges have inconsistent winding.",
                         mesh_diagnostics.inconsistent_winding_edges
                     ));
+                }
+                if mesh_diagnostics.self_intersection_pairs > 0 {
+                    warnings.push(format!(
+                        "{} non-adjacent triangle pairs intersect.",
+                        mesh_diagnostics.self_intersection_pairs
+                    ));
+                }
+                if mesh_diagnostics.signed_volume < 0.0 {
+                    warnings.push(
+                        "Source triangle winding is inward. The value is recorded; current diffuse-interface loads derive normals from the occupancy mask and are not sign-flipped by STL winding."
+                            .into(),
+                    );
                 }
                 if mesh_diagnostics.components > 1 {
                     warnings.push(format!(
@@ -7415,15 +10961,24 @@ impl ReynApp {
                     degenerate_triangles: mesh_diagnostics.degenerate_triangles,
                     boundary_edges: mesh_diagnostics.boundary_edges,
                     non_manifold_edges: mesh_diagnostics.non_manifold_edges,
+                    inconsistent_winding_edges: mesh_diagnostics.inconsistent_winding_edges,
+                    self_intersection_pairs: mesh_diagnostics.self_intersection_pairs,
+                    source_signed_volume: mesh_diagnostics.signed_volume,
                     source_extents: mesh_diagnostics.extents.map(f64::from),
-                    proposed_scale: vm.transform_4x4[0],
+                    proposed_scale: vm.scale,
                     solver_characteristic_length: vm.char_len as f64,
+                    angle_of_attack_deg: 0.0,
+                    yaw_deg: 0.0,
+                    roll_deg: 0.0,
                     transform_4x4: vm.transform_4x4,
                     target_grid: vm.n,
                     solid_voxels: vm.solid_voxels,
                     voxel_components: vm.components,
                     minimum_cells_across: vm.minimum_cells_across,
                     boundary_clearance_cells: vm.boundary_clearance_cells,
+                    voxel_axis_disagreement_fraction: vm.axis_disagreement_fraction,
+                    voxel_odd_crossing_rows: vm.odd_crossing_rows,
+                    voxel_classification_version: vm.classification_version,
                     warnings: warnings.clone(),
                     waivers: Vec::new(),
                     transform_approved: false,
@@ -7439,33 +10994,17 @@ impl ReynApp {
                     source_revision_id: Some(source_revision_id.clone()),
                     case_revision_id: Some(case_revision_id.clone()),
                     model_id: model.clone(),
-                    model_sha256: model_card
-                        .as_ref()
-                        .map(|card| card.checkpoint_sha256.clone()),
-                    model_max_steps: model_card.as_ref().map(|card| card.max_steps).unwrap_or(64),
-                    model_support: model_card
-                        .as_ref()
-                        .map(|card| engineering::ModelSupport {
-                            status: card.status.clone(),
-                            dimension: card.dimension,
-                            grid: card.grid,
-                            input_channels: card.in_channels,
-                            output_channels: card.out_channels,
-                            scenario: card.scenario.clone(),
-                            physics_contract: card.physics_contract.clone(),
-                        })
-                        .unwrap_or_default(),
+                    model_sha256,
+                    model_max_steps,
+                    model_support,
                     preflight,
                     operating: engineering::OperatingPoint {
                         reference_length,
                         // Settings › Workflow default, clamped to the model.
-                        horizon_steps: self.settings.default_horizon_steps.clamp(
-                            1,
-                            model_card
-                                .as_ref()
-                                .map(|card| card.max_steps.max(1))
-                                .unwrap_or(64),
-                        ),
+                        horizon_steps: self
+                            .settings
+                            .default_horizon_steps
+                            .clamp(1, model_max_steps.max(1)),
                         ..Default::default()
                     },
                     result: None,
@@ -7474,10 +11013,12 @@ impl ReynApp {
                         .as_ref()
                         .and_then(|case| case.active_run_id.clone()),
                 };
-                if let Err(error) =
-                    self.project
-                        .add_content_with_digest(bytes.clone(), "model/stl", &source_sha256)
-                {
+                if let Err(error) = self.add_project_content(
+                    "Importing a geometry revision",
+                    bytes.clone(),
+                    "model/stl",
+                    &source_sha256,
+                ) {
                     self.project_notice =
                         Some((format!("Geometry content was not stored: {error}"), true));
                     return;
@@ -7507,6 +11048,9 @@ impl ReynApp {
                         "solid_voxels": vm.solid_voxels,
                         "minimum_cells_across": vm.minimum_cells_across,
                         "boundary_clearance_cells": vm.boundary_clearance_cells,
+                        "axis_disagreement_fraction": vm.axis_disagreement_fraction,
+                        "odd_crossing_rows_xyz": vm.odd_crossing_rows,
+                        "classification_version": vm.classification_version,
                         "transform_4x4": vm.transform_4x4,
                     }),
                     outputs: serde_json::json!({
@@ -7521,31 +11065,38 @@ impl ReynApp {
                     .cases()
                     .iter()
                     .any(|case| case.case_id() == case_id);
-                let persist_result = self.project.transact(now_utc_unix(), |manifest| {
-                    manifest.add_source_revision(source, now_utc_unix())?;
-                    if existing_case {
-                        manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
-                    } else {
-                        manifest.create_case(
-                            case_id.clone(),
-                            workflow.name.clone(),
-                            revision,
-                            now_utc_unix(),
-                        )?;
-                    }
-                    Ok(())
-                });
+                let persist_result = self.transact_project(
+                    "Importing a geometry revision",
+                    now_utc_unix(),
+                    |manifest| {
+                        manifest.add_source_revision(source, now_utc_unix())?;
+                        if existing_case {
+                            manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
+                        } else {
+                            manifest.create_case(
+                                case_id.clone(),
+                                workflow.name.clone(),
+                                revision,
+                                now_utc_unix(),
+                            )?;
+                        }
+                        Ok(())
+                    },
+                );
                 if let Err(error) = persist_result {
                     self.project_notice =
                         Some((format!("Case revision was not recorded: {error}"), true));
                     return;
                 }
+                self.dependencies_dirty = true;
                 self.invalidate_cad_section();
                 self.cad = Some(CadCase {
                     mask: mask.clone(),
+                    mask_bounds: cad::mask_bounds(mask.as_ref(), vm.n),
                     model: model.clone(),
                     steps: workflow.operating.horizon_steps,
                     surf: None,
+                    surf_mask_source: None,
                     name: name.clone(),
                     workflow,
                     velocity: Vec::new(),
@@ -7553,11 +11104,17 @@ impl ReynApp {
                     cp: Vec::new(),
                     traction: Vec::new(),
                     result_grid: 0,
+                    dt_frame: 0.0,
                     active_run_id: None,
                     pending: false,
                     pending_request_id: None,
                     pending_run: None,
+                    playback: HorizonPlayback::default(),
                 });
+                self.case_draft_dirty = false;
+                self.orientation_draft = None;
+                self.orientation_pending = None;
+                self.rebase_case_draft_history();
                 self.nav = Nav::Case;
                 self.engine_status = format!(
                     "● {name}: {} triangles → {} solid voxels @ {}³ · preflight required",
@@ -7578,20 +11135,27 @@ impl ReynApp {
     fn import_model(&mut self) {
         if !self.engine_ok {
             self.library.notice = Some((
-                "Engine unavailable; checkpoint validation cannot run.".into(),
+                "Engine unavailable; model-bundle validation cannot run.".into(),
                 true,
             ));
             self.nav = Nav::Models;
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("checkpoint", &["pth"])
+            .add_filter("Reyn model bundle", &["reynmodel"])
             .set_directory(&self.settings.research_dir)
             .pick_file()
         {
+            if let Err(error) = engine::require_model_signature(&path) {
+                self.library.busy = false;
+                self.library.validation = None;
+                self.library.notice = Some((error.to_string(), true));
+                self.nav = Nav::Models;
+                return;
+            }
             self.library.busy = true;
             self.library.validation = None;
-            self.library.notice = Some(("Validating checkpoint contract…".into(), false));
+            self.library.notice = Some(("Validating model-bundle contract…".into(), false));
             let _ = self.engine.tx.send(engine::Cmd::ImportModel {
                 path: path.to_string_lossy().into_owned(),
             });
@@ -7643,13 +11207,27 @@ impl ReynApp {
         };
         if model.status == "invalid" {
             self.library.notice =
-                Some(("Rejected checkpoints cannot be made active.".into(), true));
+                Some(("Rejected model bundles cannot be made active.".into(), true));
+            return;
+        }
+        if model.authenticity_status != "verified" {
+            self.library.notice = Some((
+                format!(
+                    "Unsigned or unauthenticated model bundles cannot be made active. {}",
+                    engine::TRUSTED_MODEL_CONVERSION_GUIDANCE
+                ),
+                true,
+            ));
+            return;
+        }
+        if !engine::is_model_bundle_id(&model.id) {
+            self.library.notice = Some((engine::TRUSTED_MODEL_CONVERSION_GUIDANCE.into(), true));
             return;
         }
         self.current_model = model.id.clone();
         self.seed = self.seed.wrapping_add(1);
         if model.dimension == 2 {
-            self.f2d_model = model.id;
+            self.f2d_model = model.id.clone();
             self.f2d = None;
             self.f2d_tex.clear();
             self.f2d_sig = u64::MAX;
@@ -7690,6 +11268,7 @@ impl ReynApp {
         } else {
             self.nav = Nav::Models;
         }
+        let persistence = self.persist_model_default(&model.id, model.dimension);
         if self.engine_ok && model.dimension == 3 && self.settings.developer_research_sandbox {
             let _ = self.engine.tx.send(engine::Cmd::Predict {
                 model: self.current_model.clone(),
@@ -7697,7 +11276,30 @@ impl ReynApp {
             });
             self.engine_status = "● Predicting…".into();
         }
-        self.library.notice = Some((format!("{} is now active", self.current_model), false));
+        self.library.notice = Some(match persistence {
+            Ok(()) => (format!("{} is now active", self.current_model), false),
+            Err(error) => (
+                format!(
+                    "{} is active for this session, but the default was not saved: {error}",
+                    self.current_model
+                ),
+                true,
+            ),
+        });
+    }
+
+    fn persist_model_default(&mut self, model_id: &str, dimension: u32) -> Result<(), String> {
+        if !engine::is_model_bundle_id(model_id) {
+            return Err(engine::TRUSTED_MODEL_CONVERSION_GUIDANCE.into());
+        }
+        match dimension {
+            2 => self.settings.default_2d_model = model_id.into(),
+            3 => self.settings.default_3d_model = model_id.into(),
+            _ => return Err(format!("unsupported model dimension {dimension}")),
+        }
+        self.settings.normalize();
+        self.settings_draft = self.settings.clone();
+        self.settings.save().map(|_| ())
     }
 
     fn handle_library_action(&mut self, action: library::LibraryAction) {
@@ -7705,13 +11307,13 @@ impl ReynApp {
             library::LibraryAction::Activate(model) => self.activate_model(&model),
             library::LibraryAction::Delete(model) => {
                 self.library.busy = true;
-                self.library.notice = Some(("Deleting managed checkpoint…".into(), false));
+                self.library.notice = Some(("Deleting managed model bundle…".into(), false));
                 let _ = self.engine.tx.send(engine::Cmd::DeleteModel { model });
             }
             library::LibraryAction::Import => self.import_model(),
             library::LibraryAction::Refresh => {
                 self.library.busy = true;
-                self.library.notice = Some(("Refreshing checkpoint metadata…".into(), false));
+                self.library.notice = Some(("Refreshing model-bundle metadata…".into(), false));
                 let _ = self.engine.tx.send(engine::Cmd::ListModels);
             }
         }
@@ -7721,19 +11323,84 @@ impl ReynApp {
         match action {
             settings::SettingsAction::RestoreDefaults => {
                 // Preferences reset; user data (signing identity, saved
-                // operating-point presets) is preserved as promised in the
-                // confirmation copy.
-                let mut defaults = settings::AppSettings::default();
-                defaults.signing_key_reference = self.settings.signing_key_reference.clone();
-                defaults.signing_public_key_base64 =
-                    self.settings.signing_public_key_base64.clone();
-                defaults.signing_key_fingerprint_sha256 =
-                    self.settings.signing_key_fingerprint_sha256.clone();
-                defaults.revoked_signing_key_fingerprints =
-                    self.settings.revoked_signing_key_fingerprints.clone();
-                defaults.operating_presets = self.settings.operating_presets.clone();
+                // operating-point presets, and case templates) is preserved as
+                // promised in the confirmation copy.
+                let defaults = settings::AppSettings {
+                    signing_key_reference: self.settings.signing_key_reference.clone(),
+                    signing_public_key_base64: self.settings.signing_public_key_base64.clone(),
+                    signing_key_fingerprint_sha256: self
+                        .settings
+                        .signing_key_fingerprint_sha256
+                        .clone(),
+                    revoked_signing_key_fingerprints: self
+                        .settings
+                        .revoked_signing_key_fingerprints
+                        .clone(),
+                    operating_presets: self.settings.operating_presets.clone(),
+                    case_templates: self.settings.case_templates.clone(),
+                    ..settings::AppSettings::default()
+                };
                 self.settings_draft = defaults;
                 self.settings_notice = Some(("Defaults staged; save to apply.".into(), false));
+            }
+            settings::SettingsAction::ImportCaseTemplate => {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Reyn case template", &[settings::CASE_TEMPLATE_EXTENSION])
+                    .pick_file()
+                else {
+                    return;
+                };
+                match settings::load_case_template(&path) {
+                    Ok(template) => {
+                        let name = template.name.clone();
+                        match self.settings_draft.upsert_case_template(template) {
+                            Ok(()) => {
+                                self.settings_notice = Some((
+                                    format!(
+                                        "Imported template “{name}” from {}. Save settings to keep it.",
+                                        path.display()
+                                    ),
+                                    false,
+                                ));
+                            }
+                            Err(error) => {
+                                self.settings_notice =
+                                    Some((format!("Template was not imported: {error}"), true));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.settings_notice =
+                            Some((format!("Template was not imported: {error}"), true));
+                    }
+                }
+            }
+            settings::SettingsAction::ExportCaseTemplate(index) => {
+                let Some(template) = self.settings_draft.case_templates.get(index).cloned() else {
+                    self.settings_notice = Some((
+                        "Template was not exported: selection is unavailable.".into(),
+                        true,
+                    ));
+                    return;
+                };
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Reyn case template", &[settings::CASE_TEMPLATE_EXTENSION])
+                    .set_file_name(settings::case_template_file_name(&template))
+                    .save_file()
+                else {
+                    return;
+                };
+                self.settings_notice = Some(match settings::save_case_template(&template, &path) {
+                    Ok(()) => (
+                        format!(
+                            "Exported template “{}” to {}",
+                            template.name,
+                            path.display()
+                        ),
+                        false,
+                    ),
+                    Err(error) => (format!("Template was not exported: {error}"), true),
+                });
             }
             settings::SettingsAction::CreateSigningKey => {
                 let provider = signing::NativeKeychainProvider;
@@ -7832,6 +11499,7 @@ impl ReynApp {
                         ctx.set_zoom_factor(self.settings.ui_scale);
                         field2d::set_view_colormap(self.settings.colormap);
                         self.input_units = self.settings.input_units;
+                        self.schedule_autosave_from_now();
                         if display_changed {
                             // Force colormapped textures to rebuild with the
                             // new appearance preferences.
@@ -7858,7 +11526,9 @@ impl ReynApp {
         // runtime from presenting as revalidated output.
         self.invalidate_engine_results();
         self.engine = engine::EngineHandle::spawn_with_config(self.settings.engine_config());
+        self.attach_engine_repaint_wake();
         self.engine_ok = false;
+        self.dependencies_dirty = true;
         self.engine_status = "○ Restarting engine…".into();
         self.library.busy = true;
         let _ = self.engine.tx.send(engine::Cmd::ListModels);
@@ -7868,10 +11538,12 @@ impl ReynApp {
         // C7: the near-black well is for calibrated render viewports only;
         // document screens sit on the BG surface so the elevation ladder
         // (BG → SURFACE → SURFACE_HIGH) stays legible.
-        let is_render_screen = matches!(
-            self.nav,
-            Nav::Results | Nav::Metrics | Nav::Fields2D | Nav::FlowPainter | Nav::Benchmark
-        );
+        let has_result = self
+            .cad
+            .as_ref()
+            .and_then(|case| case.workflow.result.as_ref())
+            .is_some();
+        let is_render_screen = uses_scientific_canvas(self.nav, has_result);
         let canvas_fill = if is_render_screen {
             // Settings › Viewport: theme-sanctioned well surfaces only.
             self.settings.viewport_background.color()
@@ -7911,7 +11583,9 @@ impl ReynApp {
                 if self.nav == Nav::Case {
                     self.engineering_case_view(ui);
                 }
-                if matches!(self.nav, Nav::Results | Nav::Metrics) {
+                if self.nav == Nav::Results && !has_result {
+                    self.engineering_results_empty_view(ui);
+                } else if matches!(self.nav, Nav::Results | Nav::Metrics) {
                     if self.nav == Nav::Results && !self.volumetric {
                         self.cad_section_view(ui, rect);
                     } else {
@@ -7966,8 +11640,21 @@ impl ReynApp {
                             orbit_sensitivity: self.settings.orbit_sensitivity,
                             invert_scroll_zoom: self.settings.invert_scroll_zoom,
                             show_domain_bounds: self.settings.show_domain_bounds,
+                            nav_scheme: self.settings.navigation_scheme,
+                            // Frame the body itself, not the tunnel: zoom-to-fit
+                            // is only useful if it fits what you imported.
+                            fit_bounds: self.cad.as_ref().and_then(|case| case.mask_bounds),
+                            snap_to: self.view_snap.take(),
+                            fit_now: std::mem::take(&mut self.view_fit),
+                            reduced_motion: reduced_motion(ui.ctx()),
+                            research_sandbox: self.nav == Nav::Metrics
+                                && self.settings.developer_research_sandbox,
                         };
-                        viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
+                        let interaction =
+                            viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
+                        if let Some(screen) = interaction.picked {
+                            self.probe_surface_at(rect, screen);
+                        }
                     }
                 }
                 if self.nav == Nav::Fields2D {
@@ -8063,9 +11750,10 @@ impl ReynApp {
                     }
                 }
                 // camera chip — live azimuth / elevation / zoom (3D only)
-                if matches!(self.nav, Nav::Results | Nav::Metrics)
-                    && !(self.nav == Nav::Results && !self.volumetric)
-                {
+                let mut camera_readout = None;
+                let show_3d_controls = self.nav == Nav::Metrics
+                    || (self.nav == Nav::Results && has_result && self.volumetric);
+                if show_3d_controls {
                     let cam_text = format!(
                         "Perspective  ·  az {:>3.0}°  el {:>3.0}°  ·  zoom {:.2}×",
                         self.cam.yaw.to_degrees().rem_euclid(360.0),
@@ -8089,6 +11777,14 @@ impl ReynApp {
                         cg,
                         TEXT_DIM,
                     );
+                    camera_readout = Some(chip);
+                }
+
+                // Camera stations and zoom-to-fit, mirroring the 1–7 / F keys.
+                if show_3d_controls {
+                    self.viewport_camera_controls(ui, rect, banner_offset, camera_readout);
+                    self.viewport_horizon_controls(ui, rect);
+                    self.draw_surface_probe(&p, rect, mono_s().resolve(ui.style()));
                 }
 
                 // The floating engine pill is retired: engine state lives in
@@ -8097,25 +11793,48 @@ impl ReynApp {
                 // Interaction hint — dropped on short viewports where it
                 // would collide with the section legend (QA R7), and
                 // suppressible from Settings › Viewport.
-                if matches!(self.nav, Nav::Results | Nav::Metrics)
+                if (self.nav == Nav::Metrics || (self.nav == Nav::Results && has_result))
                     && rect.height() >= 420.0
                     && self.settings.show_viewport_hints
                 {
-                    p.text(
-                        rect.center_bottom() - Vec2::new(0.0, 22.0),
-                        Align2::CENTER_CENTER,
-                        if self.nav == Nav::Results {
-                            if self.volumetric {
-                                "drag to orbit · scroll to zoom · section planes remain linked to this case"
-                            } else {
-                                "stored engineering section · hover to inspect · geometry from active run mask"
-                            }
-                        } else {
-                            "research sandbox · drag to orbit · scroll to zoom · G to regenerate"
-                        },
-                        egui::TextStyle::Small.resolve(ui.style()),
-                        TEXT_MUTE,
+                    // The hint names the bindings of the scheme that is actually
+                    // active (Settings › Viewport & camera), so learning the
+                    // viewport never requires guessing.
+                    let mapping = self.settings.navigation_scheme.mapping();
+                    let primary = |binding: &str| {
+                        binding
+                            .split(',')
+                            .next()
+                            .unwrap_or(binding)
+                            .to_lowercase()
+                    };
+                    let gestures = format!(
+                        "{} to orbit · {} to pan · scroll to zoom",
+                        primary(mapping[0].1),
+                        primary(mapping[1].1),
                     );
+                    let hint = if self.nav == Nav::Results {
+                        if self.volumetric {
+                            format!("{gestures} · F fits · 1–7 stations · click the body to probe")
+                        } else {
+                            "stored engineering section · hover to inspect · geometry from active run mask".to_owned()
+                        }
+                    } else {
+                        format!("research sandbox · {gestures} · F fits · G regenerates")
+                    };
+                    // A hint that runs off both edges teaches nothing, so on a
+                    // narrow viewport it drops rather than clipping — the same
+                    // bindings are printed in Settings › Keyboard shortcuts.
+                    let galley =
+                        p.layout_no_wrap(hint, egui::TextStyle::Small.resolve(ui.style()), TEXT_MUTE);
+                    if galley.size().x <= rect.width() - 32.0 {
+                        p.galley(
+                            rect.center_bottom()
+                                - Vec2::new(galley.size().x * 0.5, 22.0 + galley.size().y * 0.5),
+                            galley,
+                            TEXT_MUTE,
+                        );
+                    }
                 }
 
                 // Crossfade veil: painted last so it sits over everything in
@@ -8127,15 +11846,547 @@ impl ReynApp {
             });
     }
 
+    /// Camera stations and zoom-to-fit, top-right of the render viewport. Every
+    /// station is named in flow terms and carries its meaning on hover, so the
+    /// bindings are learnable without leaving the picture.
+    fn viewport_camera_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        banner_offset: f32,
+        readout: Option<Rect>,
+    ) {
+        const STRIP: Vec2 = Vec2::new(320.0, 30.0);
+        let mut snap = None;
+        let mut fit = false;
+        let mut strip = Rect::from_min_size(
+            egui::pos2(
+                rect.max.x - STRIP.x - 16.0,
+                rect.min.y + 16.0 + banner_offset,
+            ),
+            STRIP,
+        );
+        // On a narrow viewport the strip would land on top of the camera
+        // readout. Take the row underneath instead of overprinting it.
+        if let Some(readout) = readout.filter(|chip| strip.min.x < chip.max.x + 12.0) {
+            strip = Rect::from_min_size(egui::pos2(strip.min.x, readout.max.y + 8.0), strip.size());
+        }
+        if !rect.contains(strip.min) || !rect.contains(strip.max) {
+            return; // too narrow to place honestly; keys still work
+        }
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(strip)
+                .layout(Layout::right_to_left(Align::Center)),
+            |ui| {
+                Frame::NONE
+                    .fill(SURFACE)
+                    .corner_radius(CornerRadius::same(R2))
+                    .stroke(Stroke::new(1.0, OUTLINE_VARIANT))
+                    .inner_margin(2)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for view in viewport::StandardView::ALL.into_iter().rev() {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(view.short())
+                                                .text_style(mono_s())
+                                                .color(TEXT_DIM),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(CornerRadius::same(R1)),
+                                    )
+                                    .on_hover_text(format!("{} — {}", view.label(), view.detail()))
+                                    .clicked()
+                                {
+                                    snap = Some(view);
+                                }
+                            }
+                            ui.add(egui::Separator::default().vertical().spacing(6.0));
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("{} Fit", ph::CROSSHAIR))
+                                            .text_style(mono_s())
+                                            .color(TEXT),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(CornerRadius::same(R1)),
+                                )
+                                .on_hover_text(
+                                    "Frame the imported geometry (F). With no geometry loaded it frames the solver domain.",
+                                )
+                                .clicked()
+                            {
+                                fit = true;
+                            }
+                        });
+                    });
+            },
+        );
+        if snap.is_some() {
+            self.view_snap = snap;
+        }
+        if fit {
+            self.view_fit = true;
+        }
+    }
+
+    /// Horizon playback for a completed case: step through the model's own
+    /// prediction sequence. The label always names the horizon step; physical
+    /// time appears only when it can be derived from the recorded run.
+    fn viewport_horizon_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let Some(state) = self.cad.as_ref().and_then(|case| {
+            case.workflow.result.as_ref()?;
+            Some((
+                case.display_step(),
+                case.steps,
+                case.workflow.model_max_steps.max(case.steps).max(1),
+                case.playback.playing,
+                case.playback.fetching.as_ref().map(|(step, _)| *step),
+                case.playback.failed.contains(&case.display_step()),
+                case.display_fields().is_some(),
+                case.playback.frames.len(),
+            ))
+        }) else {
+            return;
+        };
+        let (step, recorded_step, max_step, playing, fetching, failed, available, cached) = state;
+        if rect.height() < 320.0 || rect.width() < 520.0 {
+            return; // no honest room; the keys and Results panel still work
+        }
+        let bar = Rect::from_min_size(
+            egui::pos2(rect.center().x - 250.0, rect.max.y - 76.0),
+            Vec2::new(500.0, 56.0),
+        );
+        let seconds = self.seconds_per_horizon_step();
+        let mut requested: Option<u32> = None;
+        let mut toggle = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            Frame::NONE
+                .fill(SURFACE)
+                .corner_radius(CornerRadius::same(R2))
+                .stroke(Stroke::new(1.0, OUTLINE_VARIANT))
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(step > 1, egui::Button::new(ph::SKIP_BACK).frame(false))
+                            .on_hover_text("Previous horizon step (,)")
+                            .on_disabled_hover_text("Already at horizon step 1")
+                            .clicked()
+                        {
+                            requested = Some(step.saturating_sub(1));
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(if playing {
+                                    ph::PAUSE
+                                } else {
+                                    ph::PLAY
+                                })
+                                .frame(false),
+                            )
+                            .on_hover_text(if playing {
+                                "Pause (Space)"
+                            } else {
+                                "Play through the horizon (Space) — one model prediction per step, not real time"
+                            })
+                            .clicked()
+                        {
+                            toggle = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                step < max_step,
+                                egui::Button::new(ph::SKIP_FORWARD).frame(false),
+                            )
+                            .on_hover_text("Next horizon step (.)")
+                            .on_disabled_hover_text(format!(
+                                "Horizon step {max_step} is the model's declared limit"
+                            ))
+                            .clicked()
+                        {
+                            requested = Some(step + 1);
+                        }
+                        let mut slider_step = step;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut slider_step, 1..=max_step)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            )
+                            .changed()
+                        {
+                            requested = Some(slider_step);
+                        }
+                    });
+                    // One line, always naming what the number means.
+                    let mut label = format!("MODEL HORIZON STEP {step} of {max_step}");
+                    if let Some(seconds) = seconds {
+                        label.push_str(&format!(
+                            " · t ≈ {:.4} s",
+                            seconds * step as f64
+                        ));
+                    }
+                    let (chip, chip_color) = if step == recorded_step {
+                        ("RECORDED RUN", BRAND)
+                    } else if fetching == Some(step) {
+                        ("FETCHING", WARN)
+                    } else if failed {
+                        ("UNAVAILABLE", DANGER)
+                    } else if available {
+                        ("PREVIEW · NOT RECORDED", GOLD)
+                    } else {
+                        ("NOT COMPUTED", WARN)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).text_style(mono_s()).color(TEXT_DIM));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(chip_text(chip).color(chip_color)).on_hover_text(
+                                if step == recorded_step {
+                                    "This step is the horizon the immutable run stored.".to_owned()
+                                } else {
+                                    format!(
+                                        "Preview of the model at horizon step {step}. It is displayed only — the recorded run stays at step {recorded_step}. {cached} step(s) cached this session."
+                                    )
+                                },
+                            );
+                        });
+                    });
+                });
+        });
+        if toggle {
+            self.toggle_horizon_playback();
+        }
+        if let Some(next) = requested {
+            if let Some(case) = self.cad.as_mut() {
+                case.playback.playing = false;
+            }
+            self.show_horizon_step(next);
+        }
+    }
+
+    /// Horizon playback for the completed case, in the inspector so it also
+    /// drives the 2D section view. Every step other than the recorded horizon is
+    /// a display-only model preview and is labeled as one.
+    fn horizon_playback_card(&mut self, ui: &mut egui::Ui) {
+        let Some(state) = self.cad.as_ref().and_then(|case| {
+            case.workflow.result.as_ref()?;
+            let step = case.display_step();
+            Some((
+                step,
+                case.steps,
+                case.workflow.model_max_steps.max(case.steps).max(1),
+                case.playback.playing,
+                case.playback
+                    .fetching
+                    .as_ref()
+                    .map(|(fetching, _)| *fetching),
+                case.playback.failed.contains(&step),
+                case.playback.frames.len(),
+                case.playback
+                    .frames
+                    .get(&step)
+                    .map(|frame| (frame.force_coefficients, frame.cp_min, frame.cp_max)),
+            ))
+        }) else {
+            return;
+        };
+        let (step, recorded_step, max_step, playing, fetching, failed, cached, preview) = state;
+        let seconds = self.seconds_per_horizon_step();
+        let format = self.settings.value_format();
+        let mut requested: Option<u32> = None;
+        let mut toggle = false;
+        card(ui, |ui| {
+            ui.label(caps("Horizon playback"));
+            ui.label(
+                RichText::new(
+                    "Each step is one model prediction at that lead time, not a time integration. Step controls also drive the 2D section view.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(step > 1, egui::Button::new(ph::SKIP_BACK))
+                    .on_hover_text("Previous horizon step (,)")
+                    .on_disabled_hover_text("Already at horizon step 1")
+                    .clicked()
+                {
+                    requested = Some(step.saturating_sub(1));
+                }
+                if ui
+                    .add(egui::Button::new(if playing { ph::PAUSE } else { ph::PLAY }))
+                    .on_hover_text(if playing {
+                        "Pause (Space)"
+                    } else {
+                        "Play through the horizon (Space). Uncached steps are predicted on demand, so playback waits for the engine."
+                    })
+                    .clicked()
+                {
+                    toggle = true;
+                }
+                if ui
+                    .add_enabled(step < max_step, egui::Button::new(ph::SKIP_FORWARD))
+                    .on_hover_text("Next horizon step (.)")
+                    .on_disabled_hover_text(format!(
+                        "Horizon step {max_step} is the model's declared limit"
+                    ))
+                    .clicked()
+                {
+                    requested = Some(step + 1);
+                }
+                let mut slider_step = step;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut slider_step, 1..=max_step)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    )
+                    .on_hover_text("Scrub the model horizon")
+                    .changed()
+                {
+                    requested = Some(slider_step);
+                }
+            });
+            ui.add_space(6.0);
+            let (chip, chip_color, note) = if step == recorded_step {
+                (
+                    "RECORDED RUN",
+                    BRAND,
+                    "This step is the horizon the immutable run stored; it is the only step in the evidence chain.".to_owned(),
+                )
+            } else if fetching == Some(step) {
+                (
+                    "FETCHING",
+                    WARN,
+                    "The engine is predicting this step. The recorded run is unaffected."
+                        .to_owned(),
+                )
+            } else if failed {
+                (
+                    "UNAVAILABLE",
+                    DANGER,
+                    "This step could not be fetched. Nothing is shown for it rather than showing another step's field.".to_owned(),
+                )
+            } else if preview.is_some() {
+                (
+                    "PREVIEW · NOT RECORDED",
+                    GOLD,
+                    format!("Display-only model preview at horizon step {step}. The recorded run stays at step {recorded_step}."),
+                )
+            } else {
+                (
+                    "NOT COMPUTED",
+                    WARN,
+                    "This step has not been predicted yet.".to_owned(),
+                )
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("STEP {step} of {max_step}"))
+                        .text_style(mono_s())
+                        .color(TEXT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(chip_text(chip).color(chip_color))
+                        .on_hover_text(note);
+                });
+            });
+            ui.add_space(6.0);
+            match seconds {
+                Some(seconds) => diag(
+                    ui,
+                    "Lead time",
+                    &format!("{:.4} s after the developed state", seconds * step as f64),
+                    TEXT_DIM,
+                ),
+                None => diag(
+                    ui,
+                    "Lead time",
+                    "not stated · declare units and a complete operating point",
+                    TEXT_MUTE,
+                ),
+            }
+            // Per-step coefficients, only for steps we actually hold.
+            if let Some((coefficients, cp_min, cp_max)) = preview {
+                measure_row(
+                    ui,
+                    "Cd at this step",
+                    &units::format_value(coefficients[0] as f64, format),
+                    "–",
+                    "PREVIEW",
+                    GOLD,
+                )
+                .on_hover_text(engineering::COEFFICIENT_REFERENCE_FRAME);
+                measure_row(
+                    ui,
+                    "Cl at this step",
+                    &units::format_value(coefficients[2] as f64, format),
+                    "–",
+                    "PREVIEW",
+                    GOLD,
+                );
+                measure_row(
+                    ui,
+                    "Cp range at this step",
+                    &format!(
+                        "{} … {}",
+                        units::format_value(cp_min as f64, format),
+                        units::format_value(cp_max as f64, format)
+                    ),
+                    "–",
+                    "PREVIEW",
+                    GOLD,
+                );
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{cached} step(s) cached this session · previews are memory-only and are dropped when the case changes"
+                ))
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+        });
+        if toggle {
+            self.toggle_horizon_playback();
+        }
+        if let Some(next) = requested {
+            if let Some(case) = self.cad.as_mut() {
+                case.playback.playing = false;
+            }
+            self.show_horizon_step(next);
+        }
+    }
+
+    /// The 3D surface probe readout, anchored to the picked point.
+    fn draw_surface_probe(&self, painter: &egui::Painter, rect: Rect, font: egui::FontId) {
+        let Some(probe) = self.probe3d.as_ref() else {
+            return;
+        };
+        let format = self.settings.value_format();
+        let system = self.settings.unit_system;
+        let traction = (probe.traction_pa[0].powi(2)
+            + probe.traction_pa[1].powi(2)
+            + probe.traction_pa[2].powi(2))
+        .sqrt();
+        let mut lines = vec![
+            format!(
+                "Cp {}  · DERIVED",
+                units::format_value(probe.cp as f64, format)
+            ),
+            format!(
+                "p  {}  · RECOVERED",
+                units::format_quantity(
+                    units::Quantity::Pressure,
+                    probe.pressure_pa as f64,
+                    system,
+                    format
+                )
+            ),
+            format!(
+                "|t| {}  · DERIVED",
+                units::format_quantity(units::Quantity::Pressure, traction as f64, system, format)
+            ),
+        ];
+        lines.push(match probe.source_m {
+            Some(point) => format!(
+                "at [{:.4}, {:.4}, {:.4}] m · source frame",
+                point[0], point[1], point[2]
+            ),
+            None => format!(
+                "at cell [{}, {}, {}] · source frame unavailable",
+                probe.cell[0], probe.cell[1], probe.cell[2]
+            ),
+        });
+        lines.push(if probe.recorded {
+            format!("horizon step {} · recorded run", probe.step)
+        } else {
+            format!("horizon step {} · preview, not recorded", probe.step)
+        });
+        let galleys: Vec<_> = lines
+            .iter()
+            .map(|line| painter.layout_no_wrap(line.clone(), font.clone(), TEXT))
+            .collect();
+        let width = galleys
+            .iter()
+            .fold(0.0f32, |widest, galley| widest.max(galley.size().x))
+            + 22.0;
+        let height = galleys.len() as f32 * (font.size + 4.0) + 18.0;
+        // Re-project every frame so the readout follows the picked point. When
+        // the point swings behind the camera there is nothing honest to anchor
+        // to, so the readout steps aside rather than floating somewhere wrong.
+        let Some((screen, _)) = self.cam.project(rect, probe.anchor) else {
+            return;
+        };
+        let anchor = egui::pos2(
+            (screen.x + 14.0).clamp(rect.min.x + 8.0, (rect.max.x - width - 8.0).max(rect.min.x)),
+            (screen.y + 14.0).clamp(
+                rect.min.y + 8.0,
+                (rect.max.y - height - 8.0).max(rect.min.y),
+            ),
+        );
+        let card = Rect::from_min_size(anchor, Vec2::new(width, height));
+        painter.rect_filled(card, CornerRadius::same(R2), SURFACE);
+        painter.rect_stroke(
+            card,
+            CornerRadius::same(R2),
+            Stroke::new(1.0, OUTLINE),
+            egui::StrokeKind::Inside,
+        );
+        painter.circle_stroke(screen, 5.0, Stroke::new(1.5, BRAND));
+        painter.line_segment(
+            [screen, egui::pos2(card.min.x, card.min.y)],
+            Stroke::new(1.0, OUTLINE_VARIANT),
+        );
+        for (index, galley) in galleys.into_iter().enumerate() {
+            painter.galley(
+                egui::pos2(
+                    card.min.x + 11.0,
+                    card.min.y + 9.0 + index as f32 * (font.size + 4.0),
+                ),
+                galley,
+                TEXT_DIM,
+            );
+        }
+    }
+
     fn ensure_cad_section_texture(&mut self, ctx: &egui::Context) {
         let Some(case) = self.cad.as_ref() else {
             self.invalidate_cad_section();
             self.section_error = Some("No active engineering result is available.".into());
             return;
         };
+        // The section follows horizon playback: it renders the step on screen,
+        // and says so rather than showing another step's data under this label.
+        let step = case.display_step();
+        let Some(fields) = case.display_fields() else {
+            let pending = case
+                .playback
+                .fetching
+                .as_ref()
+                .is_some_and(|(fetching, _)| *fetching == step);
+            self.section_tex = None;
+            self.section_data = None;
+            self.section_sig = u64::MAX;
+            self.section_error = Some(if pending {
+                format!("Horizon step {step} is being predicted…")
+            } else {
+                format!(
+                    "Horizon step {step} has not been computed. Use the horizon controls to predict it."
+                )
+            });
+            return;
+        };
         let axis_index = self.section_axis.id() as usize;
         let location = self.slice_pos[axis_index];
-        let index = match engineering_section::section_index(case.result_grid, location) {
+        let index = match engineering_section::section_index(fields.n, location) {
             Ok(index) => index,
             Err(error) => {
                 self.invalidate_cad_section();
@@ -8146,7 +12397,8 @@ impl ReynApp {
         let signature = self.cad_version.wrapping_mul(131)
             ^ self.section_axis.id().wrapping_mul(17)
             ^ self.section_quantity.id().wrapping_mul(31)
-            ^ (index as u64).wrapping_mul(47);
+            ^ (index as u64).wrapping_mul(47)
+            ^ (step as u64).wrapping_mul(1_000_003);
         if signature == self.section_sig
             && (self.section_tex.is_some() || self.section_error.is_some())
         {
@@ -8160,12 +12412,12 @@ impl ReynApp {
                 .meters_per_unit()
                 .unwrap_or(0.0);
         let input = engineering_section::SectionInput {
-            n: case.result_grid,
-            velocity: &case.velocity,
-            pressure_pa: &case.pressure,
-            mask: case.mask.as_ref(),
-            cp: &case.cp,
-            traction_pa: &case.traction,
+            n: fields.n,
+            velocity: fields.velocity,
+            pressure_pa: fields.pressure,
+            mask: fields.mask,
+            cp: fields.cp,
+            traction_pa: fields.traction,
             free_stream_mps: case.workflow.operating.velocity as f32,
             reference_pressure_pa: case.workflow.operating.reference_pressure as f32,
             reference_length_m: reference_length_m as f32,
@@ -8316,6 +12568,7 @@ impl ReynApp {
     /// live hover probe, and a calibrated legend.
     fn field2d_view(&mut self, ui: &mut egui::Ui, rect: Rect) {
         self.ensure_f2d_textures(ui.ctx());
+        self.ensure_f2d_insights();
         let p = ui.painter_at(rect);
         if self.f2d_tex.is_empty() {
             let t = if self.f2d_pending {
@@ -8375,14 +12628,8 @@ impl ReynApp {
         // Auto-pinned critical points: field classes on the model panel and the
         // error hotspot on the |error| panel when the reference is shown.
         if self.insights_on {
-            let truth = if self.f2d_truth {
-                f.truth.as_deref()
-            } else {
-                None
-            };
-            let all = field2d::insights(f, &f.ai, truth, self.f2d_var);
             let mut chips: Vec<Rect> = Vec::new();
-            for ins in &all {
+            for ins in &self.f2d_insights {
                 let class = ins.kind as usize;
                 if !self.insight_classes.get(class).copied().unwrap_or(true) {
                     continue;
@@ -8818,6 +13065,13 @@ impl ReynApp {
     }
 
     fn select_bench_cell(&mut self, seed_index: usize, horizon_index: usize) {
+        if self.project.availability().is_read_only_evidence() {
+            self.bench_inspector_error = Some(
+                "New cell inspection is blocked in read-only evidence mode; stored inspector evidence remains available."
+                    .into(),
+            );
+            return;
+        }
         if self.bench_inspector_pending {
             return;
         }
@@ -8981,7 +13235,7 @@ impl ReynApp {
         let content_w = (rect.width() - 2.0 * pad).max(600.0);
 
         // header: model · grid · epoch · global RelL2 · runtime
-        let stem = b.model.trim_end_matches(".pth");
+        let stem = b.model.trim_end_matches(".reynmodel");
         p.text(
             egui::pos2(x0, y),
             Align2::LEFT_TOP,
@@ -9370,6 +13624,7 @@ impl ReynApp {
     }
 
     fn controls_bench(&mut self, ui: &mut egui::Ui) {
+        let read_only = self.project.availability().is_read_only_evidence();
         let original_inputs = (
             self.f2d_model.clone(),
             self.bench_seed_start,
@@ -9383,8 +13638,18 @@ impl ReynApp {
                 .color(TEXT_MUTE),
         );
         ui.add_space(16.0);
+        if read_only {
+            ui.label(
+                RichText::new(
+                    "READ-ONLY EVIDENCE · Benchmark inputs, new suites, and new cell evidence are locked. Stored suite evidence remains inspectable.",
+                )
+                .text_style(caption())
+                .color(WARN),
+            );
+            ui.add_space(8.0);
+        }
 
-        let stem = |m: &str| m.trim_end_matches(".pth").to_string();
+        let stem = |m: &str| m.trim_end_matches(".reynmodel").to_string();
         let models: Vec<String> = self
             .models
             .iter()
@@ -9392,16 +13657,23 @@ impl ReynApp {
             .map(|model| model.id.clone())
             .collect();
         let mut pick = self.f2d_model.clone();
-        egui::ComboBox::from_id_salt("bench.model")
-            .selected_text(RichText::new(stem(&pick)).color(TEXT).size(12.5))
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for m in &models {
-                    ui.selectable_value(&mut pick, m.clone(), stem(m));
-                }
-            });
+        ui.add_enabled_ui(!read_only, |ui| {
+            egui::ComboBox::from_id_salt("bench.model")
+                .selected_text(RichText::new(stem(&pick)).color(TEXT).size(12.5))
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for m in &models {
+                        ui.selectable_value(&mut pick, m.clone(), stem(m));
+                    }
+                });
+        });
         if pick != self.f2d_model {
             self.f2d_model = pick;
+            let selected_model = self.f2d_model.clone();
+            if let Err(error) = self.persist_model_default(&selected_model, 2) {
+                self.settings_notice =
+                    Some((format!("The 2D model default was not saved: {error}"), true));
+            }
             self.bench = None;
             self.bench_selected = None;
             self.bench_inspector = None;
@@ -9412,6 +13684,9 @@ impl ReynApp {
 
         ui.add_space(12.0);
         card(ui, |ui| {
+            if read_only {
+                ui.disable();
+            }
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Exact seed start").color(TEXT_DIM));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -9489,7 +13764,12 @@ impl ReynApp {
         });
         // Disabled-with-reason (X3): the button never renders as a live
         // control while blocked, and states why on hover.
-        let (run_label, run_gate) = if self.bench_running {
+        let (run_label, run_gate) = if read_only {
+            (
+                "Read-only evidence",
+                Some("New benchmark runs are blocked in read-only evidence mode."),
+            )
+        } else if self.bench_running {
             ("Running…", Some("The benchmark suite is already running."))
         } else if self.bench_inspector_pending {
             ("Inspecting cell…", Some("A suite cell is being inspected."))
@@ -9502,7 +13782,7 @@ impl ReynApp {
             (
                 "Model unavailable",
                 Some(
-                    "The selected checkpoint is invalid or missing; pick another in Model Library.",
+                    "The selected model bundle is invalid or missing; pick another in Model Library.",
                 ),
             )
         } else {
@@ -9795,7 +14075,7 @@ impl ReynApp {
             .find(|model| model.id == benchmark.model)
             .map(|model| model.checkpoint_sha256.to_ascii_lowercase())
             .filter(|digest| is_sha256(digest))
-            .ok_or_else(|| "the selected model has no verified checkpoint SHA-256".to_string())?;
+            .ok_or_else(|| "the selected model has no verified bundle SHA-256".to_string())?;
         let timestamp_unix = self
             .project
             .manifest()
@@ -10074,6 +14354,7 @@ impl ReynApp {
         signature_json: &str,
         signature: &signing::SignedEvidenceArtifact,
     ) -> Result<bool, String> {
+        self.project_write_access("Recording signed evidence")?;
         let report_sha256 = signing::sha256_hex(canonical_report_json.as_bytes());
         let signature_sha256 = signing::sha256_hex(signature_json.as_bytes());
         let canonical_payload_sha256 = &signature.source.canonical_payload_sha256;
@@ -10093,20 +14374,20 @@ impl ReynApp {
         }) {
             return Ok(false);
         }
-        self.project
-            .add_content_with_digest(
-                canonical_report_json.as_bytes().to_vec(),
-                "application/vnd.reyn.benchmark-report+json",
-                &report_sha256,
-            )
-            .map_err(|error| format!("canonical report bundle: {error}"))?;
-        self.project
-            .add_content_with_digest(
-                signature_json.as_bytes().to_vec(),
-                "application/vnd.reyn.evidence-signature+json",
-                &signature_sha256,
-            )
-            .map_err(|error| format!("signature sidecar bundle: {error}"))?;
+        self.add_project_content(
+            "Recording signed evidence",
+            canonical_report_json.as_bytes().to_vec(),
+            "application/vnd.reyn.benchmark-report+json",
+            &report_sha256,
+        )
+        .map_err(|error| format!("canonical report bundle: {error}"))?;
+        self.add_project_content(
+            "Recording signed evidence",
+            signature_json.as_bytes().to_vec(),
+            "application/vnd.reyn.evidence-signature+json",
+            &signature_sha256,
+        )
+        .map_err(|error| format!("signature sidecar bundle: {error}"))?;
 
         let report_evidence_id = format!("benchmark-report-{report_sha256}");
         let signature_evidence_id =
@@ -10167,36 +14448,35 @@ impl ReynApp {
             calibrated_views: Vec::new(),
         };
         let now = now_utc_unix();
-        self.project
-            .transact(now, move |manifest| {
-                if !report_exists {
-                    manifest.append_evidence(report, now)?;
-                }
-                manifest.append_evidence(signature_evidence, now)?;
-                manifest.set_selection(
-                    project::ProjectSelection {
-                        active_case_id: manifest
-                            .cases()
-                            .iter()
-                            .find(|case| case.runs().iter().any(|run| run.run_id() == run_id))
-                            .map(|case| case.case_id().to_owned()),
-                        selected_run_id: Some(run_id),
-                        selected_evidence_id: Some(signature_evidence_id),
-                        selected_view_id: None,
-                    },
-                    now,
-                )?;
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+        self.transact_project("Recording signed evidence", now, move |manifest| {
+            if !report_exists {
+                manifest.append_evidence(report, now)?;
+            }
+            manifest.append_evidence(signature_evidence, now)?;
+            manifest.set_selection(
+                project::ProjectSelection {
+                    active_case_id: manifest
+                        .cases()
+                        .iter()
+                        .find(|case| case.runs().iter().any(|run| run.run_id() == run_id))
+                        .map(|case| case.case_id().to_owned()),
+                    selected_run_id: Some(run_id),
+                    selected_evidence_id: Some(signature_evidence_id),
+                    selected_view_id: None,
+                },
+                now,
+            )?;
+            Ok(())
+        })?;
+        self.dependencies_dirty = true;
         Ok(true)
     }
 
     fn controls_2d(&mut self, ui: &mut egui::Ui) {
         ui.label(title_text("Pressure Recovery (2D)"));
         ui.add_space(8.0);
-        // model selector — the obstacle-family 2D checkpoints (all work with predict2d)
-        let stem = |m: &str| m.trim_end_matches(".pth").to_string();
+        // Model selector — verified obstacle-family 2D bundles.
+        let stem = |m: &str| m.trim_end_matches(".reynmodel").to_string();
         let models: Vec<String> = self
             .models
             .iter()
@@ -10214,6 +14494,11 @@ impl ReynApp {
             });
         if pick != self.f2d_model {
             self.f2d_model = pick;
+            let selected_model = self.f2d_model.clone();
+            if let Err(error) = self.persist_model_default(&selected_model, 2) {
+                self.settings_notice =
+                    Some((format!("The 2D model default was not saved: {error}"), true));
+            }
             self.f2d = None;
             self.f2d_tex.clear();
             self.f2d_sig = u64::MAX;
@@ -11842,15 +16127,83 @@ fn nav_row(ui: &mut egui::Ui, icon: &str, label: &str, active: bool) -> bool {
     resp.clicked()
 }
 
-fn open_url(url: &str) {
+fn bundled_docs_path(current_exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let macos = current_exe.parent()?;
+    let contents = macos.parent()?;
+    if macos.file_name() == Some(std::ffi::OsStr::new("MacOS"))
+        && contents.file_name() == Some(std::ffi::OsStr::new("Contents"))
+    {
+        Some(contents.join("Resources").join("docs").join("PRD.md"))
+    } else {
+        None
+    }
+}
+
+fn resolve_docs_path_at(
+    current_exe: &std::path::Path,
+    current_dir: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = bundled_docs_path(current_exe) {
+        return if path.is_file() {
+            Ok(path)
+        } else {
+            Err("packaged documentation is missing from Contents/Resources/docs/PRD.md".into())
+        };
+    }
+
+    let current_dir = current_dir.ok_or_else(|| {
+        "the current directory is unavailable for development documentation discovery".to_owned()
+    })?;
+    for root in current_dir.ancestors().take(6) {
+        let candidate = root.join("PRD.md");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Some(parent) = current_exe.parent() {
+        for root in parent.ancestors().take(8) {
+            let candidate = root.join("PRD.md");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(
+        "development documentation was not found in current-directory or executable ancestors"
+            .into(),
+    )
+}
+
+fn resolve_docs_path() -> Result<std::path::PathBuf, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("the application executable path is unavailable: {error}"))?;
+    let current_dir = if bundled_docs_path(&current_exe).is_some() {
+        None
+    } else {
+        Some(
+            std::env::current_dir()
+                .map_err(|error| format!("the current directory is unavailable: {error}"))?,
+        )
+    };
+    resolve_docs_path_at(&current_exe, current_dir.as_deref())
+}
+
+fn open_path(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
+    let result = std::process::Command::new("open").arg(path).spawn();
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    let result = std::process::Command::new("xdg-open").arg(path).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", url])
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(path)
         .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    return Err("opening local documentation is unsupported on this platform".into());
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    result
+        .map(|_| ())
+        .map_err(|error| format!("failed to launch the local document opener: {error}"))
 }
 
 /// Centered icon+label button. `border` gives a ghost style. Hover and press
@@ -12088,39 +16441,62 @@ fn results_summary_tsv(
         "–",
         "PROVENANCE",
     );
+    row(
+        "body_orientation",
+        case.preflight.body_orientation_summary(),
+        "deg",
+        "PROVENANCE",
+    );
+    row(
+        "coefficient_frame",
+        engineering::COEFFICIENT_REFERENCE_FRAME.into(),
+        "–",
+        "PROVENANCE",
+    );
     let Some(result) = case.result.as_ref() else {
         return out;
     };
-    row("Cd (+X drag)", fmt(result.force_coefficients[0]), "1", "MODEL");
-    row("Cs (+Y side)", fmt(result.force_coefficients[1]), "1", "MODEL");
+    row(
+        "Cd (+X drag)",
+        fmt(result.force_coefficients[0]),
+        "1",
+        "DERIVED",
+    );
+    row(
+        "Cs (+Y side)",
+        fmt(result.force_coefficients[1]),
+        "1",
+        "DERIVED",
+    );
     row(
         "Cl (+Z vertical)",
         fmt(result.force_coefficients[2]),
         "1",
-        "MODEL",
+        "DERIVED",
     );
     let axes = ["x", "y", "z"];
     for (axis, label) in axes.iter().enumerate() {
-        let (value, unit) = units::display_value(Quantity::Force, result.force_newtons[axis], system);
-        row(&format!("F{label}"), fmt(value), unit, "MODEL");
+        let (value, unit) =
+            units::display_value(Quantity::Force, result.force_newtons[axis], system);
+        row(&format!("F{label}"), fmt(value), unit, "DERIVED");
     }
     for (axis, label) in axes.iter().enumerate() {
         row(
             &format!("Cm{label}"),
             fmt(result.moment_coefficients[axis]),
             "1",
-            "MODEL",
+            "DERIVED",
         );
     }
     for (axis, label) in axes.iter().enumerate() {
         let (value, unit) =
             units::display_value(Quantity::Moment, result.moment_newton_meters[axis], system);
-        row(&format!("M{label}"), fmt(value), unit, "MODEL");
+        row(&format!("M{label}"), fmt(value), unit, "DERIVED");
     }
-    row("Cp_min", fmt(result.cp_min), "1", "RECOVERED");
-    row("Cp_max", fmt(result.cp_max), "1", "RECOVERED");
+    row("Cp_min", fmt(result.cp_min), "1", "DERIVED");
+    row("Cp_max", fmt(result.cp_max), "1", "DERIVED");
     let (area, area_unit) = units::display_value(Quantity::Area, result.surface_area_m2, system);
-    row("diffuse_surface_area", fmt(area), area_unit, "MODEL");
+    row("diffuse_surface_area", fmt(area), area_unit, "DERIVED");
     let operating = &case.operating;
     let (speed, speed_unit) = units::display_value(Quantity::Velocity, operating.velocity, system);
     row("V_inf", fmt(speed), speed_unit, "REFERENCE");
@@ -12141,6 +16517,33 @@ fn results_summary_tsv(
         row("Re", fmt(reynolds), "1", "REFERENCE");
     }
     out
+}
+
+/// Own the compositor image on a short-lived worker and wake egui only when the
+/// PNG has finished (or failed).
+fn spawn_screenshot_write(
+    result_tx: std::sync::mpsc::Sender<ScreenshotWriteResult>,
+    repaint_context: egui::Context,
+    image: std::sync::Arc<egui::ColorImage>,
+    crop: Option<(Rect, f32)>,
+    path: std::path::PathBuf,
+    kind: ScreenshotWriteKind,
+) {
+    std::thread::Builder::new()
+        .name("reyn-screenshot-write".into())
+        .spawn(move || {
+            let result = match crop {
+                Some((rect, pixels_per_point)) => {
+                    let cropped = image.region(&rect, Some(pixels_per_point));
+                    color_image_png_bytes(&cropped, 0)
+                }
+                None => color_image_png_bytes(image.as_ref(), 0),
+            }
+            .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
+            let _ = result_tx.send(ScreenshotWriteResult { kind, path, result });
+            repaint_context.request_repaint();
+        })
+        .expect("screenshot worker thread should start");
 }
 
 /// Encode an egui `ColorImage` as RGBA PNG bytes, nearest-neighbor upscaling
@@ -12169,9 +16572,7 @@ fn color_image_png_bytes(image: &egui::ColorImage, min_edge: usize) -> Result<Ve
         let mut encoder = png::Encoder::new(&mut bytes, out_width as u32, out_height as u32);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|error| error.to_string())?;
+        let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
         writer
             .write_image_data(&rgba)
             .map_err(|error| error.to_string())?;
@@ -12181,7 +16582,8 @@ fn color_image_png_bytes(image: &egui::ColorImage, min_edge: usize) -> Result<Ve
 
 /// Unit-aware SI-backed numeric input: a DragValue in the chosen display unit
 /// plus a unit selector. Storage stays SI; switching the unit only changes
-/// presentation. Returns true when the SI value changed.
+/// presentation. Returns the numeric response so case history can coalesce an
+/// active DragValue interaction into one undo transaction.
 fn unit_value_input<U: units::InputUnit>(
     ui: &mut egui::Ui,
     id: &str,
@@ -12189,8 +16591,7 @@ fn unit_value_input<U: units::InputUnit>(
     unit: &mut U,
     si_speed: f64,
     si_range: std::ops::RangeInclusive<f64>,
-) -> bool {
-    let mut changed = false;
+) -> egui::Response {
     ui.horizontal(|ui| {
         let active = *unit;
         let mut display = active.unit_from_si(*si_value);
@@ -12205,7 +16606,6 @@ fn unit_value_input<U: units::InputUnit>(
             *si_value = active
                 .unit_to_si(display)
                 .clamp(*si_range.start(), *si_range.end());
-            changed = true;
         }
         egui::ComboBox::from_id_salt(id)
             .selected_text(active.unit_symbol())
@@ -12224,8 +16624,25 @@ fn unit_value_input<U: units::InputUnit>(
                     .color(TEXT_MUTE),
             );
         }
-    });
-    changed
+        response
+    })
+    .inner
+}
+
+fn track_case_edit_response(
+    response: &egui::Response,
+    transaction: CaseEditTransaction,
+    changed: &mut bool,
+    changed_transaction: &mut Option<CaseEditTransaction>,
+    active_transaction: &mut Option<CaseEditTransaction>,
+) {
+    if response.has_focus() || response.dragged() {
+        *active_transaction = Some(transaction);
+    }
+    if response.changed() {
+        *changed = true;
+        *changed_transaction = Some(transaction);
+    }
 }
 
 fn diag(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
@@ -12243,7 +16660,7 @@ fn diag(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
 
 /// §4.4 measurement-table row: label in body text, value in mono
 /// right-aligned, a shared unit column, and a source-class chip
-/// (`MODEL` / `RECOVERED`, N5X-EV-02) on every row. Returns the row
+/// (`MODEL` / `RECOVERED` / `DERIVED`, N5X-EV-02) on every row. Returns the row
 /// response so callers can attach method notes on hover.
 fn measure_row(
     ui: &mut egui::Ui,
@@ -12253,8 +16670,30 @@ fn measure_row(
     source: &str,
     source_color: Color32,
 ) -> egui::Response {
-    let response = ui
-        .horizontal(|ui| {
+    let response = if measurement_row_stacks(ui.available_width()) {
+        ui.vertical(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Keep the source class visible; the descriptive label yields
+                // and elides into whatever width remains on the left.
+                ui.label(
+                    RichText::new(source)
+                        .text_style(mono_chip())
+                        .color(source_color),
+                );
+                ui.add(egui::Label::new(RichText::new(label).color(TEXT_DIM)).truncate())
+                    .on_hover_text(label);
+            });
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(unit).text_style(mono_s()).color(TEXT_MUTE));
+                    ui.add(egui::Label::new(mono(value, TEXT)).truncate())
+                        .on_hover_text(RichText::new(value).monospace());
+                });
+            });
+        })
+        .response
+    } else {
+        ui.horizontal(|ui| {
             ui.label(RichText::new(label).color(TEXT_DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
@@ -12280,10 +16719,12 @@ fn measure_row(
                     unit_galley,
                     TEXT_MUTE,
                 );
-                ui.label(mono(value, TEXT));
+                ui.add(egui::Label::new(mono(value, TEXT)).truncate())
+                    .on_hover_text(RichText::new(value).monospace());
             });
         })
-        .response;
+        .response
+    };
     ui.add_space(7.0);
     response
 }
@@ -12598,14 +17039,21 @@ fn spine_stage(
         TEXT_MUTE,
     );
     let summary_font = mono_s().resolve(ui.style());
-    let summary_galley = painter.layout_no_wrap(summary.to_owned(), summary_font, TEXT_MUTE);
     let title_end = rect.min.x + 28.0 + 140.0;
-    let summary_x = (rect.max.x - 24.0 - summary_galley.size().x).max(title_end);
+    let summary_galley = elided_singleline(
+        painter,
+        summary,
+        summary_font,
+        TEXT_MUTE,
+        rect.max.x - 24.0 - title_end,
+    );
+    let summary_x = rect.max.x - 24.0 - summary_galley.size().x;
     painter.galley(
         egui::pos2(summary_x, row_y - summary_galley.size().y / 2.0),
         summary_galley,
         TEXT_MUTE,
     );
+    resp.clone().on_hover_text(summary);
 
     state.show_body_unindented(ui, |ui| {
         let left = ui.max_rect().min.x;
@@ -12641,7 +17089,7 @@ mod tests {
 
     fn benchmark_fixture() -> engine::BenchResult {
         engine::BenchResult {
-            model: "fixture.pth".into(),
+            model: "fixture.reynmodel".into(),
             seeds: vec![70000],
             horizons: vec![1, 4],
             rel: vec![vec![0.1, 0.2]],
@@ -12851,6 +17299,23 @@ mod tests {
         assert!(!settings::AppSettings::default().developer_research_sandbox);
     }
 
+    #[test]
+    fn engineering_layout_helpers_preserve_empty_states_and_narrow_measurements() {
+        assert!(!should_show_detail_rail(Nav::Models, true, true));
+        assert!(!should_show_detail_rail(Nav::Results, true, false));
+        assert!(should_show_detail_rail(Nav::Results, true, true));
+        assert!(!should_show_detail_rail(Nav::Evidence, false, false));
+        assert!(should_show_detail_rail(Nav::Evidence, true, false));
+
+        assert!(!uses_scientific_canvas(Nav::Results, false));
+        assert!(uses_scientific_canvas(Nav::Results, true));
+        assert!(uses_scientific_canvas(Nav::Metrics, false));
+        assert!(!uses_scientific_canvas(Nav::Evidence, true));
+
+        assert!(measurement_row_stacks(359.0));
+        assert!(!measurement_row_stacks(360.0));
+    }
+
     /// Nav stage model (§4.1): Results is gated with an explicit reason (no
     /// silent redirect), and stage glyphs reflect the lifecycle honestly.
     #[test]
@@ -12875,6 +17340,672 @@ mod tests {
         assert_eq!(complete[2].glyph, StageGlyph::Complete);
         assert!(complete[2].blocked.is_none());
         assert_eq!(complete[3].glyph, StageGlyph::Complete);
+    }
+
+    fn summary_case_fixture() -> engineering::ExternalFlowCase {
+        engineering::ExternalFlowCase {
+            stage: engineering::CaseStage::Results,
+            case_id: "case-1".into(),
+            name: "duct fairing".into(),
+            source_name: "duct.stl".into(),
+            source_revision_id: Some("src-rev".into()),
+            case_revision_id: Some("case-rev".into()),
+            model_id: "flow3d.reynmodel".into(),
+            model_sha256: Some("a".repeat(64)),
+            model_max_steps: 32,
+            model_support: engineering::ModelSupport::default(),
+            preflight: engineering::GeometryPreflight {
+                source_sha256: "b".repeat(64),
+                ..engineering::GeometryPreflight::default()
+            },
+            operating: engineering::OperatingPoint {
+                length_unit: engineering::LengthUnit::Meter,
+                reference_length: 0.2,
+                velocity: 30.0,
+                density: 1.225,
+                viscosity: 1.81e-5,
+                reference_pressure: 101_325.0,
+                horizon_steps: 4,
+                ..engineering::OperatingPoint::default()
+            },
+            result: Some(engineering::EngineeringResult {
+                method: engineering::SURFACE_LOAD_METHOD.into(),
+                cp_min: -1.5,
+                cp_max: 0.9,
+                force_coefficients: [0.71, 0.02, -0.04],
+                moment_coefficients: [0.0, 0.01, 0.0],
+                force_newtons: [4.448_221_615_260_5, 0.0, 0.0],
+                moment_newton_meters: [0.0, 0.1, 0.0],
+                surface_area_m2: 0.05,
+                pressure_force_fraction: 0.8,
+                load_hotspot: [0.0; 3],
+                suction_hotspot: [0.0; 3],
+                divergence_rms: 1e-3,
+                wake_deficit_peak: 0.3,
+                wake_deficit_mean: 0.1,
+                warnings: Vec::new(),
+            }),
+            parent_run_id: None,
+        }
+    }
+
+    /// The clipboard summary names the drag coefficient, keeps provenance
+    /// identifiers, and converts physical loads into the display system.
+    #[test]
+    fn results_summary_tsv_carries_named_coefficients_units_and_provenance() {
+        let case = summary_case_fixture();
+        let format = units::ValueFormat {
+            significant_digits: 4,
+            notation: units::NumberNotation::Auto,
+        };
+        let si = results_summary_tsv(&case, Some("run-42"), units::UnitSystem::Si, format);
+        assert!(si.starts_with("label\tvalue\tunit\tsource\n"));
+        assert!(si.contains("Cd (+X drag)\t0.7100\t1\tDERIVED"));
+        assert!(si.contains("run\trun-42\t–\tPROVENANCE"));
+        assert!(si.contains(&"b".repeat(64)));
+        assert!(si.contains("Fx\t4.448\tN\tDERIVED"));
+        assert!(si.contains("V_inf\t30.00\tm/s\tREFERENCE"));
+
+        // Imperial display converts the physical loads (1 lbf exactly here)
+        // while coefficients stay dimensionless.
+        let imperial =
+            results_summary_tsv(&case, Some("run-42"), units::UnitSystem::Imperial, format);
+        assert!(imperial.contains("Fx\t1.000\tlbf\tDERIVED"));
+        assert!(imperial.contains("Cd (+X drag)\t0.7100\t1\tDERIVED"));
+
+        // Draft (no immutable run) is stated honestly, never invented.
+        let draft = results_summary_tsv(&case, None, units::UnitSystem::Si, format);
+        assert!(draft.contains("run\tdraft (no immutable run)\t–\tPROVENANCE"));
+    }
+
+    /// Cancellation guarantee: once a request is cancelled its result can only
+    /// be discarded, never recorded, and a preview fetch never becomes a run.
+    #[test]
+    fn cancelled_and_stale_cad_results_are_never_recorded() {
+        let cancelled = vec!["run-a".to_string()];
+        // The in-flight run is the only thing that may be recorded.
+        assert_eq!(
+            classify_cad_result("run-b", None, Some("run-b"), &cancelled),
+            CadResultDisposition::Record
+        );
+        // Cancelling clears `pending_run`, so the same result now only drops —
+        // and it drops as an expected outcome, not an error.
+        assert_eq!(
+            classify_cad_result("run-a", None, None, &cancelled),
+            CadResultDisposition::DiscardCancelled
+        );
+        // A superseded request nobody is waiting for is stale, not cancelled.
+        assert_eq!(
+            classify_cad_result("run-c", None, Some("run-b"), &cancelled),
+            CadResultDisposition::DiscardStale
+        );
+        // A playback fetch is display-only even while a run is pending, and
+        // even if a request with that id was cancelled earlier.
+        assert_eq!(
+            classify_cad_result(
+                "preview-1",
+                Some((3, "preview-1")),
+                Some("run-b"),
+                &cancelled
+            ),
+            CadResultDisposition::Preview(3)
+        );
+        assert_eq!(
+            classify_cad_result("run-a", Some((3, "preview-1")), None, &cancelled),
+            CadResultDisposition::DiscardCancelled
+        );
+    }
+
+    /// Horizon previews are cached for instant scrubbing, evicted from the far
+    /// end first, and never displace the recorded step.
+    #[test]
+    fn horizon_frames_cache_and_evict_around_the_displayed_step() {
+        let frame = |n: usize| HorizonFrame {
+            n,
+            velocity: vec![0.0; 3 * n * n * n],
+            pressure: vec![0.0; n * n * n],
+            cp: vec![0.0; n * n * n],
+            traction: vec![0.0; 3 * n * n * n],
+            mask: std::sync::Arc::new(vec![0.0; n * n * n]),
+            force_coefficients: [0.5, 0.0, 0.1],
+            cp_min: -1.0,
+            cp_max: 0.8,
+        };
+        let mut playback = HorizonPlayback::default();
+        for step in 1..=(HORIZON_CACHE_LIMIT as u32 + 6) {
+            playback.frames.insert(step, frame(3));
+        }
+        playback.step = 20;
+        playback.trim(4); // 4 is the recorded horizon
+        assert_eq!(playback.frames.len(), HORIZON_CACHE_LIMIT);
+        assert!(playback.frames.contains_key(&4), "recorded step kept");
+        assert!(playback.frames.contains_key(&20), "displayed step kept");
+        assert!(!playback.frames.contains_key(&1), "farthest step evicted");
+
+        // A case serves a cached step from memory and says nothing at all for a
+        // step it does not hold, rather than showing the wrong field.
+        let mut case = playback_case_fixture();
+        case.playback.frames.insert(7, frame(case.result_grid));
+        case.playback.step = 7;
+        let fields = case.display_fields().expect("cached preview is displayed");
+        assert_eq!(fields.step, 7);
+        assert!(!fields.recorded, "a preview is not the recorded run");
+        case.playback.step = 9;
+        assert!(case.display_fields().is_none(), "step 9 is not held");
+        // Step 0 means "wherever the run was recorded".
+        case.playback.step = 0;
+        let recorded = case.display_fields().expect("recorded fields");
+        assert_eq!(recorded.step, case.steps);
+        assert!(recorded.recorded);
+        // Any case edit drops the previews: they belong to the old contract.
+        case.playback.reset();
+        assert!(case.playback.frames.is_empty());
+    }
+
+    fn playback_case_fixture() -> CadCase {
+        let n = 3usize;
+        let cube = n * n * n;
+        let workflow = summary_case_fixture();
+        CadCase {
+            mask: std::sync::Arc::new(vec![1.0; cube]),
+            mask_bounds: Some(([-1.0; 3], [1.0; 3])),
+            model: workflow.model_id.clone(),
+            steps: 4,
+            surf: None,
+            surf_mask_source: None,
+            name: workflow.name.clone(),
+            velocity: vec![0.0; 3 * cube],
+            pressure: vec![0.0; cube],
+            cp: vec![0.0; cube],
+            traction: vec![0.0; 3 * cube],
+            result_grid: n,
+            dt_frame: 0.04,
+            workflow,
+            active_run_id: Some(FIXTURE_RUN_ID.into()),
+            pending: false,
+            pending_request_id: None,
+            pending_run: None,
+            playback: HorizonPlayback::default(),
+        }
+    }
+
+    fn pending_orientation(
+        generation: u64,
+        request_id: &str,
+        angles: [f64; 3],
+    ) -> PendingOrientation {
+        PendingOrientation {
+            generation,
+            request_id: request_id.into(),
+            case_id: "case-1".into(),
+            source_sha256: "source-sha".into(),
+            angles,
+            started_at: std::time::Instant::now(),
+            kind: PendingOrientationKind::Draft,
+        }
+    }
+
+    fn orientation_mask(angles: [f64; 3]) -> cad::VoxelMask {
+        cad::VoxelMask {
+            n: 3,
+            mask: vec![1.0; 27],
+            solid_voxels: 27,
+            char_len: 0.6,
+            components: 1,
+            minimum_cells_across: 3,
+            boundary_clearance_cells: 1,
+            axis_disagreement_fraction: 0.0,
+            odd_crossing_rows: [0; 3],
+            classification_version: 2,
+            scale: 1.0,
+            orientation: cad::BodyOrientation::from_degrees(angles),
+            transform_4x4: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        }
+    }
+
+    fn orientation_completion(
+        generation: u64,
+        request_id: &str,
+        angles: [f64; 3],
+        result: Result<cad::VoxelMask, String>,
+    ) -> OrientationWorkResult {
+        OrientationWorkResult {
+            generation,
+            request_id: request_id.into(),
+            case_id: "case-1".into(),
+            source_sha256: "source-sha".into(),
+            angles,
+            completed_utc_unix: 200,
+            result,
+        }
+    }
+
+    #[test]
+    fn rapid_orientation_requests_coalesce_to_newest_generation() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request = |generation, angle| OrientationWorkRequest {
+            generation,
+            request_id: format!("orientation-{generation}"),
+            case_id: "case-1".into(),
+            source_sha256: "source-sha".into(),
+            angles: [angle, 0.0, 0.0],
+            grid: 32,
+            source_bytes: vec![generation as u8],
+        };
+        tx.send(request(2, 4.0)).unwrap();
+        tx.send(request(3, 7.5)).unwrap();
+        let newest = coalesce_orientation_requests(request(1, 1.0), &rx);
+        assert_eq!(newest.generation, 3);
+        assert_eq!(newest.request_id, "orientation-3");
+        assert_eq!(newest.angles, [7.5, 0.0, 0.0]);
+        assert_eq!(newest.source_bytes, vec![3]);
+    }
+
+    #[test]
+    fn stale_orientation_completion_cannot_mutate_current_case() {
+        let pending = pending_orientation(2, "orientation-2", [8.0, 1.0, 0.0]);
+        let stale = orientation_completion(
+            1,
+            "orientation-1",
+            [3.0, 0.0, 0.0],
+            Ok(orientation_mask([3.0, 0.0, 0.0])),
+        );
+        assert_eq!(
+            classify_orientation_result(&stale, Some(&pending), Some(("case-1", "source-sha"))),
+            OrientationResultDisposition::DiscardStale
+        );
+
+        let current = orientation_completion(
+            2,
+            "orientation-2",
+            [8.0, 1.0, 0.0],
+            Ok(orientation_mask([8.0, 1.0, 0.0])),
+        );
+        assert_eq!(
+            classify_orientation_result(&current, Some(&pending), Some(("case-1", "source-sha"))),
+            OrientationResultDisposition::Apply
+        );
+        assert_eq!(
+            classify_orientation_result(
+                &current,
+                Some(&pending),
+                Some(("other-case", "source-sha"))
+            ),
+            OrientationResultDisposition::DiscardStale
+        );
+    }
+
+    #[test]
+    fn recovered_case_reconstruction_is_async_and_not_project_dirty() {
+        let angles = [6.0, -1.0, 0.25];
+        let pending = PendingOrientation {
+            generation: 5,
+            request_id: "orientation-hydrate-5".into(),
+            case_id: "case-1".into(),
+            source_sha256: "source-sha".into(),
+            angles,
+            started_at: std::time::Instant::now(),
+            kind: PendingOrientationKind::Hydrate(Box::new(PendingOrientationHydration {
+                workflow: summary_case_fixture(),
+                selected_run_id: None,
+                dt_frame: 0.0,
+            })),
+        };
+        assert!(
+            !pending.mutates_project(),
+            "runtime reconstruction is not an edit"
+        );
+        let completed = orientation_completion(
+            5,
+            "orientation-hydrate-5",
+            angles,
+            Ok(orientation_mask(angles)),
+        );
+        assert_eq!(
+            classify_orientation_result(&completed, Some(&pending), None),
+            OrientationResultDisposition::Apply
+        );
+        assert_eq!(
+            classify_orientation_result(&completed, Some(&pending), Some(("case-1", "source-sha"))),
+            OrientationResultDisposition::DiscardStale
+        );
+    }
+
+    #[test]
+    fn orientation_worker_hands_failures_back_with_request_identity() {
+        let worker = OrientationWorker::spawn(None).expect("worker starts");
+        worker
+            .request_tx
+            .send(OrientationWorkRequest {
+                generation: 9,
+                request_id: "orientation-9".into(),
+                case_id: "case-1".into(),
+                source_sha256: "source-sha".into(),
+                angles: [12.0, -2.0, 0.5],
+                grid: 32,
+                source_bytes: vec![0; 4],
+            })
+            .unwrap();
+        let completed = worker
+            .result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("failure is delivered without UI polling");
+        assert_eq!(completed.generation, 9);
+        assert_eq!(completed.request_id, "orientation-9");
+        assert_eq!(completed.angles, [12.0, -2.0, 0.5]);
+        assert!(completed
+            .result
+            .as_ref()
+            .is_err_and(|error| error.contains("file too small")));
+        let pending = pending_orientation(9, "orientation-9", completed.angles);
+        assert_eq!(
+            classify_orientation_result(&completed, Some(&pending), Some(("case-1", "source-sha"))),
+            OrientationResultDisposition::Failed
+        );
+        assert_eq!(
+            autosave_deadline_after_attempt(completed.completed_utc_unix, 30, false),
+            completed.completed_utc_unix + 5
+        );
+    }
+
+    #[test]
+    fn save_and_run_gate_draft_or_in_flight_orientation_geometry() {
+        let angles = [5.0, 0.0, 0.0];
+        let pending = pending_orientation(4, "orientation-4", angles);
+        let save = orientation_geometry_gate("Saving project drafts", Some(angles), Some(&pending))
+            .expect("save is gated");
+        assert!(save.contains(&short_id("orientation-4")));
+        assert!(save.contains("re-voxelizing"));
+
+        let run = orientation_geometry_gate("Starting a new run", Some(angles), None)
+            .expect("run is gated");
+        assert!(run.contains("not in the voxel mask"));
+        assert!(orientation_geometry_gate("Saving project drafts", None, None).is_none());
+    }
+
+    #[test]
+    fn static_ready_or_unavailable_state_has_no_background_poll() {
+        assert_eq!(
+            background_repaint_delays(false, false, false, 10, 20),
+            (None, None)
+        );
+        assert_eq!(
+            background_repaint_delays(true, false, false, 10, 20).0,
+            Some(LIVE_REPAINT_INTERVAL)
+        );
+        assert_eq!(
+            background_repaint_delays(false, true, false, 10, 20).1,
+            Some(std::time::Duration::from_secs(10))
+        );
+        // An orientation draft or worker request is event-driven. A previously
+        // scheduled autosave may wake once, but it never starts an idle poll;
+        // worker completion or the next user edit wakes the UI.
+        assert_eq!(
+            background_repaint_delays(false, true, true, 20, 20),
+            (None, None)
+        );
+        assert_eq!(autosave_deadline_after_attempt(40, 30, true), 70);
+        assert_eq!(autosave_deadline_after_attempt(40, 30, false), 45);
+    }
+
+    #[test]
+    fn case_and_orientation_drafts_drive_dirty_guards_and_recovery_wakes() {
+        assert!(!has_unsaved_project_work(false, false, None, false));
+        assert!(has_unsaved_project_work(true, false, None, false));
+        assert!(has_unsaved_project_work(false, true, None, false));
+        assert!(has_unsaved_project_work(
+            false,
+            false,
+            Some([3.0, -1.5, 0.25]),
+            false
+        ));
+        assert!(has_unsaved_project_work(false, false, None, true));
+
+        let dirty = has_unsaved_project_work(false, true, None, false);
+        assert_eq!(
+            background_repaint_delays(false, dirty, false, 100, 130),
+            (None, Some(std::time::Duration::from_secs(30)))
+        );
+        let orientation_dirty =
+            has_unsaved_project_work(false, false, Some([3.0, -1.5, 0.25]), false);
+        assert_eq!(
+            background_repaint_delays(false, orientation_dirty, true, 130, 130),
+            (None, None)
+        );
+        // A maximum-grid orientation re-voxelization may finish well after the
+        // deadline that started it. The next wake is measured from completion,
+        // not from the stale frame timestamp, and still uses one event deadline.
+        let started = 130;
+        let completed = 171;
+        let next = autosave_deadline_after_attempt(completed, 30, true);
+        assert_eq!(next, 201);
+        assert_eq!(
+            background_repaint_delays(false, true, false, completed, next),
+            (None, Some(std::time::Duration::from_secs(30)))
+        );
+        assert_ne!(next, started + 30);
+    }
+
+    #[test]
+    fn read_only_capability_rejects_project_mutations_centrally() {
+        assert!(
+            project_mutation_rejection(project_lifecycle::ProjectAccessMode::Full, "Run").is_none()
+        );
+        let rejection = project_mutation_rejection(
+            project_lifecycle::ProjectAccessMode::ReadOnlyEvidence,
+            "Recording a case revision",
+        )
+        .expect("read-only mode rejects mutation");
+        assert!(rejection.contains("Recording a case revision"));
+        assert!(rejection.contains("read-only evidence mode"));
+        assert!(rejection.contains("runs and evidence remain unchanged"));
+        let run_rejection = project_mutation_rejection(
+            project_lifecycle::ProjectAccessMode::ReadOnlyEvidence,
+            "Starting a new immutable run",
+        )
+        .expect("read-only mode rejects engine execution");
+        assert!(run_rejection.contains("Starting a new immutable run"));
+        let orientation_rejection = project_mutation_rejection(
+            project_lifecycle::ProjectAccessMode::ReadOnlyEvidence,
+            "Changing body orientation",
+        )
+        .expect("read-only mode rejects orientation workers");
+        assert!(orientation_rejection.contains("Changing body orientation"));
+        assert!(orientation_rejection.contains("unchanged and inspectable"));
+    }
+
+    #[test]
+    fn optimistic_save_conflicts_map_to_unique_sibling_copies() {
+        let conflict =
+            project_lifecycle::LifecycleError::Project(project::ProjectError::WriteConflict {
+                expected_sha256: Some("a".repeat(64)),
+                actual_sha256: Some("b".repeat(64)),
+            });
+        assert!(is_project_write_conflict(&conflict));
+        assert!(!is_project_write_conflict(
+            &project_lifecycle::LifecycleError::SaveAsRequired
+        ));
+
+        let original = std::path::Path::new("/tmp/wing.reynproj");
+        let first = conflict_copy_path(original, 42, "abcdef123456");
+        let second = conflict_copy_path(original, 42, "9876543210");
+        assert_eq!(
+            first,
+            std::path::PathBuf::from("/tmp/wing conflict 42 abcdef12.reynproj")
+        );
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), original.parent());
+        assert_eq!(
+            resolve_project_conflict_action(ProjectConflictAction::Reload, original, 42, "unused"),
+            ProjectConflictResolution::Reload(original.to_path_buf())
+        );
+        assert_eq!(
+            resolve_project_conflict_action(ProjectConflictAction::SaveAs, original, 42, "unused"),
+            ProjectConflictResolution::PromptSaveAs
+        );
+        assert_eq!(
+            resolve_project_conflict_action(
+                ProjectConflictAction::ConflictCopy,
+                original,
+                42,
+                "abcdef123456"
+            ),
+            ProjectConflictResolution::SaveConflictCopy(first)
+        );
+        assert_eq!(
+            resolve_project_conflict_action(ProjectConflictAction::Dismiss, original, 42, "unused"),
+            ProjectConflictResolution::Dismiss
+        );
+    }
+
+    #[test]
+    fn failed_persistence_drops_large_transient_results_before_ui_installation() {
+        struct LargeTransient {
+            values: Vec<f32>,
+            dropped: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+
+        impl Drop for LargeTransient {
+            fn drop(&mut self) {
+                self.dropped.set(true);
+            }
+        }
+
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let transient = LargeTransient {
+            // The engineering field payload carries nine 64³ float channels.
+            values: vec![0.0; 9 * 64usize.pow(3)],
+            dropped: dropped.clone(),
+        };
+        let mut persistence_attempts = 0;
+        let result: Result<(String, LargeTransient), String> =
+            retain_after_persistence(transient, |field| {
+                persistence_attempts += 1;
+                assert_eq!(field.values.len(), 9 * 64usize.pow(3));
+                Err("injected atomic write failure".into())
+            });
+
+        assert_eq!(persistence_attempts, 1);
+        assert_eq!(
+            result
+                .err()
+                .expect("fault injection must reject persistence"),
+            "injected atomic write failure".to_string()
+        );
+        assert!(dropped.get(), "failed transient payload must be released");
+    }
+
+    #[test]
+    fn cad_case_keeps_precomputed_geometry_bounds() {
+        let case = playback_case_fixture();
+        assert_eq!(case.mask_bounds, Some(([-1.0; 3], [1.0; 3])));
+    }
+
+    /// PNG export helper: upscales small images by an integer factor and
+    /// produces a decodable PNG of the right dimensions.
+    #[test]
+    fn color_image_png_bytes_round_trips_dimensions() {
+        let image = egui::ColorImage {
+            size: [2, 2],
+            pixels: vec![Color32::RED, Color32::GREEN, Color32::BLUE, Color32::WHITE],
+            source_size: egui::Vec2::new(2.0, 2.0),
+        };
+        let bytes = color_image_png_bytes(&image, 8).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let reader = decoder.read_info().unwrap();
+        let info = reader.info();
+        assert_eq!((info.width, info.height), (8, 8));
+        // min_edge = 0 keeps native resolution.
+        let native = color_image_png_bytes(&image, 0).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(native));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+    }
+
+    #[test]
+    fn screenshot_worker_crops_and_writes_off_thread() {
+        let image = egui::ColorImage {
+            size: [4, 4],
+            pixels: vec![Color32::WHITE; 16],
+            source_size: egui::Vec2::new(4.0, 4.0),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "reyn-screenshot-worker-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_screenshot_write(
+            tx,
+            egui::Context::default(),
+            std::sync::Arc::new(image),
+            Some((
+                Rect::from_min_max(egui::pos2(1.0, 1.0), egui::pos2(3.0, 3.0)),
+                1.0,
+            )),
+            path.clone(),
+            ScreenshotWriteKind::Viewport,
+        );
+        let completion = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("screenshot worker completion");
+        completion.result.expect("screenshot write succeeds");
+        let bytes = std::fs::read(&path).expect("screenshot bytes");
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn docs_resolution_prefers_bundle_and_never_falls_back_when_incomplete() {
+        let root = std::env::temp_dir().join(format!("reyn-docs-bundle-{}", uuid::Uuid::new_v4()));
+        let executable = root.join("Reyn Studio.app/Contents/MacOS/reyn-studio");
+        let bundled = root.join("Reyn Studio.app/Contents/Resources/docs/PRD.md");
+        let development = root.join("PRD.md");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "# Packaged docs\n").unwrap();
+        std::fs::write(&development, "# Development docs\n").unwrap();
+
+        assert_eq!(
+            resolve_docs_path_at(&executable, Some(&root)).unwrap(),
+            bundled
+        );
+        std::fs::remove_file(&bundled).unwrap();
+        let error = resolve_docs_path_at(&executable, Some(&root)).unwrap_err();
+        assert!(error.contains("Contents/Resources/docs/PRD.md"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docs_resolution_finds_development_ancestor_without_build_path_literal() {
+        let root = std::env::temp_dir().join(format!("reyn-docs-dev-{}", uuid::Uuid::new_v4()));
+        let executable = root.join("target/debug/reyn-studio");
+        let current_dir = root.join("nested/work");
+        let docs = root.join("PRD.md");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&current_dir).unwrap();
+        std::fs::write(&docs, "# Development docs\n").unwrap();
+
+        assert_eq!(
+            resolve_docs_path_at(&executable, Some(&current_dir)).unwrap(),
+            docs
+        );
+
+        let source = include_str!("app.rs");
+        for forbidden in [
+            ["file", "://./", "PRD.md"].concat(),
+            ["CARGO_", "MANIFEST_DIR"].concat(),
+            ["/", "Users", "/"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "OpenDocs source contains forbidden literal: {forbidden}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

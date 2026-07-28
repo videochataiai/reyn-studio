@@ -1,0 +1,42 @@
+{
+  "bundle": {
+    "archive_members": [
+      "manifest.json",
+      "weights.safetensors"
+    ],
+    "extension": ".reynmodel",
+    "schema": "com.reyn.inference-model-bundle/1"
+  },
+  "detached_signature": {
+    "algorithm": "ed25519",
+    "document_schema": "com.reyn.inference-model-signature/1",
+    "payload_schema": "com.reyn.inference-model-signature-payload/1",
+    "required_adjacent_suffix": ".sig"
+  },
+  "model_assets_bundled": false,
+  "production_root": {
+    "pinned": false,
+    "status": "intentionally-unset"
+  },
+  "schema": "com.reyn.studio.model-trust-contract.v1",
+  "tuf": {
+    "allowed_metadata_names": "^(?:[1-9][0-9]*\\.)?(?:root|snapshot|targets|models)\\.json$|^timestamp\\.json$",
+    "consistent_snapshot_required": true,
+    "detached_repository_suffix": ".tuf",
+    "metadata_subdirectory": "metadata",
+    "minimum_thresholds": {
+      "root": 2,
+      "targets": 2
+    },
+    "models_role": "models",
+    "required_metadata": [
+      "<version>.root.json",
+      "<version>.targets.json",
+      "<version>.models.json",
+      "<version>.snapshot.json",
+      "timestamp.json"
+    ],
+    "target_custom_schema": "com.reyn.tuf-model-target/1",
+    "transport": "offline-local-only"
+  }
+}

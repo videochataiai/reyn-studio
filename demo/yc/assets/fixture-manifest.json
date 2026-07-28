@@ -1,0 +1,55 @@
+{
+  "fixture_policy": "Pipeline fixtures only. They demonstrate import and preflight behavior; they are not model-accuracy evidence.",
+  "fixtures": [
+    {
+      "boundary_edges": 0,
+      "bytes": 96084,
+      "expected_diagnostics": [],
+      "file": "primary_capsule_d80_l260mm.stl",
+      "non_manifold_edges": 0,
+      "role": "primary",
+      "sha256": "ca2b82f712c576a1c878c2312da23f8fb74dc9439d443c49fd1e41cf18f18c08",
+      "source": "Deterministically generated from test-geometry/make_test_stls.py using capsule_body(radius=40, length=260, n=40, rings=12).",
+      "title": "Watertight road-vehicle-like capsule",
+      "triangles": 1920,
+      "units": "millimeter",
+      "watertight": true
+    },
+    {
+      "boundary_edges": 0,
+      "bytes": 684,
+      "expected_diagnostics": [],
+      "file": "fallback_cube_100mm.stl",
+      "non_manifold_edges": 0,
+      "role": "fallback",
+      "sha256": "8616c0b4fed80d422c7f18fe94d136e1f35ef79f22a10dde23883a3fd17751b0",
+      "source": "Deterministically generated from test-geometry/make_test_stls.py using box(0, 0, 0, 100, 100, 100).",
+      "title": "Watertight 100 mm cube",
+      "triangles": 12,
+      "units": "millimeter",
+      "watertight": true
+    },
+    {
+      "boundary_edges": 48,
+      "bytes": 84084,
+      "expected_diagnostics": [
+        {
+          "code": "mesh.open_boundary",
+          "expected": "nonzero open boundary edges; execution blocked",
+          "waivable": false
+        }
+      ],
+      "file": "defective_sphere_missing_cap_r50mm.stl",
+      "non_manifold_edges": 0,
+      "role": "intentional_rejection",
+      "sha256": "f8bcc023db3c7cb15af11a6ec72f4ea791d23db6635de7d837ec2a9ddca48159",
+      "source": "Deterministically generated from test-geometry/make_test_stls.py using uv_sphere(r=50, nu=48, nv=24), then removing triangles whose centroid has z >= 36 mm; mirrors the existing large-leak fixture.",
+      "title": "Intentionally open sphere with missing cap",
+      "triangles": 1680,
+      "units": "millimeter",
+      "watertight": false
+    }
+  ],
+  "generator": "demo/yc/scripts/build_fixtures.py",
+  "schema": "com.reyn.studio.yc-demo-fixtures/1"
+}

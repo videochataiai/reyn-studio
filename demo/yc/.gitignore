@@ -1,0 +1,5 @@
+.state/
+*.mov
+*.mp4
+!assets/*.stl
+!assets/fixture-manifest.json

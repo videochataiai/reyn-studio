@@ -8,6 +8,7 @@
 
 use crate::engineering::{self, ExternalFlowCase};
 use crate::units::{self, Quantity, UnitSystem, ValueFormat};
+use base64::Engine as _;
 
 pub const REPORT_SCHEMA: &str = "reyn_engineering_report_html.v1";
 
@@ -60,6 +61,186 @@ fn mono_row(label: &str, value: &str) -> String {
     )
 }
 
+fn source_row(label: &str, value: &str, source: &str) -> String {
+    format!(
+        "<tr><th>{}</th><td>{}</td><td class=\"source\">{}</td></tr>\n",
+        escape(label),
+        escape(value),
+        escape(source)
+    )
+}
+
+fn validate_required_text(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("Engineering report requires a persisted {label}."));
+    }
+    if value.chars().any(|character| character == '\0') {
+        return Err(format!(
+            "Engineering report {label} contains an unsupported null character."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Engineering report requires a canonical lowercase {label} SHA-256."
+        ))
+    }
+}
+
+fn validate_finite(label: &str, values: impl IntoIterator<Item = f64>) -> Result<(), String> {
+    if let Some((index, _)) = values
+        .into_iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        Err(format!(
+            "Engineering report rejected non-finite {label} value at index {index}."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_section_figure(figure: &SectionFigure) -> Result<(), String> {
+    validate_required_text("section figure caption", &figure.caption)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&figure.png_base64)
+        .map_err(|error| {
+            format!("Engineering report section figure is not valid base64: {error}")
+        })?;
+    if !decoded.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("Engineering report section figure must contain a valid PNG signature.".into());
+    }
+    Ok(())
+}
+
+fn validate_report_input(
+    input: &ReportInput<'_>,
+    result: &engineering::EngineeringResult,
+) -> Result<(), String> {
+    let case = input.case;
+    if !matches!(
+        case.stage,
+        engineering::CaseStage::Results | engineering::CaseStage::Evidence
+    ) {
+        return Err(
+            "Engineering report requires a completed case in Results or Evidence state.".into(),
+        );
+    }
+    for (label, value) in [
+        ("case name", case.name.as_str()),
+        ("source file name", case.source_name.as_str()),
+        ("run identity", input.run_id),
+        ("model identity", case.model_id.as_str()),
+        ("application version", input.app_version),
+        ("surface-load method", result.method.as_str()),
+    ] {
+        validate_required_text(label, value)?;
+    }
+    let source_revision = case
+        .source_revision_id
+        .as_deref()
+        .ok_or_else(|| "Engineering report requires a persisted source revision.".to_string())?;
+    validate_required_text("source revision", source_revision)?;
+    let case_revision = case
+        .case_revision_id
+        .as_deref()
+        .ok_or_else(|| "Engineering report requires a persisted case revision.".to_string())?;
+    validate_required_text("case revision", case_revision)?;
+    validate_sha256("source", &case.preflight.source_sha256)?;
+    let model_sha256 = case
+        .model_sha256
+        .as_deref()
+        .ok_or_else(|| "Engineering report requires a persisted model SHA-256.".to_string())?;
+    validate_sha256("model", model_sha256)?;
+    if input.generated_utc_unix < input.run_created_utc_unix {
+        return Err(
+            "Engineering report generation time cannot precede the immutable run time.".into(),
+        );
+    }
+    if case.operating.length_unit.meters_per_unit().is_none() {
+        return Err("Engineering report requires confirmed geometry units.".into());
+    }
+    for (label, value) in [
+        ("reference length", case.operating.reference_length),
+        ("free-stream speed", case.operating.velocity),
+        ("density", case.operating.density),
+        ("dynamic viscosity", case.operating.viscosity),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!(
+                "Engineering report requires a finite positive {label}."
+            ));
+        }
+    }
+    validate_finite(
+        "operating point",
+        std::iter::once(case.operating.reference_pressure).chain(case.operating.flow_direction),
+    )?;
+    if case.operating.horizon_steps == 0 {
+        return Err("Engineering report requires a nonzero prediction horizon.".into());
+    }
+    validate_finite(
+        "geometry preflight",
+        [
+            case.preflight.source_signed_volume,
+            case.preflight.proposed_scale,
+            case.preflight.solver_characteristic_length,
+            case.preflight.angle_of_attack_deg,
+            case.preflight.yaw_deg,
+            case.preflight.roll_deg,
+            case.preflight.voxel_axis_disagreement_fraction,
+        ]
+        .into_iter()
+        .chain(case.preflight.source_extents)
+        .chain(case.preflight.transform_4x4),
+    )?;
+    validate_finite(
+        "engineering result",
+        [
+            result.cp_min,
+            result.cp_max,
+            result.surface_area_m2,
+            result.pressure_force_fraction,
+            result.divergence_rms,
+            result.wake_deficit_peak,
+            result.wake_deficit_mean,
+        ]
+        .into_iter()
+        .chain(result.force_coefficients)
+        .chain(result.moment_coefficients)
+        .chain(result.force_newtons)
+        .chain(result.moment_newton_meters)
+        .chain(result.load_hotspot)
+        .chain(result.suction_hotspot),
+    )?;
+    if result.cp_min > result.cp_max {
+        return Err("Engineering report Cp range has minimum greater than maximum.".into());
+    }
+    if result.surface_area_m2 < 0.0 {
+        return Err("Engineering report surface area cannot be negative.".into());
+    }
+    if !(0.0..=1.0).contains(&result.pressure_force_fraction) {
+        return Err("Engineering report pressure-force fraction must lie in [0,1].".into());
+    }
+    if result.divergence_rms < 0.0 {
+        return Err("Engineering report divergence RMS cannot be negative.".into());
+    }
+    if let Some(figure) = &input.section_figure {
+        validate_section_figure(figure)?;
+    }
+    Ok(())
+}
+
 /// Format an SI value in the report's display system, with the SI value in
 /// parentheses when the display system is not SI (both are always readable).
 fn dual(quantity: Quantity, si: f64, system: UnitSystem, format: ValueFormat) -> String {
@@ -82,9 +263,7 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
         .result
         .as_ref()
         .ok_or_else(|| "A completed run result is required for a report.".to_string())?;
-    if input.run_id.trim().is_empty() {
-        return Err("A durable immutable run identity is required for a report.".into());
-    }
+    validate_report_input(input, result)?;
     let operating = &case.operating;
     let preflight = &case.preflight;
     let system = input.unit_system;
@@ -96,11 +275,15 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
     provenance.push_str(&mono_row("Source SHA-256", &preflight.source_sha256));
     provenance.push_str(&mono_row(
         "Source revision",
-        case.source_revision_id.as_deref().unwrap_or("unknown"),
+        case.source_revision_id
+            .as_deref()
+            .expect("source revision validated"),
     ));
     provenance.push_str(&mono_row(
         "Case revision",
-        case.case_revision_id.as_deref().unwrap_or("unknown"),
+        case.case_revision_id
+            .as_deref()
+            .expect("case revision validated"),
     ));
     provenance.push_str(&mono_row("Immutable run", input.run_id));
     provenance.push_str(&row(
@@ -110,13 +293,16 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
     provenance.push_str(&row("Model", &case.model_id));
     provenance.push_str(&mono_row(
         "Model SHA-256",
-        case.model_sha256.as_deref().unwrap_or("unknown"),
+        case.model_sha256
+            .as_deref()
+            .expect("model SHA-256 validated"),
     ));
     provenance.push_str(&mono_row("Contract", engineering::EXTERNAL_FLOW_CONTRACT));
     provenance.push_str(&mono_row(
-        "Surface-load method",
-        engineering::SURFACE_LOAD_METHOD,
+        "Result schema",
+        engineering::ENGINEERING_RESULT_SCHEMA,
     ));
+    provenance.push_str(&mono_row("Surface-load method", &result.method));
 
     let length_symbol = operating.length_unit.symbol();
     let meters_per_unit = operating.length_unit.meters_per_unit();
@@ -210,13 +396,43 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
         ),
     ));
     geometry_rows.push_str(&row(
+        "Body orientation",
+        &format!(
+            "{} — applied to the geometry before voxelization; the free stream stays on +X",
+            preflight.body_orientation_summary()
+        ),
+    ));
+    geometry_rows.push_str(&row(
+        "Source surface",
+        &format!(
+            "{} component(s) · {} open · {} non-manifold · {} inconsistent-winding edges · {} intersecting triangle pairs · signed volume {:+.6e} source³",
+            preflight.components,
+            preflight.boundary_edges,
+            preflight.non_manifold_edges,
+            preflight.inconsistent_winding_edges,
+            preflight.self_intersection_pairs,
+            preflight.source_signed_volume,
+        ),
+    ));
+    geometry_rows.push_str(&row(
         "Voxel grid",
         &format!(
-            "{}³ · {} solid voxels · {} cells across critical thickness · {} cells boundary clearance",
+            "{}³ · {} solid voxels · {}-cell resolved core · {} cells boundary clearance",
             preflight.target_grid,
             preflight.solid_voxels,
             preflight.minimum_cells_across,
             preflight.boundary_clearance_cells
+        ),
+    ));
+    geometry_rows.push_str(&row(
+        "Occupancy validation",
+        &format!(
+            "classifier v{} · {:.2}% three-axis disagreement · odd scanlines X/Y/Z {} / {} / {}",
+            preflight.voxel_classification_version,
+            preflight.voxel_axis_disagreement_fraction * 100.0,
+            preflight.voxel_odd_crossing_rows[0],
+            preflight.voxel_odd_crossing_rows[1],
+            preflight.voxel_odd_crossing_rows[2],
         ),
     ));
     for waiver in &preflight.waivers {
@@ -225,18 +441,20 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
 
     let coefficient = |value: f64| format_plain(value);
     let axis_labels = ["+X · streamwise (drag)", "+Y · lateral", "+Z · vertical"];
+    let load_source = format!("DERIVED · {}", result.method);
     let mut results_rows = String::new();
     for (axis, label) in axis_labels.iter().enumerate() {
         results_rows.push_str(&format!(
-            "<tr><th>Force coefficient · {}</th><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>\n",
+            "<tr><th>Force coefficient · {}</th><td class=\"mono\">{}</td><td class=\"mono\">{}</td><td class=\"source\">{}</td></tr>\n",
             escape(label),
             escape(&coefficient(result.force_coefficients[axis])),
             escape(&dual(Quantity::Force, result.force_newtons[axis], system, format)),
+            escape(&load_source),
         ));
     }
     for (axis, label) in axis_labels.iter().enumerate() {
         results_rows.push_str(&format!(
-            "<tr><th>Moment coefficient · {}</th><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>\n",
+            "<tr><th>Moment coefficient · {}</th><td class=\"mono\">{}</td><td class=\"mono\">{}</td><td class=\"source\">{}</td></tr>\n",
             escape(label),
             escape(&coefficient(result.moment_coefficients[axis])),
             escape(&dual(
@@ -245,37 +463,43 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
                 system,
                 format
             )),
+            escape(&load_source),
         ));
     }
 
     let mut scalar_rows = String::new();
-    scalar_rows.push_str(&row(
-        "Cp range (derived from recovered pressure)",
+    scalar_rows.push_str(&source_row(
+        "Cp range (dimensionless)",
         &format!(
             "{} … {}",
             format_plain(result.cp_min),
             format_plain(result.cp_max)
         ),
+        "DERIVED · physical-reference Cp from recovered pressure",
     ));
-    scalar_rows.push_str(&row(
+    scalar_rows.push_str(&source_row(
         "Diffuse surface area",
         &dual(Quantity::Area, result.surface_area_m2, system, format),
+        "DERIVED · diffuse immersed interface geometry",
     ));
-    scalar_rows.push_str(&row(
+    scalar_rows.push_str(&source_row(
         "Pressure share of force (component norms)",
         &format!("{} %", format_plain(result.pressure_force_fraction * 100.0)),
+        "DERIVED · integrated pressure / total fluid-force norms",
     ));
-    scalar_rows.push_str(&row(
+    scalar_rows.push_str(&source_row(
         "Divergence RMS",
         &format_plain(result.divergence_rms),
+        "DERIVED · model-predicted velocity",
     ));
-    scalar_rows.push_str(&row(
+    scalar_rows.push_str(&source_row(
         "Wake deficit · peak / mean",
         &format!(
             "{} / {}",
             format_plain(result.wake_deficit_peak),
             format_plain(result.wake_deficit_mean)
         ),
+        "DERIVED · model-predicted velocity",
     ));
 
     let mut warnings_html = String::new();
@@ -294,7 +518,7 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
             format!(
                 "<h2>Section evidence</h2>\n<figure>\n<img alt=\"Stored engineering section\" \
                  src=\"data:image/png;base64,{}\">\n<figcaption>{}</figcaption>\n</figure>\n",
-                figure.png_base64,
+                escape(&figure.png_base64),
                 escape(&figure.caption)
             )
         })
@@ -320,6 +544,7 @@ th {{ text-align: left; font-weight: 500; color: #4d453b; padding: 5px 14px 5px 
 td {{ padding: 5px 0; border-bottom: 1px solid #ece7df; vertical-align: top; }}
 .mono {{ font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-size: 12px;
         word-break: break-all; }}
+.source {{ color: #6b6156; font-size: 12px; }}
 .limits {{ background: #f4efe7; border: 1px solid #ddd2c0; border-radius: 6px; padding: 14px 16px;
           font-size: 12.5px; margin-top: 10px; }}
 .limits ul {{ margin: 6px 0 0 18px; padding: 0; }}
@@ -344,14 +569,15 @@ schema {schema} · model-derived fluid loads, not structural stress</p>
 
 <h2>Force &amp; moment coefficients</h2>
 <p class="meta">Coefficients are area-weighted over the diffuse immersed interface;
-physical values use the recorded q∞ scaling. +X is the free-stream (drag) direction;
-lateral and vertical axes follow the approved source orientation.</p>
+physical values use the recorded q∞ scaling. Reference frame: {coefficient_frame}.
+Any body orientation rotates the geometry, never these axes.</p>
 <table>
-<tr><th>Quantity</th><td><b>Coefficient</b></td><td><b>Physical</b></td></tr>
+<tr><th>Quantity</th><td><b>Coefficient (1)</b></td><td><b>Physical</b></td><td><b>Source · method</b></td></tr>
 {results_rows}</table>
 
 <h2>Derived scalars</h2>
-<table>{scalar_rows}</table>
+<table><tr><th>Quantity</th><td><b>Value</b></td><td><b>Source · method</b></td></tr>
+{scalar_rows}</table>
 {warnings_html}{figure_html}
 <h2>Limitations</h2>
 <div class="limits">
@@ -368,6 +594,7 @@ This report presents <b>model-derived</b> results from a neural fixed-body surro
 </html>
 "#,
         title = escape(&case.name),
+        coefficient_frame = escape(crate::engineering::COEFFICIENT_REFERENCE_FRAME),
         generated = crate::app::format_utc(input.generated_utc_unix),
         app_version = escape(input.app_version),
         schema = REPORT_SCHEMA,
@@ -471,17 +698,30 @@ mod tests {
         assert!(html.contains("not structural stress"));
         assert!(html.contains("recovered"));
         assert!(html.contains(REPORT_SCHEMA));
+        assert!(html.contains(engineering::ENGINEERING_RESULT_SCHEMA));
         assert!(html.contains("Named waiver"));
         assert!(html.contains("horizon near support limit"));
+        assert!(html.contains("Source · method"));
+        assert!(html.contains("DERIVED · physical-reference Cp from recovered pressure"));
     }
 
     #[test]
     fn report_escapes_untrusted_strings() {
         let mut case = fixture_case();
         case.name = "<script>alert('x')</script>".into();
+        case.source_name = "part<&>.stl".into();
+        case.result.as_mut().unwrap().method = "traction<&>.v1".into();
+        case.result
+            .as_mut()
+            .unwrap()
+            .warnings
+            .push("<img src=x onerror=alert(1)>".into());
         let html = engineering_report_html(&input(&case, UnitSystem::Si)).unwrap();
         assert!(!html.contains("<script>alert"));
+        assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("part&lt;&amp;&gt;.stl"));
+        assert!(html.contains("traction&lt;&amp;&gt;.v1"));
     }
 
     #[test]
@@ -503,18 +743,76 @@ mod tests {
         let mut no_run = input(&case, UnitSystem::Si);
         no_run.run_id = " ";
         assert!(engineering_report_html(&no_run).is_err());
+
+        let mut draft_with_result = fixture_case();
+        draft_with_result.stage = crate::engineering::CaseStage::Setup;
+        assert!(
+            engineering_report_html(&input(&draft_with_result, UnitSystem::Si))
+                .unwrap_err()
+                .contains("Results or Evidence")
+        );
+    }
+
+    #[test]
+    fn report_rejects_nonfinite_values_and_incomplete_provenance() {
+        let mut case = fixture_case();
+        case.result.as_mut().unwrap().force_newtons[1] = f64::NAN;
+        assert!(engineering_report_html(&input(&case, UnitSystem::Si))
+            .unwrap_err()
+            .contains("non-finite engineering result"));
+
+        let mut case = fixture_case();
+        case.source_revision_id = None;
+        assert!(engineering_report_html(&input(&case, UnitSystem::Si))
+            .unwrap_err()
+            .contains("source revision"));
+
+        let mut case = fixture_case();
+        case.model_sha256 = Some("C".repeat(64));
+        assert!(engineering_report_html(&input(&case, UnitSystem::Si))
+            .unwrap_err()
+            .contains("canonical lowercase model SHA-256"));
+
+        let case = fixture_case();
+        let mut time_reversed = input(&case, UnitSystem::Si);
+        time_reversed.generated_utc_unix = time_reversed.run_created_utc_unix - 1;
+        assert!(engineering_report_html(&time_reversed)
+            .unwrap_err()
+            .contains("cannot precede"));
     }
 
     #[test]
     fn report_embeds_a_section_figure_when_supplied() {
+        const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
         let case = fixture_case();
         let mut with_figure = input(&case, UnitSystem::Si);
         with_figure.section_figure = Some(SectionFigure {
-            png_base64: "AAAA".into(),
+            png_base64: ONE_PIXEL_PNG.into(),
             caption: "X section · physical-reference Cp".into(),
         });
         let html = engineering_report_html(&with_figure).unwrap();
-        assert!(html.contains("data:image/png;base64,AAAA"));
+        assert!(html.contains(&format!("data:image/png;base64,{ONE_PIXEL_PNG}")));
         assert!(html.contains("X section"));
+
+        let mut invalid_figure = input(&case, UnitSystem::Si);
+        invalid_figure.section_figure = Some(SectionFigure {
+            png_base64: "AAAA&quot; onerror=&quot;alert(1)".into(),
+            caption: "unsafe".into(),
+        });
+        assert!(engineering_report_html(&invalid_figure)
+            .unwrap_err()
+            .contains("not valid base64"));
+    }
+
+    #[test]
+    fn report_bytes_are_deterministic_and_locale_independent() {
+        let case = fixture_case();
+        let first = engineering_report_html(&input(&case, UnitSystem::Si)).unwrap();
+        let second = engineering_report_html(&input(&case, UnitSystem::Si)).unwrap();
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert!(first.contains("30.00 m/s"));
+        assert!(!first.contains("30,00 m/s"));
+        assert!(!first.contains("NaN"));
+        assert!(!first.contains(">inf<"));
     }
 }

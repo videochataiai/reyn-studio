@@ -90,11 +90,73 @@ Every item verified against the current source and a fresh release build (window
 | X6 | **FIXED** | color — combo `selected_text` in TEXT; BRAND stays wordmark-only |
 | G1 | **FIXED** | helper — `diag()` truncates the value galley with full-value hover (root fix for R2/CS3/E1) |
 | G2 | **FIXED** | sweep — 63 sub-floor `.size()` call sites replaced with named styles across `app.rs`/`settings.rs`; remaining two are intentional glyph dots |
-| G3 | **OPEN** | content max-widths still vary (976/1048/1040); Settings now uses 1040 — full unification deferred |
-| G4 | **OPEN** | `i8` margin gutters remain on Case/Evidence center views; works, but should move to `content_column` math — deferred |
+| G3 | **FIXED** (2026-07-24 settings/features pass) | one `content_column(CONTENT_MAX_WIDTH = 980)` with enforced 34px minimum symmetric gutters now used by Projects, Case, Evidence, Library, and Settings |
+| G4 | **FIXED** (2026-07-24 settings/features pass) | the `i8` `Margin` gutters on Case/Evidence center views were replaced by `content_column` f32 math; no magic 99/93 clamps remain |
 | G5 | **FIXED** | survivable — verified live at 1100×700: rails scroll, `diag()` elides, setting rows yield, the spine replaced the wide ribbon; min size stays 1100×700 |
 
-**Consciously left open (all minor except noted):** P5 (caps state-token convention), R8 (painter header refactor), C12 (dirty-indicator consolidation), X4/X5 (sandbox state/canvas polish), G3/G4 (layout unification). None affects reachability, honesty, or overlap at supported sizes.
+**Consciously left open (all minor except noted):** P5 (caps state-token convention), R8 (painter header refactor), C12 (dirty-indicator consolidation), X4/X5 (sandbox state/canvas polish). G3/G4 (layout unification) were closed by the 2026-07-24 settings/features pass. None of the remaining items affects reachability, honesty, or overlap at supported sizes.
+
+---
+
+## Disposition — navigation / run-lifecycle pass, 2026-07-24 (annotation; rows above unchanged)
+
+Three Settings defects found in founder review of the post-settings-pass captures, plus the two
+punch-list rows they reopened. Verified against a fresh release build at 1600×1000 and 1100×700.
+
+| # | Disposition | How / why |
+|---|---|---|
+| S2 | **REOPENED → FIXED** | the earlier fix still allocated a fixed-width control gutter, so a path elided at ~200px on a card with hundreds of spare pixels. Path settings now own a full-width row of their own (`path_setting_row`), and the value uses all of it |
+| S8 | **REOPENED → FIXED** | elision was mid-word with no marker. `path_field` now paints the unfocused value middle-elided with a visible `…`, keeps more of the tail (the identifying end of a path), and shows the full value on hover; clicking turns it into an ordinary field |
+| S9 | **NEW → FIXED** | the category rail's vertical hairline ran the full panel height and met the action row's horizontal rule at a T-junction. It now stops 14px short, so the two rules never meet — matching the single meeting-edge convention from C5 |
+| S10 | **NEW → FIXED** | on tall windows the content card left a large unexplained dead region. The column now anchors a real closing line to the bottom (`settings_scope_footnote`: where the preferences file lives and what it cannot change), so the composition reads deliberately at both 700px and 1000px heights |
+| R7 | **EXTENDED** | the viewport hint now names the bindings of the *active* mouse scheme plus F / 1–7 / click-to-probe, instead of a hardcoded "drag to orbit · scroll to zoom". Same 420px height threshold and the same Settings toggle |
+
+The seven consciously-open minors (P5, R8, C12, X4, X5) were not in the surface area this pass
+touched and remain open with their original reasons.
+
+### Found while capturing this pass (same annotation, 2026-07-24)
+
+Four of these came out of the 1100×700 captures and one out of launching the build at all — none
+were visible in the 1600×1000 review set.
+
+| # | Disposition | How / why |
+|---|---|---|
+| S10 | **FIXED → REFIXED** | the closing footnote reserved a guessed 46px, so its second line clipped whenever the preferences path or the scope sentence wrapped. The reserve is now measured from the laid-out galleys at the current column width |
+| V1 | **NEW → FIXED** | at 1100×700 the camera-station strip was pinned to the top-right of the viewport and printed straight over the azimuth/elevation readout. When the two would collide the strip now takes the row underneath the readout instead |
+| V2 | **NEW → FIXED** | the interaction hint is centred and was clipped at both viewport edges on a narrow window, which teaches nothing. It is now measured and dropped when it does not fit; the same bindings stay in Settings › Keyboard shortcuts |
+| V3 | **NEW → FIXED** | the top and bottom stations sit at 89° elevation, which was inside the up-reference fallback band, so the plan view rendered rolled a quarter turn while its label promised "stream left to right". The fallback threshold moved above the pitch limit in both the CPU basis and the raymarch shader, and a test now pins each station's on-screen orientation to its label |
+| V4 | **NEW → FIXED** | the release build crashed on first paint: the volume shader's look-at uniform was named `target`, a WGSL reserved word. The GPU render tests skip themselves silently on a machine with no adapter, so the suite was green. Field renamed, and every shader is now parsed and validated in the test suite without needing an adapter |
+
+Two capture hooks were added for this and later passes: `REYN_STUDIO_IMPORT=<file.stl>` imports a
+mesh through the ordinary import path once the model inventory arrives (the shot waits for it), and
+`REYN_STUDIO_START_NAV` now also accepts `results` and the sandbox screens `metrics`, `fields2d`,
+`painter`, `benchmark` — the sandbox ones only when the Developer sandbox is actually enabled, which
+`REYN_STUDIO_CONFIG_DIR` lets a capture run do without touching the operator's own settings.
+
+---
+
+## Disposition — engineering workflow polish, 2026-07-25
+
+Verified from fresh composited-frame captures of the current code:
+
+- `case-default.png` (1440×900) and `case-narrow.png` (1100×700) in
+  `/tmp/reyn-polish-qa-after-20260725/`: **CS7/G5 remain fixed.** The case
+  lineage and stage summaries elide rather than crossing columns. Undo/Redo
+  are visible at the top of the rail, the units/transform setup gate follows,
+  and source/preflight detail is disclosed only on request.
+- `results-empty-default.png` (1440×900): **R9/C7 extended and verified.**
+  Empty Results owns the document center with one recovery action, does not
+  open an empty detail rail, and no longer paints procedural particles,
+  camera controls, or viewport hints as if evidence existed.
+- `evidence-empty-narrow.png` (1100×700): the no-case Evidence state is a
+  single readable center card with one recovery action. The redundant empty
+  detail rail is suppressed and the copy remains unclipped at minimum width.
+
+The capture hook can import a case or deep-link a destination, but importing
+intentionally returns to Case Setup. It therefore did not visually exercise
+the completed-run export menu, its disabled reasons, or post-run measurement
+rows in this pass; those remain interactive-smoke items rather than visually
+closed claims.
 
 ---
 

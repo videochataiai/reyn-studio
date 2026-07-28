@@ -8,6 +8,13 @@ use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{AboutMetadata, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use std::path::PathBuf;
 
+const IMPORT_STL_LABEL: &str = "Import STL Geometry…";
+const RUN_ANALYSIS_LABEL: &str = "Run Analysis";
+const EXPORT_FEA_LABEL: &str = "Export Fluid Surface Loads for FEA…";
+const NO_RECENT_PROJECTS_LABEL: &str = "No Recent Projects";
+const START_AUTO_ADVANCE_LABEL: &str = "Start Sandbox Auto-Advance";
+const STOP_AUTO_ADVANCE_LABEL: &str = "Stop Sandbox Auto-Advance";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuCommand {
     NewProject,
@@ -18,6 +25,8 @@ pub enum MenuCommand {
     ImportCad,
     ExportCalculations,
     Quit,
+    UndoCaseEdit,
+    RedoCaseEdit,
     ResetControls,
     ResetCamera,
     ToggleDimension,
@@ -37,6 +46,8 @@ pub enum MenuSignal {
 #[derive(Clone, PartialEq, Default)]
 pub struct MenuSyncState {
     pub can_save: bool,
+    pub can_undo_case_edit: bool,
+    pub can_redo_case_edit: bool,
     pub analysis_available: bool,
     pub sandbox_enabled: bool,
     pub sandbox_live: bool,
@@ -47,11 +58,14 @@ pub struct MenuBar {
     _menu: Menu,
     commands: Vec<(MenuId, MenuCommand)>,
     save_item: MenuItem,
+    undo_case_edit_item: MenuItem,
+    redo_case_edit_item: MenuItem,
     run_item: MenuItem,
     export_fea_item: MenuItem,
     research_menu: Submenu,
     live_item: MenuItem,
     recent_menu: Submenu,
+    empty_recent_item: MenuItem,
     recent_items: Vec<(MenuId, PathBuf, MenuItem)>,
     synced: MenuSyncState,
 }
@@ -96,6 +110,8 @@ impl MenuBar {
                     }),
                 ),
                 &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::services(None),
+                &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::hide(None),
                 &PredefinedMenuItem::hide_others(None),
                 &PredefinedMenuItem::show_all(None),
@@ -105,6 +121,8 @@ impl MenuBar {
             .ok()?;
 
         let recent_menu = Submenu::new("Open Recent", true);
+        let empty_recent_item = MenuItem::new(NO_RECENT_PROJECTS_LABEL, false, None);
+        recent_menu.append(&empty_recent_item).ok()?;
         let save_item = item("Save Project", cmd(Code::KeyS), MenuCommand::SaveProject);
         let file_menu = Submenu::new("File", true);
         file_menu
@@ -121,7 +139,7 @@ impl MenuBar {
                 ),
                 &PredefinedMenuItem::separator(),
                 &item("Import Model…", None, MenuCommand::ImportModel),
-                &item("Import CAD Geometry (STL)…", None, MenuCommand::ImportCad),
+                &item(IMPORT_STL_LABEL, None, MenuCommand::ImportCad),
                 &item(
                     "Export Calculations…",
                     None,
@@ -132,9 +150,30 @@ impl MenuBar {
             ])
             .ok()?;
 
+        let undo_case_edit_item = item(
+            "Undo Case-Draft Edit",
+            cmd(Code::KeyZ),
+            MenuCommand::UndoCaseEdit,
+        );
+        let redo_case_edit_item = item(
+            "Redo Case-Draft Edit",
+            cmd_shift(Code::KeyZ),
+            MenuCommand::RedoCaseEdit,
+        );
         let edit_menu = Submenu::new("Edit", true);
         edit_menu
-            .append_items(&[&item("Reset Controls", None, MenuCommand::ResetControls)])
+            .append_items(&[
+                &undo_case_edit_item,
+                &redo_case_edit_item,
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::cut(None),
+                &PredefinedMenuItem::copy(None),
+                &PredefinedMenuItem::paste(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::select_all(None),
+                &PredefinedMenuItem::separator(),
+                &item("Reset Controls", None, MenuCommand::ResetControls),
+            ])
             .ok()?;
 
         let view_menu = Submenu::new("View", true);
@@ -148,18 +187,18 @@ impl MenuBar {
             .ok()?;
 
         let run_item = item(
-            "Run Immutable Attempt",
+            RUN_ANALYSIS_LABEL,
             cmd(Code::KeyR),
             MenuCommand::RunAnalysis,
         );
-        let export_fea_item = item("Export FEA Surface Loads…", None, MenuCommand::ExportFea);
+        let export_fea_item = item(EXPORT_FEA_LABEL, None, MenuCommand::ExportFea);
         let analysis_menu = Submenu::new("Analysis", true);
         analysis_menu
             .append_items(&[&run_item, &export_fea_item])
             .ok()?;
 
         let live_item = item(
-            "Start Sandbox Auto-Advance",
+            START_AUTO_ADVANCE_LABEL,
             None,
             MenuCommand::ToggleSandboxLive,
         );
@@ -180,6 +219,8 @@ impl MenuBar {
             .append_items(&[
                 &PredefinedMenuItem::minimize(None),
                 &PredefinedMenuItem::maximize(Some("Zoom")),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::bring_all_to_front(None),
             ])
             .ok()?;
 
@@ -209,15 +250,20 @@ impl MenuBar {
             _menu: menu,
             commands,
             save_item,
+            undo_case_edit_item,
+            redo_case_edit_item,
             run_item,
             export_fea_item,
             research_menu,
             live_item,
             recent_menu,
+            empty_recent_item,
             recent_items: Vec::new(),
             synced: MenuSyncState {
                 // Force the first sync to write real state.
                 can_save: true,
+                can_undo_case_edit: true,
+                can_redo_case_edit: true,
                 analysis_available: true,
                 sandbox_enabled: true,
                 sandbox_live: false,
@@ -250,6 +296,14 @@ impl MenuBar {
         if state.can_save != self.synced.can_save {
             self.save_item.set_enabled(state.can_save);
         }
+        if state.can_undo_case_edit != self.synced.can_undo_case_edit {
+            self.undo_case_edit_item
+                .set_enabled(state.can_undo_case_edit);
+        }
+        if state.can_redo_case_edit != self.synced.can_redo_case_edit {
+            self.redo_case_edit_item
+                .set_enabled(state.can_redo_case_edit);
+        }
         if state.analysis_available != self.synced.analysis_available {
             self.run_item.set_enabled(state.analysis_available);
             self.export_fea_item.set_enabled(state.analysis_available);
@@ -259,27 +313,85 @@ impl MenuBar {
         }
         if state.sandbox_live != self.synced.sandbox_live {
             self.live_item.set_text(if state.sandbox_live {
-                "Stop Sandbox Auto-Advance"
+                STOP_AUTO_ADVANCE_LABEL
             } else {
-                "Start Sandbox Auto-Advance"
+                START_AUTO_ADVANCE_LABEL
             });
         }
         if state.recents != self.synced.recents {
             for (_, _, entry) in self.recent_items.drain(..) {
                 let _ = self.recent_menu.remove(&entry);
             }
-            for (name, path) in &state.recents {
-                let file = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("project");
-                let entry = MenuItem::new(format!("{name}  ·  {file}"), true, None);
-                if self.recent_menu.append(&entry).is_ok() {
-                    self.recent_items
-                        .push((entry.id().clone(), path.clone(), entry));
+            if state.recents.is_empty() {
+                let _ = self.recent_menu.append(&self.empty_recent_item);
+            } else {
+                let _ = self.recent_menu.remove(&self.empty_recent_item);
+                for (name, path) in &state.recents {
+                    let file = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("project");
+                    let entry = MenuItem::new(format!("{name}  ·  {file}"), true, None);
+                    if self.recent_menu.append(&entry).is_ok() {
+                        self.recent_items
+                            .push((entry.id().clone(), path.clone(), entry));
+                    }
                 }
             }
         }
         self.synced = state;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn native_accelerators_are_conventional_and_unique() {
+        let standard = [
+            cmd(Code::KeyN).unwrap(),
+            cmd(Code::KeyO).unwrap(),
+            cmd(Code::KeyS).unwrap(),
+            cmd_shift(Code::KeyS).unwrap(),
+            cmd(Code::KeyQ).unwrap(),
+            cmd(Code::KeyZ).unwrap(),
+            cmd_shift(Code::KeyZ).unwrap(),
+            cmd(Code::KeyR).unwrap(),
+        ];
+        assert!(standard[0].matches(Modifiers::SUPER, Code::KeyN));
+        assert!(standard[3].matches(Modifiers::SUPER | Modifiers::SHIFT, Code::KeyS));
+
+        let ids: HashSet<_> = standard.iter().map(Accelerator::id).collect();
+        assert_eq!(
+            ids.len(),
+            standard.len(),
+            "native menu accelerators must not collide"
+        );
+    }
+
+    #[test]
+    fn action_labels_are_specific_and_scientifically_bounded() {
+        assert!(IMPORT_STL_LABEL.ends_with('…'));
+        assert!(!IMPORT_STL_LABEL.contains("CAD"));
+        assert_eq!(RUN_ANALYSIS_LABEL, "Run Analysis");
+        assert!(EXPORT_FEA_LABEL.starts_with("Export Fluid Surface Loads"));
+        assert!(EXPORT_FEA_LABEL.ends_with('…'));
+        assert!(START_AUTO_ADVANCE_LABEL.starts_with("Start "));
+        assert!(STOP_AUTO_ADVANCE_LABEL.starts_with("Stop "));
+    }
+
+    #[test]
+    fn contextual_actions_default_to_disabled() {
+        let state = MenuSyncState::default();
+        assert!(!state.can_save);
+        assert!(!state.can_undo_case_edit);
+        assert!(!state.can_redo_case_edit);
+        assert!(!state.analysis_available);
+        assert!(!state.sandbox_enabled);
+        assert!(!state.sandbox_live);
+        assert!(state.recents.is_empty());
+        assert_eq!(NO_RECENT_PROJECTS_LABEL, "No Recent Projects");
     }
 }

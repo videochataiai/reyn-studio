@@ -150,7 +150,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Benchmark evidence: canonical JSON + PNG/PDF + Ed25519 signed sidecars | SHIPPED (sandbox scope) | `src/benchmark_export.rs`; N5X-EXPORT-01 passed; signing slice per PRD §4.1 (production Keychain gate open) |
 | **Engineering-case report (PDF/PNG)** | MISSING | The benchmark path proves the machinery; nothing equivalent exists for the flagship external-flow case |
 | **Viewport image export / screenshot with legend + provenance** | MISSING | No capture path in `src/gpu.rs` or `src/app.rs` |
-| Field export (VTK or equivalent) for external post-processing | MISSING | Fields persist internally as `REYNENG1` blobs (`src/engineering.rs:748-822`) but there is no neutral-format export |
+| Field export (VTK or equivalent) for external post-processing | SHIPPED (automated format/provenance gate; ParaView smoke pending) | `src/vtk_export.rs` streams a legacy VTK `STRUCTURED_GRID` from the completed selected run's persisted `REYNENG1` blob, mapping coordinates and vectors into the approved source frame and embedding units, source classes, methods, transform, and source/case/run/model/field identity. Results and Evidence affordances live in `src/app.rs`; malformed, non-finite, stale/incomplete, unapproved, missing-content, and non-canonical inputs are rejected. External ParaView/manual-open remains a release smoke. |
 | Diagnostics CSV | PARTIAL | `src/app.rs:7100-7118` exports procedural-particle diagnostics — sandbox-grade, not case evidence |
 
 ### 2.6 Project management
@@ -160,7 +160,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | New/Open/Save/Save As, recents, autosave, crash recovery, migration | SHIPPED | Shortcuts `src/app.rs:4982-5136`; unsaved-changes guard `src/app.rs:5233+`; N6-PROJ-01..07 passed per PRD §4.1 |
 | Portable content-addressed project bundle, read-only degraded reopen | SHIPPED | PRD §4.1 external-case row; read-only banner `src/app.rs:2629-2641` (N6-PROJ-05/06) |
 | Staleness + immutable runs + evidence locking | SHIPPED | `src/app.rs:724+`, ledger `src/app.rs:2646-2729` |
-| **Undo/redo for case edits** | MISSING | No undo system anywhere (repo-wide grep). Revisions mitigate for runs, but a mistyped viscosity has no one-keystroke recovery — every incumbent has ⌘Z |
+| **Undo/redo for case edits** | SHIPPED | Bounded, transaction-coalesced history covers reversible Case Setup operating/preflight draft inputs (`CaseDraftHistory` in `src/engineering.rs`); ⌘Z / ⇧⌘Z (Ctrl equivalents), native Edit menu, and command-palette actions route restores through normal result invalidation/readiness while immutable source/model/run/evidence identity stays outside snapshots (`src/app.rs`, `src/menubar.rs`) |
 | Project search / filtering | MISSING | Recents list only (`src/app.rs:4030+`); acceptable at current scale |
 
 ### 2.7 Collaboration & versioning

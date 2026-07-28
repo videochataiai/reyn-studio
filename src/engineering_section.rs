@@ -466,6 +466,35 @@ mod tests {
         }
     }
 
+    /// Pinned Cp range (Settings › Appearance): a signed scale becomes an
+    /// exact symmetric ±extent; magnitude scales are untouched.
+    #[test]
+    fn pinned_scale_overrides_signed_ranges_only() {
+        let signed = SectionScale {
+            minimum: -0.4,
+            maximum: 0.9,
+            center: Some(0.0),
+            extent: 0.9,
+        };
+        let pinned = signed.pinned(1.5);
+        assert_eq!(pinned.legend_minimum(), -1.5);
+        assert_eq!(pinned.legend_maximum(), 1.5);
+        assert_eq!(pinned.normalize(1.5), 1.0);
+        assert_eq!(pinned.normalize(-3.0), -1.0, "clamped beyond the pin");
+        // Magnitude (uncentered) scales are unchanged by pinning.
+        let magnitude = SectionScale {
+            minimum: 0.0,
+            maximum: 4.0,
+            center: None,
+            extent: 4.0,
+        };
+        let same = magnitude.pinned(1.5);
+        assert_eq!(same.legend_maximum(), 4.0);
+        // Invalid extents are ignored rather than corrupting the scale.
+        let unchanged = signed.pinned(f32::NAN);
+        assert_eq!(unchanged.legend_maximum(), 0.9);
+    }
+
     #[test]
     fn axes_extract_expected_plane_orientation_and_mask() {
         let n = 3;

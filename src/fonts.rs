@@ -120,12 +120,17 @@ mod tests {
     #[test]
     fn named_weight_families_are_registered_and_backed_by_font_data() {
         let fonts = definitions();
-        for family in [FAMILY_MEDIUM, FAMILY_SEMIBOLD, FAMILY_MONO_MEDIUM] {
+        for (family, expected_primary) in [
+            (FAMILY_MEDIUM, "inter-medium"),
+            (FAMILY_SEMIBOLD, "inter-semibold"),
+            (FAMILY_MONO_MEDIUM, "jbmono-medium"),
+        ] {
             let chain = fonts
                 .families
                 .get(&FontFamily::Name(family.into()))
                 .unwrap_or_else(|| panic!("family {family} is not registered"));
             let first = chain.first().expect("family chain is empty");
+            assert_eq!(first, expected_primary);
             assert!(
                 fonts.font_data.contains_key(first),
                 "family {family} resolves to missing font data {first}"
@@ -134,6 +139,12 @@ mod tests {
                 chain.len() > 1,
                 "family {family} has no fallback chain for glyph coverage"
             );
+            for font in chain {
+                assert!(
+                    fonts.font_data.contains_key(font),
+                    "family {family} fallback chain references missing font data {font}"
+                );
+            }
         }
         // Icon font present and reachable from proportional text.
         assert!(fonts.font_data.contains_key("phosphor"));
@@ -207,6 +218,61 @@ mod tests {
                 "phosphor face lacks U+{:04X}",
                 c as u32
             );
+        }
+    }
+
+    /// Resolution guard for every family used by the theme. Checking the
+    /// first font that actually contains each icon catches both missing
+    /// fallback links and any future text face that shadows Phosphor.
+    #[test]
+    fn shell_icons_resolve_to_phosphor_in_every_theme_family() {
+        let fonts = definitions();
+        let families = [
+            ("proportional", FontFamily::Proportional),
+            ("monospace", FontFamily::Monospace),
+            (FAMILY_MEDIUM, FontFamily::Name(FAMILY_MEDIUM.into())),
+            (FAMILY_SEMIBOLD, FontFamily::Name(FAMILY_SEMIBOLD.into())),
+            (
+                FAMILY_MONO_MEDIUM,
+                FontFamily::Name(FAMILY_MONO_MEDIUM.into()),
+            ),
+        ];
+        let icons = [
+            egui_phosphor::regular::FOLDER,
+            egui_phosphor::regular::WIND,
+            egui_phosphor::regular::CHART_BAR,
+            egui_phosphor::regular::BOOK_OPEN,
+            egui_phosphor::regular::CUBE,
+            egui_phosphor::regular::GEAR,
+            egui_phosphor::regular::PLAY,
+        ];
+
+        for (family_name, family) in families {
+            let chain = fonts
+                .families
+                .get(&family)
+                .unwrap_or_else(|| panic!("family {family_name} is not registered"));
+            for icon in icons {
+                let character = icon.chars().next().unwrap();
+                let resolved = chain.iter().find(|name| {
+                    let data = fonts
+                        .font_data
+                        .get(*name)
+                        .unwrap_or_else(|| panic!("font data missing for {name}"));
+                    let face = fontdue::Font::from_bytes(
+                        data.font.as_ref(),
+                        fontdue::FontSettings::default(),
+                    )
+                    .unwrap_or_else(|error| panic!("could not parse {name}: {error}"));
+                    face.lookup_glyph_index(character) != 0
+                });
+                assert_eq!(
+                    resolved.map(String::as_str),
+                    Some("phosphor"),
+                    "{family_name} resolves U+{:04X} through {resolved:?}",
+                    character as u32
+                );
+            }
         }
     }
 }

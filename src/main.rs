@@ -20,11 +20,13 @@ mod painter;
 pub mod project;
 mod project_lifecycle;
 mod report;
+mod runtime;
 mod settings;
 mod signing;
 mod theme;
 mod units;
 mod viewport;
+mod vtk_export;
 
 fn main() -> eframe::Result<()> {
     if let Some(request) = signing::parse_verify_cli(std::env::args()) {
@@ -56,15 +58,21 @@ fn main() -> eframe::Result<()> {
 
     // Dev/QA affordance (matches REYN_STUDIO_START_NAV): launch at an exact
     // window size, e.g. REYN_STUDIO_WINDOW=1100x700 for min-window audits.
-    let inner_size = std::env::var("REYN_STUDIO_WINDOW")
-        .ok()
-        .and_then(|spec| {
-            let (w, h) = spec.split_once('x')?;
-            Some([w.parse().ok()?, h.parse().ok()?])
-        })
-        .unwrap_or([1440.0, 900.0]);
+    let forced_size = std::env::var("REYN_STUDIO_WINDOW").ok().and_then(|spec| {
+        let (w, h) = spec.split_once('x')?;
+        Some([w.parse().ok()?, h.parse().ok()?])
+    });
+    let inner_size = forced_size.unwrap_or([1440.0, 900.0]);
 
     let options = eframe::NativeOptions {
+        // A forced QA size must win over persisted window geometry. eframe
+        // restores the stored "window" entry regardless of `persist_window`
+        // (that flag only gates saving), so QA runs get a scratch storage
+        // path — which also keeps audits from clobbering real window state.
+        persist_window: forced_size.is_none(),
+        persistence_path: forced_size
+            .is_some()
+            .then(|| std::env::temp_dir().join("reyn-studio-qa-storage.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(inner_size)
             .with_min_inner_size([1100.0, 700.0])

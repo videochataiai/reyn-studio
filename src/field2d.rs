@@ -309,6 +309,34 @@ fn argext(vals: &[f32], n: usize, max: bool) -> (usize, usize, f32) {
     (bi / n, bi % n, bv)
 }
 
+/// First maximum absolute value, matching `argext(abs(values), max=true)`
+/// without allocating the temporary absolute-value map.
+fn argmax_abs(vals: &[f32], n: usize) -> (usize, usize, f32) {
+    let (mut best_index, mut best_abs) = (0usize, vals[0].abs());
+    for (index, value) in vals.iter().enumerate() {
+        let absolute = value.abs();
+        if absolute > best_abs {
+            best_index = index;
+            best_abs = absolute;
+        }
+    }
+    (best_index / n, best_index % n, vals[best_index])
+}
+
+/// First maximum absolute pointwise difference, matching materialization of an
+/// error map followed by `argext`, but retaining only the winning scalar.
+fn argmax_abs_diff(left: &[f32], right: &[f32], n: usize) -> (usize, usize, f32) {
+    let (mut best_index, mut best_error) = (0usize, (left[0] - right[0]).abs());
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        let error = (left - right).abs();
+        if error > best_error {
+            best_index = index;
+            best_error = error;
+        }
+    }
+    (best_index / n, best_index % n, best_error)
+}
+
 /// Auto-detected critical points of a `[3,N,N]` source (+ the error hotspot vs
 /// `truth` when present, measured on the displayed variable).
 pub fn insights(f: &Field2D, src: &[f32], truth: Option<&[f32]>, var: FieldVar) -> Vec<Insight> {
@@ -330,13 +358,12 @@ pub fn insights(f: &Field2D, src: &[f32], truth: Option<&[f32]>, var: FieldVar) 
         value: v,
     });
     let (w, _) = scalar(src, n, FieldVar::Vorticity);
-    let wa: Vec<f32> = w.iter().map(|x| x.abs()).collect();
-    let (i, j, _) = argext(&wa, n, true);
+    let (i, j, value) = argmax_abs(&w, n);
     out.push(Insight {
         kind: InsightKind::MaxVorticity,
         i,
         j,
-        value: w[i * n + j],
+        value,
     });
     let (s, _) = scalar(src, n, FieldVar::Velocity);
     let (i, j, v) = argext(&s, n, true);
@@ -349,8 +376,7 @@ pub fn insights(f: &Field2D, src: &[f32], truth: Option<&[f32]>, var: FieldVar) 
     if let Some(t) = truth {
         let (a, _) = scalar(src, n, var);
         let (b, _) = scalar(t, n, var);
-        let err: Vec<f32> = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).collect();
-        let (i, j, v) = argext(&err, n, true);
+        let (i, j, v) = argmax_abs_diff(&a, &b, n);
         out.push(Insight {
             kind: InsightKind::MaxError,
             i,
@@ -487,6 +513,14 @@ mod tests {
             .find(|x| x.kind == InsightKind::MaxError)
             .unwrap();
         assert_eq!((err.i, err.j), (3, 4));
+    }
+
+    #[test]
+    fn allocation_free_extrema_keep_first_tie_semantics() {
+        let values = [1.0, -4.0, 4.0, 2.0];
+        assert_eq!(argmax_abs(&values, 2), (0, 1, -4.0));
+        let reference = [1.0, 0.0, 8.0, 2.0];
+        assert_eq!(argmax_abs_diff(&values, &reference, 2), (0, 1, 4.0));
     }
 
     #[test]

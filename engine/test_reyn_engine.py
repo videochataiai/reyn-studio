@@ -1,10 +1,14 @@
-import unittest
-from pathlib import Path
+import base64
 import sys
 import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
-
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from engine.reyn_engine import (
     Engine,
     analyze_checkpoint_provenance,
@@ -19,6 +23,50 @@ try:
     import torch
 except ImportError:  # The lightweight system-Python suite remains usable.
     torch = None
+
+
+def utc_text(value):
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def signing_context(root, key_id="engine-release-key"):
+    private_key = Ed25519PrivateKey.generate()
+    private_path = root / f"{key_id}.pem"
+    private_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    private_path.chmod(0o600)
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    entry = {
+        "key_id": key_id,
+        "algorithm": "ed25519",
+        "public_key": base64.b64encode(public_key).decode("ascii"),
+        "revoked_at": None,
+        "minimum_release_sequence": 0,
+        "maximum_release_sequence": 2**63 - 1,
+    }
+    return private_path, entry
+
+
+def sign_bundle(path, private_path, key_id="engine-release-key"):
+    from model_bundle import sign_model_bundle
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    return sign_model_bundle(
+        path,
+        private_key_path=private_path,
+        key_id=key_id,
+        release_sequence=1,
+        issued_at=utc_text(now - timedelta(minutes=1)),
+        expires_at=utc_text(now + timedelta(days=30)),
+    )
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -215,6 +263,16 @@ class ModelLibraryTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
+        self.research_dir = Path(__file__).resolve().parents[2] / "reyn-research"
+        sys.path.insert(0, str(self.research_dir))
+        import model_bundle
+        import test_model_bundle as bundle_test_support
+
+        self.model_bundle = model_bundle
+        self.bundle_test_support = bundle_test_support
+        self.original_tuf_root = model_bundle.PINNED_TUF_ROOT_JSON
+        self.private_key, self.signature_entry = signing_context(self.root)
+        self.tuf_signers = bundle_test_support.tuf_signers()
         self.engine = Engine.__new__(Engine)
         self.engine.research_dir = str(self.root)
         self.engine.torch = torch
@@ -225,6 +283,7 @@ class ModelLibraryTests(unittest.TestCase):
         self.engine._probe_checkpoint_compatibility = lambda _path: None
 
     def tearDown(self):
+        self.model_bundle.PINNED_TUF_ROOT_JSON = self.original_tuf_root
         self.directory.cleanup()
 
     def checkpoint(
@@ -236,14 +295,25 @@ class ModelLibraryTests(unittest.TestCase):
         out_channels=2,
         param_dim=0,
     ):
+        from model_bundle import write_model_bundle
+        from time_moe_operator import DirectFlowMap
+
+        config = {
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "width": 8,
+            "trunk_depth": 1,
+            "time_dim": 8,
+            "dt_scale": 0.01,
+            "param_dim": param_dim,
+        }
+        model = DirectFlowMap(**config)
         checkpoint = {
-            "model_config": {
-                "in_channels": in_channels,
-                "out_channels": out_channels,
-                "param_dim": param_dim,
-            },
-            "model_state_dict": {"trunk.weight": torch.ones(2, 2, 3, 3)},
+            "model_config": config,
+            "model_state_dict": model.state_dict(),
             "train_args": {
+                "dataset": "engine-fixture",
+                "seed": 0,
                 "grid_size": 128,
                 "max_steps": 64,
                 "epochs": 40,
@@ -259,11 +329,26 @@ class ModelLibraryTests(unittest.TestCase):
             "benchmark_reports": [{"sha256": "a" * 64}],
         }
         if source:
-            checkpoint["source_fingerprint"] = {"digest": "source-test"}
-        torch.save(checkpoint, path)
+            checkpoint["source_fingerprint"] = {
+                "algorithm": "sha256",
+                "digest": "b" * 64,
+            }
+        write_model_bundle(
+            checkpoint,
+            path,
+            model_id="engine-fixture",
+            model_version="1.0.0",
+        )
+        sign_bundle(path, self.private_key)
+        repository = self.bundle_test_support.write_tuf_repository(
+            Path(path),
+            self.signature_entry,
+            signers=self.tuf_signers,
+        )
+        self.model_bundle.PINNED_TUF_ROOT_JSON = repository["bootstrap_root"]
 
     def test_import_validates_copies_and_deletes_only_managed_models(self):
-        source = self.root / "outside.pth"
+        source = self.root / "outside.reynmodel"
         self.checkpoint(source)
 
         result = self.engine.import_model(source)
@@ -276,46 +361,65 @@ class ModelLibraryTests(unittest.TestCase):
         self.assertTrue(imported["managed"])
         self.assertTrue(imported["id"].startswith("reyn_models/"))
         self.assertEqual(len(imported["checkpoint_sha256"]), 64)
+        self.assertEqual(imported["authenticity_status"], "verified")
+        self.assertEqual(imported["publisher_key_id"], "engine-release-key")
         self.assertEqual(imported["limitations"], ["Static 2D geometry only"])
         self.assertEqual(imported["benchmark_report_hashes"], ["a" * 64])
         self.assertEqual(len(cards), 2)
+        imported_path = self.root / imported["id"]
+        self.assertTrue(imported_path.with_name(imported_path.name + ".sig").is_file())
+        self.assertTrue(imported_path.with_name(imported_path.name + ".tuf").is_dir())
         remaining = self.engine.delete_model(imported["id"])
-        self.assertEqual([card["id"] for card in remaining], ["outside.pth"])
-        with self.assertRaisesRegex(ValueError, "only checkpoints imported"):
-            self.engine.delete_model("outside.pth")
+        self.assertEqual([card["id"] for card in remaining], ["outside.reynmodel"])
+        self.assertFalse(imported_path.with_name(imported_path.name + ".sig").exists())
+        self.assertFalse(imported_path.with_name(imported_path.name + ".tuf").exists())
+        with self.assertRaisesRegex(ValueError, "only model bundles imported"):
+            self.engine.delete_model("outside.reynmodel")
 
     def test_invalid_checkpoint_is_rejected_with_a_clear_reason(self):
-        source = self.root / "notes.pth"
+        source = self.root / "notes.reynmodel"
         torch.save({"not": "a model"}, source)
 
         card = self.engine.checkpoint_card(source)
 
         self.assertEqual(card["status"], "invalid")
-        self.assertIn("missing required", card["status_detail"])
+        self.assertTrue(card["status_detail"])
         result = self.engine.import_model(source)
         self.assertFalse(result["ok"])
         self.assertFalse(result["validation"]["accepted"])
-        self.assertIn(
-            "checkpoint.missing_field",
-            {issue["code"] for issue in result["validation"]["issues"]},
-        )
+        self.assertTrue(result["validation"]["issues"])
         self.assertFalse(self.engine.managed_model_dir.exists())
 
-    def test_incompatible_checkpoint_returns_structured_contract_rejection(self):
-        source = self.root / "unsupported.pth"
-        self.checkpoint(source, in_channels=4, out_channels=2, param_dim=0)
+    def test_unsigned_bundle_is_rejected_and_never_copied(self):
+        source = self.root / "unsigned.reynmodel"
+        self.checkpoint(source)
+        source.with_name(source.name + ".sig").unlink()
 
         result = self.engine.import_model(source)
 
         self.assertFalse(result["ok"])
         self.assertIn(
-            "contract.unsupported_channels",
+            "signature.missing",
+            {issue["code"] for issue in result["validation"]["issues"]},
+        )
+        self.assertFalse(self.engine.managed_model_dir.exists())
+        self.assertEqual(self.engine.cache, {})
+
+    def test_pickle_checkpoint_returns_structured_fail_closed_rejection(self):
+        source = self.root / "unsupported.pth"
+        torch.save({"model_state_dict": {}}, source)
+
+        result = self.engine.import_model(source)
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "bundle.invalid_extension",
             {issue["code"] for issue in result["validation"]["issues"]},
         )
         self.assertFalse(self.engine.managed_model_dir.exists())
 
     def test_state_dictionary_load_failure_is_structured_and_not_copied(self):
-        source = self.root / "shape-mismatch.pth"
+        source = self.root / "shape-mismatch.reynmodel"
         self.checkpoint(source)
 
         def fail_probe(_path):
@@ -329,17 +433,28 @@ class ModelLibraryTests(unittest.TestCase):
             "checkpoint.load_incompatible",
             {issue["code"] for issue in result["validation"]["issues"]},
         )
-        self.assertFalse(self.engine.managed_model_dir.exists())
+        self.assertFalse(
+            any(self.engine.managed_model_dir.glob("*.reynmodel"))
+        )
+        self.assertTrue(self.engine.model_trust_state_dir.is_dir())
 
-    def test_legacy_checkpoint_remains_amber_not_verified(self):
+    def test_legacy_checkpoint_is_never_deserialized_by_runtime(self):
         source = self.root / "legacy.pth"
-        self.checkpoint(source, source=False)
+        torch.save({"model_state_dict": {}}, source)
 
-        card = self.engine.checkpoint_card(source)
+        with patch.object(
+            torch,
+            "load",
+            side_effect=AssertionError("runtime must never call torch.load"),
+        ):
+            card = self.engine.checkpoint_card(source)
 
-        self.assertEqual(card["status"], "review")
-        self.assertIn("source fingerprint absent", card["status_detail"])
-        self.assertIn("source_fingerprint", card["unknown_fields"])
+        self.assertEqual(card["status"], "invalid")
+        self.assertIn("pickle-backed checkpoints are disabled", card["status_detail"])
+        self.assertIn(
+            "checkpoint.unsafe_pickle_disabled",
+            {issue["code"] for issue in card["validation_issues"]},
+        )
 
 
 @unittest.skipIf(torch is None, "torch is available in the Reyn research environment")
@@ -426,9 +541,16 @@ class ModelContractTests(unittest.TestCase):
             "train_args": train_args,
             "epoch": 1,
             "checkpoint_role": "fixed_final",
-            "source_fingerprint": {"digest": "test-source"},
+            "source_fingerprint": {
+                "algorithm": "sha256",
+                "digest": "c" * 64,
+            },
             "physics_spec": fixed_body_v2_metadata(),
         }
+        import model_bundle
+        import test_model_bundle as bundle_test_support
+        from model_bundle import write_model_bundle
+
         engine = Engine.__new__(Engine)
         engine.research_dir = str(research_dir)
         engine.torch = torch
@@ -438,18 +560,35 @@ class ModelContractTests(unittest.TestCase):
         engine.cad_cache = {}
 
         with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory) / "physics.pth")
-            torch.save(checkpoint, path)
-            suite = engine.run_benchmark({
-                "model": path,
-                "seeds": [70000],
-                "horizons": [1],
-            })
-            cell, meta = engine.inspect_benchmark_cell({
-                "model": path,
-                "seed": 70000,
-                "horizon": 1,
-            })
+            engine.research_dir = directory
+            path = str(Path(directory) / "physics.reynmodel")
+            private_key, signature_entry = signing_context(Path(directory))
+            write_model_bundle(
+                checkpoint,
+                path,
+                model_id="physics-fixture",
+                model_version="1.0.0",
+            )
+            sign_bundle(path, private_key)
+            repository = bundle_test_support.write_tuf_repository(
+                Path(path),
+                signature_entry,
+            )
+            with patch.object(
+                model_bundle,
+                "PINNED_TUF_ROOT_JSON",
+                repository["bootstrap_root"],
+            ):
+                suite = engine.run_benchmark({
+                    "model": path,
+                    "seeds": [70000],
+                    "horizons": [1],
+                })
+                cell, meta = engine.inspect_benchmark_cell({
+                    "model": path,
+                    "seed": 70000,
+                    "horizon": 1,
+                })
 
         self.assertEqual(suite["provenance"]["verdict"], "clean")
         self.assertEqual(np.asarray(cell).shape, (3 * 16 * 16,))

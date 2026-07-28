@@ -1,0 +1,50 @@
+{
+  "operating_presets": [
+    {
+      "name": "North Atlantic full-scale tunnel campaign · vehicle configuration 2026-07-25 · primary repeatability reference with an intentionally very long operator-facing name",
+      "velocity_mps": 42.5,
+      "density_kg_m3": 1.184,
+      "viscosity_pa_s": 0.00001849,
+      "reference_pressure_pa": 100900.0
+    },
+    {
+      "name": "Short custom reference",
+      "velocity_mps": 12.0,
+      "density_kg_m3": 1.225,
+      "viscosity_pa_s": 0.0000181,
+      "reference_pressure_pa": 101325.0
+    }
+  ],
+  "case_templates": [
+    {
+      "schema_version": 1,
+      "name": "Long-range aerodynamic review template · approved operating envelope · customer configuration alpha · intentionally extended name for truncation QA",
+      "operating": {
+        "velocity_mps": 36.0,
+        "density_kg_m3": 1.2,
+        "viscosity_pa_s": 0.0000182,
+        "reference_pressure_pa": 101325.0,
+        "horizon_steps": 12
+      },
+      "preferred_view": {
+        "section_axis": "z",
+        "section_quantity": "physical_cp"
+      }
+    },
+    {
+      "schema_version": 1,
+      "name": "Invalid viscosity fixture · must remain unavailable",
+      "operating": {
+        "velocity_mps": 25.0,
+        "density_kg_m3": 1.225,
+        "viscosity_pa_s": 0.0,
+        "reference_pressure_pa": 101325.0,
+        "horizon_steps": 4
+      },
+      "preferred_view": {
+        "section_axis": "x",
+        "section_quantity": "physical_cp"
+      }
+    }
+  ]
+}

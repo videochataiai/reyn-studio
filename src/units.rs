@@ -442,12 +442,21 @@ mod tests {
 
     #[test]
     fn formatting_respects_significant_digits_and_notation() {
-        assert_eq!(format_value(1.234_567, fmt(5, NumberNotation::Auto)), "1.2346");
+        assert_eq!(
+            format_value(1.234_567, fmt(5, NumberNotation::Auto)),
+            "1.2346"
+        );
         assert_eq!(format_value(1234.6, fmt(3, NumberNotation::Auto)), "1235");
-        assert_eq!(format_value(0.0012, fmt(4, NumberNotation::Auto)), "0.001200");
+        assert_eq!(
+            format_value(0.0012, fmt(4, NumberNotation::Auto)),
+            "0.001200"
+        );
         // Auto flips to scientific past its thresholds.
         assert_eq!(format_value(1.5e6, fmt(4, NumberNotation::Auto)), "1.500e6");
-        assert_eq!(format_value(2.5e-4, fmt(3, NumberNotation::Auto)), "2.50e-4");
+        assert_eq!(
+            format_value(2.5e-4, fmt(3, NumberNotation::Auto)),
+            "2.50e-4"
+        );
         // Explicit notations override.
         assert_eq!(
             format_value(1234.5, fmt(5, NumberNotation::Scientific)),
@@ -464,7 +473,12 @@ mod tests {
     #[test]
     fn formatted_quantity_carries_the_unit_symbol() {
         assert_eq!(
-            format_quantity(Quantity::Force, 10.0, UnitSystem::Si, fmt(4, NumberNotation::Auto)),
+            format_quantity(
+                Quantity::Force,
+                10.0,
+                UnitSystem::Si,
+                fmt(4, NumberNotation::Auto)
+            ),
             "10.00 N"
         );
         assert_eq!(

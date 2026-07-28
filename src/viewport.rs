@@ -1,25 +1,457 @@
-//! Interactive 3D flow viewport. Mouse-drag orbits, scroll zooms, and every 3D
-//! control (opacity, density, slice, streamlines) drives the render. The
-//! particles are projected here on the CPU, then handed to the native wgpu
-//! bloom renderer (`gpu.rs`, N2) which lights the vortex cores with a real HDR
-//! + bloom pass. A CPU halo+core fallback keeps the viewport working if wgpu is
-//! ever unavailable.
+//! Interactive 3D flow viewport. The camera orbits, pans, zooms to the cursor,
+//! frames the geometry, and snaps to named stations, under whichever mouse
+//! scheme the operator picked; every 3D control (opacity, density, slice) drives
+//! the render. Particles are projected here on the CPU, then handed to the
+//! native wgpu bloom renderer (`gpu.rs`, N2) which lights the vortex cores with
+//! a real HDR and bloom pass. A CPU halo+core fallback keeps the viewport
+//! working if wgpu is ever unavailable.
 use crate::flow::Particle;
 use crate::gpu::{self, GpuInstance, SegInstance};
 use crate::theme::*;
-use egui::{Color32, Pos2, Rect, Sense, Stroke};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
+/// Closest and furthest orbit radius, in solver-domain units. The domain is
+/// `[-1,1]³`, so 1.2 frames a small body tightly and 14 pulls the whole tunnel
+/// back into view.
+pub const DIST_RANGE: std::ops::RangeInclusive<f32> = 1.2..=14.0;
+/// Orbit elevation limit. One degree short of the pole keeps the world-up
+/// reference (`+Z`) well conditioned, so the basis never flips mid-drag.
+pub const PITCH_LIMIT: f32 = 1.553_343; // 89°
+/// Standard-view interpolation duration (§3.7 motion budget).
+const SNAP_SECONDS: f32 = 0.28;
+
+/// Camera pose: orbit angles about the physics frame plus the look-at target,
+/// which pan moves. `+X` is the free stream, `+Y` is the side axis, and `+Z`
+/// is vertical — the same frame the coefficients are reported in, so "side"
+/// and "top" mean the same thing in the viewport and in the results table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pose {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub dist: f32,
+    pub target: [f32; 3],
+}
+
+/// A named camera station. Labels are in flow terms because the stream
+/// direction is physically fixed: an axis letter alone would not say whether
+/// you are looking at the nose or the wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardView {
+    Upstream,
+    Downstream,
+    SideLeft,
+    SideRight,
+    Top,
+    Bottom,
+    Iso,
+}
+
+impl StandardView {
+    pub const ALL: [Self; 7] = [
+        Self::Iso,
+        Self::Upstream,
+        Self::Downstream,
+        Self::SideLeft,
+        Self::SideRight,
+        Self::Top,
+        Self::Bottom,
+    ];
+
+    /// Flow-frame name plus the axis it looks along.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Upstream => "Upstream (−X)",
+            Self::Downstream => "Downstream (+X)",
+            Self::SideLeft => "Side (−Y)",
+            Self::SideRight => "Side (+Y)",
+            Self::Top => "Top (+Z)",
+            Self::Bottom => "Bottom (−Z)",
+            Self::Iso => "Iso",
+        }
+    }
+
+    /// Compact label for the viewport control strip.
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Upstream => "Up",
+            Self::Downstream => "Down",
+            Self::SideLeft => "−Y",
+            Self::SideRight => "+Y",
+            Self::Top => "Top",
+            Self::Bottom => "Bot",
+            Self::Iso => "Iso",
+        }
+    }
+
+    /// What the engineer is actually looking at, for hover disclosure.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Upstream => {
+                "Camera upstream of the body, looking downstream: the frontal / windward view."
+            }
+            Self::Downstream => "Camera downstream, looking upstream: the base and near-wake view.",
+            Self::SideLeft => "Side elevation from −Y; the free stream runs left to right.",
+            Self::SideRight => "Side elevation from +Y; the free stream runs right to left.",
+            Self::Top => "Plan view from above (+Z), stream left to right.",
+            Self::Bottom => "Plan view from below (−Z).",
+            Self::Iso => "Three-quarter view from upstream, above, and −Y.",
+        }
+    }
+
+    /// Orbit angles for this station. Top/bottom stop one degree short of the
+    /// pole so the up-reference stays conditioned.
+    pub fn angles(self) -> (f32, f32) {
+        match self {
+            Self::Downstream => (0.0, 0.0),
+            Self::Upstream => (std::f32::consts::PI, 0.0),
+            Self::SideRight => (std::f32::consts::FRAC_PI_2, 0.0),
+            Self::SideLeft => (-std::f32::consts::FRAC_PI_2, 0.0),
+            Self::Top => (-std::f32::consts::FRAC_PI_2, PITCH_LIMIT),
+            Self::Bottom => (-std::f32::consts::FRAC_PI_2, -PITCH_LIMIT),
+            Self::Iso => (-2.53, 0.5),
+        }
+    }
+}
+
+/// Which mouse buttons orbit, pan, and zoom. Orbit muscle memory is a real
+/// switching cost, so Reyn ships the rival vendors' mappings alongside its own
+/// (audit gap #1: every major CAD tool does this).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavScheme {
+    #[default]
+    Reyn,
+    SolidWorks,
+    Fusion,
+}
+
+impl NavScheme {
+    pub const ALL: [Self; 3] = [Self::Reyn, Self::SolidWorks, Self::Fusion];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reyn => "Reyn default",
+            Self::SolidWorks => "SolidWorks-style",
+            Self::Fusion => "Fusion-style",
+        }
+    }
+
+    /// Documented mapping, shown verbatim in Settings and in the shortcut
+    /// reference so the binding is discoverable without experiment.
+    pub fn mapping(self) -> [(&'static str, &'static str); 3] {
+        match self {
+            Self::Reyn => [
+                ("Orbit", "Left-drag"),
+                ("Pan", "Middle-drag, or ⇧ + left-drag"),
+                ("Zoom", "Scroll (toward the cursor)"),
+            ],
+            Self::SolidWorks => [
+                ("Orbit", "Middle-drag"),
+                ("Pan", "Ctrl + middle-drag, or ⇧ + left-drag"),
+                ("Zoom", "Scroll (toward the cursor)"),
+            ],
+            Self::Fusion => [
+                ("Orbit", "⇧ + middle-drag"),
+                ("Pan", "Middle-drag"),
+                ("Zoom", "Scroll (toward the cursor)"),
+            ],
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Reyn => {
+                "Left-drag orbits, so the primary button does the thing you do most. Matches Onshape and most web viewers."
+            }
+            Self::SolidWorks => {
+                "SolidWorks reserves the left button for selection: the middle button orbits, and Ctrl + middle pans."
+            }
+            Self::Fusion => {
+                "Fusion 360 pans with the middle button and orbits with ⇧ + middle."
+            }
+        }
+    }
+}
+
+/// Which navigation gesture a pointer drag means under the active scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gesture {
+    None,
+    Orbit,
+    Pan,
+}
+
+fn gesture_for(scheme: NavScheme, primary: bool, middle: bool, shift: bool, ctrl: bool) -> Gesture {
+    match scheme {
+        NavScheme::Reyn => {
+            if middle || (primary && shift) {
+                Gesture::Pan
+            } else if primary {
+                Gesture::Orbit
+            } else {
+                Gesture::None
+            }
+        }
+        NavScheme::SolidWorks => {
+            if (middle && ctrl) || (primary && shift) {
+                Gesture::Pan
+            } else if middle {
+                Gesture::Orbit
+            } else {
+                Gesture::None
+            }
+        }
+        NavScheme::Fusion => {
+            if middle && shift {
+                Gesture::Orbit
+            } else if middle || (primary && shift) {
+                Gesture::Pan
+            } else {
+                Gesture::None
+            }
+        }
+    }
+}
+
+/// Orbit camera with a movable target. Fields stay public for the status chip;
+/// the interpolation state is private so poses can only change through the
+/// methods that clamp them.
 pub struct Camera {
     pub yaw: f32,
     pub pitch: f32,
     pub dist: f32,
+    pub target: [f32; 3],
+    anim: Option<(Pose, Pose, f32)>,
 }
+
 impl Default for Camera {
     fn default() -> Self {
+        let (yaw, pitch) = StandardView::Iso.angles();
         Self {
-            yaw: 0.8,
-            pitch: 0.32,
+            yaw,
+            pitch,
             dist: 4.4,
+            target: [0.0; 3],
+            anim: None,
+        }
+    }
+}
+
+fn norm(v: [f32; 3]) -> [f32; 3] {
+    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-9);
+    [v[0] / l, v[1] / l, v[2] / l]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// How vertical a forward vector may be before the world-up reference has to
+/// swing off `+Z`. It sits above `sin(PITCH_LIMIT)` on purpose: orbiting and the
+/// top/bottom stations both stop at 89°, and swinging the reference there would
+/// silently roll the view a quarter turn, so the plan view would no longer show
+/// the stream running left to right the way its label promises.
+const UP_REFERENCE_LIMIT: f32 = 0.99995; // sin(89.43°)
+
+/// Camera basis from a forward vector, with the physics-frame world up (`+Z`).
+/// Straight down the pole the reference swings to `+X` so the basis never
+/// degenerates — `fs_volume` in `gpu.rs` runs the identical fallback, so CPU
+/// annotations and the raymarched image agree pixel for pixel.
+pub fn basis_from_forward(fwd: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let up_ref = if fwd[2].abs() > UP_REFERENCE_LIMIT {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let right = norm(cross(fwd, up_ref));
+    (right, cross(right, fwd))
+}
+
+impl Camera {
+    pub fn pose(&self) -> Pose {
+        Pose {
+            yaw: self.yaw,
+            pitch: self.pitch,
+            dist: self.dist,
+            target: self.target,
+        }
+    }
+
+    /// Apply a pose immediately, clamping distance and elevation.
+    pub fn set_pose(&mut self, pose: Pose) {
+        self.yaw = pose.yaw;
+        self.pitch = pose.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        self.dist = pose.dist.clamp(*DIST_RANGE.start(), *DIST_RANGE.end());
+        self.target = pose.target.map(|c| c.clamp(-2.0, 2.0));
+        self.anim = None;
+    }
+
+    /// Interpolate to a pose over [`SNAP_SECONDS`]; instant under reduced
+    /// motion. Yaw takes the short way round.
+    pub fn glide_to(&mut self, mut pose: Pose, reduced_motion: bool) {
+        let turns = ((pose.yaw - self.yaw) / std::f32::consts::TAU).round();
+        pose.yaw -= turns * std::f32::consts::TAU;
+        if reduced_motion {
+            self.set_pose(pose);
+            return;
+        }
+        let from = self.pose();
+        self.set_pose(pose);
+        let to = self.pose();
+        self.anim = Some((from, to, 0.0));
+    }
+
+    /// Advance an in-flight snap. Returns true while animating, so the caller
+    /// keeps requesting repaints.
+    pub fn advance(&mut self, dt: f32) -> bool {
+        let Some((from, to, t)) = self.anim.as_mut() else {
+            return false;
+        };
+        *t = (*t + dt / SNAP_SECONDS).min(1.0);
+        let k = egui::emath::easing::cubic_out(*t);
+        let (from, to, done) = (*from, *to, *t >= 1.0);
+        let mix = |a: f32, b: f32| a + (b - a) * k;
+        self.yaw = mix(from.yaw, to.yaw);
+        self.pitch = mix(from.pitch, to.pitch);
+        self.dist = mix(from.dist, to.dist);
+        self.target = std::array::from_fn(|axis| mix(from.target[axis], to.target[axis]));
+        if done {
+            self.anim = None;
+        }
+        !done
+    }
+
+    /// Eye position in solver-domain coordinates.
+    pub fn eye(&self) -> [f32; 3] {
+        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
+        [
+            self.target[0] + self.dist * cp * self.yaw.cos(),
+            self.target[1] + self.dist * cp * self.yaw.sin(),
+            self.target[2] + self.dist * sp,
+        ]
+    }
+
+    /// (forward, right, up) unit vectors.
+    pub fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let eye = self.eye();
+        let fwd = norm([
+            self.target[0] - eye[0],
+            self.target[1] - eye[1],
+            self.target[2] - eye[2],
+        ]);
+        let (right, up) = basis_from_forward(fwd);
+        (fwd, right, up)
+    }
+
+    /// Pixels per solver unit at the target plane, matching `fs_volume`'s
+    /// vertical field of view.
+    fn pixels_per_unit(&self, rect: Rect) -> f32 {
+        0.5 * rect.height() / (TAN_HALF_FOV * self.dist.max(1e-3))
+    }
+
+    /// Project a domain point to screen with the render camera. `None` behind
+    /// the near plane. Also returns eye-space depth for fading and sorting.
+    pub fn project(&self, rect: Rect, p: [f32; 3]) -> Option<(Pos2, f32)> {
+        let eye = self.eye();
+        let (fwd, right, up) = self.basis();
+        let v = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+        let z = dot(v, fwd);
+        if z < 0.05 {
+            return None;
+        }
+        let k = 0.5 * rect.height() / TAN_HALF_FOV / z;
+        Some((
+            Pos2::new(
+                rect.center().x + dot(v, right) * k,
+                rect.center().y - dot(v, up) * k,
+            ),
+            z,
+        ))
+    }
+
+    /// World ray through a screen point (origin at the eye, unit direction) —
+    /// the inverse of [`Camera::project`], used by the 3D surface probe.
+    pub fn ray(&self, rect: Rect, screen: Pos2) -> ([f32; 3], [f32; 3]) {
+        let (fwd, right, up) = self.basis();
+        let ndc_x = (screen.x - rect.center().x) / (0.5 * rect.height()) * TAN_HALF_FOV;
+        let ndc_y = (rect.center().y - screen.y) / (0.5 * rect.height()) * TAN_HALF_FOV;
+        let dir = norm(std::array::from_fn(|axis| {
+            fwd[axis] + right[axis] * ndc_x + up[axis] * ndc_y
+        }));
+        (self.eye(), dir)
+    }
+
+    pub fn orbit(&mut self, delta: Vec2, rate: f32) {
+        self.anim = None;
+        self.yaw -= delta.x * rate;
+        self.pitch = (self.pitch + delta.y * rate).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    /// Drag the target across the view plane so the grabbed point tracks the
+    /// cursor one-to-one at the target depth.
+    pub fn pan(&mut self, delta: Vec2, rect: Rect) {
+        self.anim = None;
+        let (_, right, up) = self.basis();
+        let scale = 1.0 / self.pixels_per_unit(rect).max(1e-6);
+        for axis in 0..3 {
+            self.target[axis] = (self.target[axis]
+                - (right[axis] * delta.x - up[axis] * delta.y) * scale)
+                .clamp(-2.0, 2.0);
+        }
+    }
+
+    /// Scroll zoom. With a cursor position the point under the pointer stays
+    /// put (zoom-to-cursor); `invert` honors Settings › Viewport.
+    pub fn zoom(&mut self, scroll: f32, cursor: Option<Pos2>, rect: Rect, invert: bool) {
+        if scroll == 0.0 {
+            return;
+        }
+        self.anim = None;
+        let signed = if invert { -scroll } else { scroll };
+        let before = self.dist;
+        let dist = (before * (1.0 - signed * 0.0018)).clamp(*DIST_RANGE.start(), *DIST_RANGE.end());
+        self.dist = dist;
+        // Zoom-to-cursor: the point under the pointer (measured on the target
+        // plane) stays put, because the world offset per pixel is proportional
+        // to distance — so shifting the target by the difference cancels it.
+        if let Some(cursor) = cursor.filter(|c| rect.contains(*c)) {
+            let (_, right, up) = self.basis();
+            let offset = cursor - rect.center();
+            let per_pixel = TAN_HALF_FOV * (before - dist) / (0.5 * rect.height());
+            for axis in 0..3 {
+                self.target[axis] = (self.target[axis]
+                    + (right[axis] * offset.x - up[axis] * offset.y) * per_pixel)
+                    .clamp(-2.0, 2.0);
+            }
+        }
+    }
+
+    /// Pose that frames `bounds` (domain coordinates) at the current
+    /// orientation, with a 12% margin. Falls back to the whole solver domain
+    /// when nothing is loaded.
+    pub fn fit_pose(&self, bounds: Option<([f32; 3], [f32; 3])>, rect: Rect) -> Pose {
+        let (lo, hi) = bounds.unwrap_or(([-1.0; 3], [1.0; 3]));
+        let center = std::array::from_fn(|axis| 0.5 * (lo[axis] + hi[axis]));
+        let radius = (0..3)
+            .map(|axis| 0.5 * (hi[axis] - lo[axis]))
+            .fold(0.0f32, |sum, half| sum + half * half)
+            .sqrt()
+            .max(1e-3);
+        let aspect = (rect.width() / rect.height().max(1.0)).max(1e-3);
+        let tan_half = TAN_HALF_FOV * aspect.min(1.0);
+        Pose {
+            yaw: self.yaw,
+            pitch: self.pitch,
+            dist: (radius * 1.12 / tan_half).clamp(*DIST_RANGE.start(), *DIST_RANGE.end()),
+            target: center,
         }
     }
 }
@@ -43,7 +475,38 @@ pub struct ViewOpts {
     pub invert_scroll_zoom: bool,
     /// Settings › Viewport: draw the [-1, 1]³ solver-domain wireframe.
     pub show_domain_bounds: bool,
+    /// Settings › Viewport: which buttons orbit/pan.
+    pub nav_scheme: NavScheme,
+    /// Solid-geometry bounds in domain coordinates, for zoom-to-fit.
+    pub fit_bounds: Option<([f32; 3], [f32; 3])>,
+    /// Snap the camera to this station on this frame (viewport control, key,
+    /// or menu item).
+    pub snap_to: Option<StandardView>,
+    /// Frame the geometry on this frame (F, or the fit control).
+    pub fit_now: bool,
+    /// Replace instrument motion with instant state changes (§3.7).
+    pub reduced_motion: bool,
+    /// True only on the research-sandbox screens. The analytic streamline
+    /// overlay is quarantined behind this flag (see [`analytic_streamlines`]).
+    pub research_sandbox: bool,
 }
+
+/// HAZARD GATE. [`streamline_polys`] advects an **analytic ABC demo field**,
+/// not the model's predicted velocity, so the ribbons it draws are decoration
+/// with no relationship to the case being solved. Rendering them anywhere near
+/// an engineering result would violate the honesty contract (PRD §2: no fake
+/// state, every rendered quantity traceable to a source), so they are hard
+/// quarantined to the research sandbox and labeled there.
+///
+/// Driving the overlay from real model velocity is the only way to un-gate it;
+/// until that exists this function must keep returning false off-sandbox.
+pub fn analytic_streamlines(streamlines_on: bool, research_sandbox: bool) -> bool {
+    streamlines_on && research_sandbox
+}
+
+/// The label the sandbox paints whenever the analytic overlay is live.
+pub const ANALYTIC_STREAMLINE_LABEL: &str =
+    "ANALYTIC DEMO FIELD · not model velocity · research sandbox only";
 
 /// A billboarded critical-point annotation: fixed screen-size ring + value chip
 /// at a 3D domain position (the 3D counterpart of the 2D Field Insights).
@@ -57,43 +520,6 @@ pub struct Marker3D {
 /// Must match `fs_volume`'s `tanH` (gpu.rs) so CPU-projected annotations land on
 /// the raymarched image.
 pub const TAN_HALF_FOV: f32 = 0.55;
-
-/// Project a domain point with the raymarch camera (orbit eye looking at the
-/// origin). Returns None behind the near plane.
-fn project_volume(cam: &Camera, rect: Rect, p: [f32; 3]) -> Option<Pos2> {
-    let eye = [
-        cam.dist * cam.pitch.cos() * cam.yaw.sin(),
-        cam.dist * cam.pitch.sin(),
-        cam.dist * cam.pitch.cos() * cam.yaw.cos(),
-    ];
-    let norm = |v: [f32; 3]| {
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
-        [v[0] / l, v[1] / l, v[2] / l]
-    };
-    let cross = |a: [f32; 3], b: [f32; 3]| {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
-    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    let fwd = norm([-eye[0], -eye[1], -eye[2]]);
-    let right = norm(cross(fwd, [0.0, 1.0, 0.0]));
-    let up = cross(right, fwd);
-    let v = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
-    let z = dot(v, fwd);
-    if z < 0.15 {
-        return None;
-    }
-    let aspect = rect.width() / rect.height().max(1.0);
-    let ndx = dot(v, right) / (z * TAN_HALF_FOV * aspect);
-    let ndy = dot(v, up) / (z * TAN_HALF_FOV);
-    Some(Pos2::new(
-        rect.min.x + (ndx + 1.0) * 0.5 * rect.width(),
-        rect.min.y + (1.0 - ndy) * 0.5 * rect.height(),
-    ))
-}
 
 /// Screen-space instrument marker: ring + dot at `center`, 1px leader to a
 /// collision-avoiding mono value chip clamped inside `bounds`. Shared by the 2D
@@ -185,8 +611,8 @@ fn draw_markers(
                 }
                 s
             }
-            None => match project_volume(cam, rect, m.pos) {
-                Some(s) => s,
+            None => match cam.project(rect, m.pos) {
+                Some((s, _)) => s,
                 None => continue,
             },
         };
@@ -223,38 +649,75 @@ struct Proj {
     gain: f32,
 }
 
+/// What this frame's pointer activity means to the caller.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Interaction {
+    /// A completed click that did not orbit or pan: the 3D probe pick point.
+    pub picked: Option<Pos2>,
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     rect: Rect,
     cam: &mut Camera,
     opts: &ViewOpts,
     particles: &[Particle],
-) {
-    let resp = ui.interact(rect, ui.id().with("viewport3d"), Sense::drag());
+) -> Interaction {
+    let resp = ui.interact(rect, ui.id().with("viewport3d"), Sense::click_and_drag());
+    // A click is a probe pick only when it stayed put; a drag is navigation.
+    let interaction = Interaction {
+        picked: resp
+            .clicked()
+            .then(|| resp.interact_pointer_pos())
+            .flatten()
+            .filter(|_| !opts.mode2d),
+    };
+    // Standard views and zoom-to-fit arrive as one-frame requests from the
+    // viewport control strip, the F key, or the View menu.
+    if let Some(view) = opts.snap_to {
+        let (yaw, pitch) = view.angles();
+        let pose = Pose {
+            yaw,
+            pitch,
+            ..cam.pose()
+        };
+        cam.glide_to(pose, opts.reduced_motion);
+    }
+    if opts.fit_now {
+        let pose = cam.fit_pose(opts.fit_bounds, rect);
+        cam.glide_to(pose, opts.reduced_motion);
+    }
+    if cam.advance(ui.input(|i| i.stable_dt).min(0.05)) {
+        ui.ctx().request_repaint();
+    }
     let orbit_rate = 0.008 * opts.orbit_sensitivity.clamp(0.4, 2.0);
     if resp.dragged() && !opts.mode2d {
-        let d = resp.drag_delta();
-        cam.yaw += d.x * orbit_rate;
-        cam.pitch = (cam.pitch + d.y * orbit_rate).clamp(-1.45, 1.45);
+        let (primary, middle, shift, ctrl) = ui.input(|i| {
+            (
+                i.pointer.button_down(egui::PointerButton::Primary),
+                i.pointer.button_down(egui::PointerButton::Middle),
+                i.modifiers.shift,
+                i.modifiers.command || i.modifiers.ctrl,
+            )
+        });
+        match gesture_for(opts.nav_scheme, primary, middle, shift, ctrl) {
+            Gesture::Orbit => cam.orbit(resp.drag_delta(), orbit_rate),
+            Gesture::Pan => cam.pan(resp.drag_delta(), rect),
+            Gesture::None => {}
+        }
     }
-    if resp.hovered() {
-        let mut sc = ui.input(|i| i.smooth_scroll_delta.y);
-        if opts.invert_scroll_zoom {
-            sc = -sc;
-        }
-        if sc != 0.0 {
-            cam.dist = (cam.dist * (1.0 - sc * 0.0018)).clamp(2.4, 9.5);
-        }
+    if resp.hovered() && !opts.mode2d {
+        let (scroll, cursor) = ui.input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
+        cam.zoom(scroll, cursor, rect, opts.invert_scroll_zoom);
+    } else if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        cam.zoom(scroll, None, rect, opts.invert_scroll_zoom);
     }
 
     // Volume raymarch mode: hand the whole 3D field to the GPU and return. The
-    // orbit camera becomes a ray origin looking at the domain origin.
+    // orbit camera becomes a ray origin looking at its target.
     if opts.gpu && opts.volume_mode && !opts.mode2d {
-        let eye = [
-            cam.dist * cam.pitch.cos() * cam.yaw.sin(),
-            cam.dist * cam.pitch.sin(),
-            cam.dist * cam.pitch.cos() * cam.yaw.cos(),
-        ];
+        let eye = cam.eye();
         let slice_c = [
             opts.slice[0].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
             opts.slice[1].map(|p| p * 2.0 - 1.0).unwrap_or(-2.0),
@@ -264,6 +727,7 @@ pub fn show(
             ui,
             rect,
             eye,
+            cam.target,
             TAN_HALF_FOV,
             opts.density_lo,
             opts.density_hi,
@@ -273,36 +737,31 @@ pub fn show(
             opts.surface.clone(),
         );
         draw_markers(ui, rect, cam, opts, None); // billboards over the raymarch
-        return;
+        return interaction;
     }
 
     let p = ui.painter_at(rect);
     let center = rect.center();
     let scale = rect.height().min(rect.width()) * 0.44;
-    let focal = 2.7_f32;
     let zoom = Camera::default().dist / cam.dist;
-    let (cy, sy) = (cam.yaw.cos(), cam.yaw.sin());
-    let (cp, sp) = (cam.pitch.cos(), cam.pitch.sin());
     let mode2d = opts.mode2d;
+    // One projector for particles, streamlines, the domain box, and the
+    // billboards — identical to the raymarch camera, so switching layers never
+    // shifts the picture. Behind the near plane the point is pushed far
+    // off-screen instead of dropped, keeping the closure infallible.
     let project = |v: [f32; 3]| -> (Pos2, f32) {
         if mode2d {
-            (
+            return (
                 Pos2::new(
                     center.x + v[0] * scale * zoom,
                     center.y - v[1] * scale * zoom,
                 ),
                 1.0 - v[2],
-            )
-        } else {
-            let x = v[0] * cy - v[2] * sy;
-            let z = v[0] * sy + v[2] * cy;
-            let y = v[1] * cp - z * sp;
-            let zc = v[1] * sp + z * cp + cam.dist;
-            let f = focal / zc.max(0.1);
-            (
-                Pos2::new(center.x + x * f * scale, center.y - y * f * scale),
-                zc,
-            )
+            );
+        }
+        match cam.project(rect, v) {
+            Some((screen, depth)) => (screen, depth),
+            None => (Pos2::new(f32::MAX, f32::MAX), -1.0),
         }
     };
 
@@ -411,7 +870,7 @@ pub fn show(
                 ],
             })
             .collect();
-        let segments = if opts.streamlines {
+        let segments = if analytic_streamlines(opts.streamlines, opts.research_sandbox) {
             streamline_segments(&project, particles, rect, ppp)
         } else {
             Vec::new()
@@ -435,20 +894,33 @@ pub fn show(
             p.circle_filled(q.screen, q.r_pts * 2.1, halo);
             p.circle_filled(q.screen, q.r_pts, col);
         }
-        if opts.streamlines {
+        if analytic_streamlines(opts.streamlines, opts.research_sandbox) {
             for poly in streamline_polys(&project, particles) {
                 p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
             }
         }
     }
 
+    // The quarantine is only credible if it is visible: whenever the analytic
+    // overlay renders, it names itself in the viewport.
+    if analytic_streamlines(opts.streamlines, opts.research_sandbox) {
+        p.text(
+            rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
+            egui::Align2::LEFT_TOP,
+            ANALYTIC_STREAMLINE_LABEL,
+            mono_s().resolve(ui.style()),
+            WARN,
+        );
+    }
+
     // billboarded critical points, projected with this mode's own camera
     draw_markers(ui, rect, cam, opts, Some(&project));
+    interaction
 }
 
-/// Project a few streamlines (seeded from strong-vorticity particles, advected
-/// through the ABC field) to screen polylines. Shared by the CPU (egui lines)
-/// and GPU (glowing ribbons) paths.
+/// Project a few streamlines to screen polylines, seeded from strong-vorticity
+/// particles and advected through a **closed-form ABC field** — deliberately
+/// not the model's velocity. Callers must gate on [`analytic_streamlines`].
 fn streamline_polys(
     project: &impl Fn([f32; 3]) -> (Pos2, f32),
     particles: &[Particle],
@@ -511,4 +983,380 @@ fn streamline_segments(
         }
     }
     segs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect() -> Rect {
+        Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(1600.0, 900.0))
+    }
+
+    #[test]
+    fn default_camera_is_the_iso_station() {
+        let cam = Camera::default();
+        let (yaw, pitch) = StandardView::Iso.angles();
+        assert_eq!((cam.yaw, cam.pitch), (yaw, pitch));
+        assert_eq!(cam.target, [0.0; 3]);
+        // Upstream of the body, above it, and off to −Y: the three-quarter view.
+        let eye = cam.eye();
+        assert!(eye[0] < 0.0 && eye[1] < 0.0 && eye[2] > 0.0);
+    }
+
+    #[test]
+    fn standard_views_look_along_their_named_axis() {
+        let cases = [
+            (StandardView::Upstream, 0usize, -1.0f32),
+            (StandardView::Downstream, 0, 1.0),
+            (StandardView::SideRight, 1, 1.0),
+            (StandardView::SideLeft, 1, -1.0),
+            (StandardView::Top, 2, 1.0),
+            (StandardView::Bottom, 2, -1.0),
+        ];
+        for (view, axis, sign) in cases {
+            let mut cam = Camera::default();
+            let (yaw, pitch) = view.angles();
+            cam.set_pose(Pose {
+                yaw,
+                pitch,
+                ..cam.pose()
+            });
+            let eye = cam.eye();
+            // The eye sits on the named side of the target…
+            assert!(
+                eye[axis] * sign > 0.9 * cam.dist,
+                "{} eye {eye:?}",
+                view.label()
+            );
+            // …and the vertical axis is up on screen for every non-polar view.
+            let (_, _, up) = cam.basis();
+            if !matches!(view, StandardView::Top | StandardView::Bottom) {
+                assert!(up[2] > 0.99, "{} up {up:?}", view.label());
+            }
+        }
+    }
+
+    #[test]
+    fn side_view_puts_the_stream_left_to_right() {
+        let mut cam = Camera::default();
+        let (yaw, pitch) = StandardView::SideLeft.angles();
+        cam.set_pose(Pose {
+            yaw,
+            pitch,
+            ..cam.pose()
+        });
+        let (_, right, _) = cam.basis();
+        assert!(
+            right[0] > 0.99,
+            "expected +X to screen right, got {right:?}"
+        );
+        let nose = cam.project(rect(), [0.5, 0.0, 0.0]).expect("in front");
+        let tail = cam.project(rect(), [-0.5, 0.0, 0.0]).expect("in front");
+        assert!(nose.0.x > tail.0.x);
+    }
+
+    #[test]
+    fn project_and_ray_are_inverses() {
+        let cam = Camera::default();
+        let rect = rect();
+        for point in [[0.0; 3], [0.4, -0.2, 0.6], [-0.7, 0.5, -0.3]] {
+            let (screen, _) = cam.project(rect, point).expect("visible");
+            let (origin, dir) = cam.ray(rect, screen);
+            // The picked ray must pass through the projected point.
+            let to_point: [f32; 3] = std::array::from_fn(|a| point[a] - origin[a]);
+            let along = dot(to_point, dir);
+            let residual: [f32; 3] = std::array::from_fn(|a| to_point[a] - dir[a] * along);
+            let error =
+                (residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2])
+                    .sqrt();
+            assert!(error < 1e-3, "ray missed {point:?} by {error}");
+        }
+    }
+
+    #[test]
+    fn fit_frames_the_bounds_and_centers_them() {
+        let cam = Camera::default();
+        let rect = rect();
+        let bounds = ([0.1, -0.2, -0.05], [0.5, 0.2, 0.35]);
+        let pose = cam.fit_pose(Some(bounds), rect);
+        assert_eq!(pose.yaw, cam.yaw, "fit preserves orientation");
+        let centre = [0.3, 0.0, 0.15];
+        for axis in 0..3 {
+            assert!(
+                (pose.target[axis] - centre[axis]).abs() < 1e-5,
+                "{:?} is not centred on {centre:?}",
+                pose.target
+            );
+        }
+        let mut fitted = Camera::default();
+        fitted.set_pose(pose);
+        // Every corner of the box lands inside the viewport…
+        for corner in 0..8 {
+            let point = [
+                if corner & 1 == 0 {
+                    bounds.0[0]
+                } else {
+                    bounds.1[0]
+                },
+                if corner & 2 == 0 {
+                    bounds.0[1]
+                } else {
+                    bounds.1[1]
+                },
+                if corner & 4 == 0 {
+                    bounds.0[2]
+                } else {
+                    bounds.1[2]
+                },
+            ];
+            let (screen, _) = fitted.project(rect, point).expect("visible");
+            assert!(rect.contains(screen), "corner {point:?} at {screen:?}");
+        }
+        // …and the framing is tight: a body this size must not be left tiny.
+        let (near, _) = fitted.project(rect, bounds.0).expect("visible");
+        let (far, _) = fitted.project(rect, bounds.1).expect("visible");
+        assert!((near - far).length() > 0.25 * rect.height());
+        // An empty scene falls back to the whole solver domain, not zero.
+        let domain = cam.fit_pose(None, rect);
+        assert_eq!(domain.target, [0.0; 3]);
+        assert!(domain.dist > 2.0);
+    }
+
+    #[test]
+    fn zoom_to_cursor_keeps_the_pointed_point_under_the_cursor() {
+        let rect = rect();
+        let mut cam = Camera::default();
+        let cursor = Pos2::new(rect.center().x + 220.0, rect.center().y - 130.0);
+        // Whatever sits under the cursor on the target plane…
+        let (origin, dir) = cam.ray(rect, cursor);
+        let point: [f32; 3] = std::array::from_fn(|a| origin[a] + dir[a] * cam.dist);
+        cam.zoom(120.0, Some(cursor), rect, false);
+        assert!(cam.dist < 4.4, "scroll up must move closer by default");
+        // …stays under the cursor afterwards.
+        let (moved, _) = cam.project(rect, point).expect("visible");
+        assert!((moved - cursor).length() < 2.0, "{moved:?} vs {cursor:?}");
+    }
+
+    #[test]
+    fn invert_scroll_zoom_reverses_the_direction_and_clamps() {
+        let rect = rect();
+        let mut cam = Camera::default();
+        cam.zoom(120.0, None, rect, true);
+        assert!(cam.dist > 4.4);
+        for _ in 0..200 {
+            cam.zoom(600.0, None, rect, false);
+        }
+        assert_eq!(cam.dist, *DIST_RANGE.start());
+        for _ in 0..200 {
+            cam.zoom(600.0, None, rect, true);
+        }
+        assert_eq!(cam.dist, *DIST_RANGE.end());
+    }
+
+    #[test]
+    fn pan_tracks_the_cursor_one_to_one_at_the_target_plane() {
+        let rect = rect();
+        let mut cam = Camera::default();
+        let before = cam.project(rect, cam.target).expect("target visible").0;
+        cam.pan(egui::vec2(60.0, -25.0), rect);
+        let after = cam.project(rect, [0.0; 3]).expect("origin visible").0;
+        assert!((after.x - (before.x + 60.0)).abs() < 1.0);
+        assert!((after.y - (before.y - 25.0)).abs() < 1.0);
+    }
+
+    #[test]
+    fn orbit_respects_the_pitch_limit_and_sensitivity() {
+        let mut cam = Camera::default();
+        for _ in 0..500 {
+            cam.orbit(egui::vec2(0.0, 40.0), 0.008);
+        }
+        assert_eq!(cam.pitch, PITCH_LIMIT);
+        let mut slow = Camera::default();
+        let mut fast = Camera::default();
+        slow.orbit(egui::vec2(50.0, 0.0), 0.008 * 0.5);
+        fast.orbit(egui::vec2(50.0, 0.0), 0.008 * 2.0);
+        assert!(
+            (fast.yaw - Camera::default().yaw).abs() > (slow.yaw - Camera::default().yaw).abs()
+        );
+    }
+
+    /// The station labels make physical claims — "stream left to right", "the
+    /// frontal view" — and an operator reads a pressure map against them. The
+    /// up-reference fallback used to trigger at the 89° plan view and roll it a
+    /// quarter turn, so the claims are pinned here rather than trusted.
+    #[test]
+    fn standard_views_put_the_stream_where_their_labels_promise() {
+        let station = |view: StandardView| {
+            let mut cam = Camera::default();
+            let (yaw, pitch) = view.angles();
+            cam.set_pose(Pose {
+                yaw,
+                pitch,
+                target: [0.0; 3],
+                ..cam.pose()
+            });
+            cam
+        };
+        let stream = [1.0, 0.0, 0.0];
+        // Side (−Y) and the plan view both say the stream runs left to right.
+        for view in [StandardView::SideLeft, StandardView::Top] {
+            let (_, right, _) = station(view).basis();
+            assert!(
+                dot(right, stream) > 0.99,
+                "{}: stream should run left to right, screen-right is {right:?}",
+                view.label()
+            );
+        }
+        // Side (+Y) is the mirror image, and says so.
+        let (_, right, _) = station(StandardView::SideRight).basis();
+        assert!(dot(right, stream) < -0.99, "{right:?}");
+        // Plan view from above keeps +Y up the screen; from below it flips.
+        let (_, _, up) = station(StandardView::Top).basis();
+        assert!(dot(up, [0.0, 1.0, 0.0]) > 0.99, "{up:?}");
+        let (_, _, up) = station(StandardView::Bottom).basis();
+        assert!(dot(up, [0.0, -1.0, 0.0]) > 0.99, "{up:?}");
+        // Upstream stands ahead of the body looking downstream; downstream is
+        // the base view looking back into the wake.
+        let upstream = station(StandardView::Upstream);
+        assert!(upstream.eye()[0] < 0.0, "{:?}", upstream.eye());
+        assert!(dot(upstream.basis().0, stream) > 0.99);
+        let downstream = station(StandardView::Downstream);
+        assert!(downstream.eye()[0] > 0.0, "{:?}", downstream.eye());
+        assert!(dot(downstream.basis().0, stream) < -0.99);
+        // Iso: upstream, above, and on −Y, as its hover text says.
+        let eye = station(StandardView::Iso).eye();
+        assert!(eye[0] < 0.0 && eye[1] < 0.0 && eye[2] > 0.0, "{eye:?}");
+        // No station may produce a degenerate or skewed basis.
+        for view in StandardView::ALL {
+            let (fwd, right, up) = station(view).basis();
+            let name = view.label();
+            assert!(dot(right, up).abs() < 1e-4, "{name} basis is skewed");
+            assert!(dot(fwd, right).abs() < 1e-4, "{name} basis is skewed");
+            for axis in [fwd, right, up] {
+                let length = dot(axis, axis).sqrt();
+                assert!((length - 1.0).abs() < 1e-4, "{name}: {length}");
+            }
+        }
+    }
+
+    #[test]
+    fn snaps_interpolate_and_settle_exactly() {
+        let mut cam = Camera::default();
+        let (yaw, pitch) = StandardView::Top.angles();
+        let goal = Pose {
+            yaw,
+            pitch,
+            ..cam.pose()
+        };
+        cam.glide_to(goal, false);
+        assert!(cam.anim.is_some());
+        assert!(cam.advance(0.1));
+        assert!(cam.pitch < PITCH_LIMIT, "still interpolating");
+        for _ in 0..10 {
+            cam.advance(0.1);
+        }
+        assert!(cam.anim.is_none());
+        assert_eq!(cam.pitch, PITCH_LIMIT);
+        // Reduced motion snaps in one frame.
+        let mut instant = Camera::default();
+        instant.glide_to(goal, true);
+        assert!(instant.anim.is_none());
+        assert_eq!(instant.pitch, PITCH_LIMIT);
+    }
+
+    #[test]
+    fn yaw_snaps_take_the_short_way_round() {
+        let mut cam = Camera::default();
+        cam.set_pose(Pose {
+            yaw: 3.4,
+            ..cam.pose()
+        });
+        let (yaw, pitch) = StandardView::Downstream.angles(); // 0 rad
+        cam.glide_to(
+            Pose {
+                yaw,
+                pitch,
+                ..cam.pose()
+            },
+            false,
+        );
+        // 3.4 → 0 direct is 3.4 rad the wrong way round; +τ is 2.88 rad.
+        let (_, to, _) = cam.anim.expect("animating");
+        assert!((to.yaw - std::f32::consts::TAU).abs() < 1e-4, "{}", to.yaw);
+        // Just inside half a turn the direct path is already the short one.
+        let mut near = Camera::default();
+        near.set_pose(Pose {
+            yaw: 3.0,
+            ..near.pose()
+        });
+        near.glide_to(
+            Pose {
+                yaw,
+                pitch,
+                ..near.pose()
+            },
+            false,
+        );
+        let (_, to, _) = near.anim.expect("animating");
+        assert!(to.yaw.abs() < 1e-4, "{}", to.yaw);
+    }
+
+    #[test]
+    fn navigation_schemes_match_their_documented_mappings() {
+        // Reyn: left orbits, middle or shift+left pans.
+        assert_eq!(
+            gesture_for(NavScheme::Reyn, true, false, false, false),
+            Gesture::Orbit
+        );
+        assert_eq!(
+            gesture_for(NavScheme::Reyn, true, false, true, false),
+            Gesture::Pan
+        );
+        assert_eq!(
+            gesture_for(NavScheme::Reyn, false, true, false, false),
+            Gesture::Pan
+        );
+        // SolidWorks: the left button never navigates on its own.
+        assert_eq!(
+            gesture_for(NavScheme::SolidWorks, true, false, false, false),
+            Gesture::None
+        );
+        assert_eq!(
+            gesture_for(NavScheme::SolidWorks, false, true, false, false),
+            Gesture::Orbit
+        );
+        assert_eq!(
+            gesture_for(NavScheme::SolidWorks, false, true, false, true),
+            Gesture::Pan
+        );
+        // Fusion: middle pans, shift+middle orbits.
+        assert_eq!(
+            gesture_for(NavScheme::Fusion, false, true, false, false),
+            Gesture::Pan
+        );
+        assert_eq!(
+            gesture_for(NavScheme::Fusion, false, true, true, false),
+            Gesture::Orbit
+        );
+        for scheme in NavScheme::ALL {
+            assert_eq!(
+                gesture_for(scheme, false, false, false, false),
+                Gesture::None
+            );
+            let mapping = scheme.mapping();
+            assert_eq!(mapping[0].0, "Orbit");
+            assert!(mapping.iter().all(|(_, keys)| !keys.is_empty()));
+        }
+    }
+
+    #[test]
+    fn analytic_streamlines_stay_quarantined_outside_the_sandbox() {
+        // The overlay advects a closed-form field, so it may never render on an
+        // engineering result — only inside the research sandbox.
+        assert!(!analytic_streamlines(true, false));
+        assert!(!analytic_streamlines(false, true));
+        assert!(analytic_streamlines(true, true));
+        assert!(ANALYTIC_STREAMLINE_LABEL.contains("not model velocity"));
+    }
 }

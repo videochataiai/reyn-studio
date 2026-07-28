@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 pub const PROJECT_SCHEMA_VERSION: u32 = 2;
@@ -241,6 +241,10 @@ pub enum ProjectError {
     Json(String),
     UnsupportedSchema(u32),
     IntegrityMismatch,
+    WriteConflict {
+        expected_sha256: Option<String>,
+        actual_sha256: Option<String>,
+    },
     ContentHashMismatch {
         expected: String,
         actual: String,
@@ -271,6 +275,17 @@ impl fmt::Display for ProjectError {
                 write!(formatter, "unsupported project schema version {version}")
             }
             Self::IntegrityMismatch => write!(formatter, "project manifest integrity mismatch"),
+            Self::WriteConflict {
+                expected_sha256,
+                actual_sha256,
+            } => {
+                let expected = expected_sha256.as_deref().unwrap_or("no file");
+                let actual = actual_sha256.as_deref().unwrap_or("no file");
+                write!(
+                    formatter,
+                    "project changed on disk before save: expected {expected}, found {actual}"
+                )
+            }
             Self::ContentHashMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -624,6 +639,12 @@ impl ProjectDocument {
         });
     }
 
+    pub(crate) fn has_bundle_integrity_failure(&self) -> bool {
+        self.load_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == ContentDiagnosticKind::BundleIntegrity)
+    }
+
     pub fn content_bytes(&self, digest: &str) -> Option<&[u8]> {
         self.content
             .get(&digest.to_ascii_lowercase())
@@ -753,7 +774,18 @@ impl ProjectDocument {
 
     pub fn save_atomic(&self, path: &Path) -> Result<(), ProjectError> {
         let bytes = self.to_bytes()?;
-        write_atomic(path, &bytes)
+        write_atomic_bytes(path, &bytes, WritePrecondition::Any)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn save_atomic_checked(
+        &self,
+        path: &Path,
+        precondition: WritePrecondition<'_>,
+    ) -> Result<String, ProjectError> {
+        let bytes = self.to_bytes()?;
+        write_atomic_bytes(path, &bytes, precondition).map_err(Into::into)
     }
 
     pub fn open(path: &Path) -> Result<Self, ProjectError> {
@@ -761,8 +793,16 @@ impl ProjectDocument {
     }
 
     pub fn open_with_migration(path: &Path) -> Result<(Self, Option<u32>), ProjectError> {
+        Self::open_with_migration_and_digest(path)
+            .map(|(document, migrated_from, _)| (document, migrated_from))
+    }
+
+    pub(crate) fn open_with_migration_and_digest(
+        path: &Path,
+    ) -> Result<(Self, Option<u32>, String), ProjectError> {
         let bytes = std::fs::read(path).map_err(|error| ProjectError::Io(error.to_string()))?;
-        Self::decode(&bytes)
+        let digest = sha256_hex(&bytes);
+        Self::decode(&bytes).map(|(document, migrated_from)| (document, migrated_from, digest))
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ProjectError> {
@@ -798,6 +838,9 @@ impl ProjectDocument {
             left.content_sha256
                 .cmp(&right.content_sha256)
                 .then_with(|| left.media_type.cmp(&right.media_type))
+                .then_with(|| left.byte_size.cmp(&right.byte_size))
+                .then_with(|| left.encoding.cmp(&right.encoding))
+                .then_with(|| left.data_hex.cmp(&right.data_hex))
         });
         let bundle_integrity_sha256 = Some(bundle_integrity(
             &manifest_integrity_sha256,
@@ -2083,31 +2126,182 @@ fn bundle_integrity(
     Ok(sha256_hex(&canonical))
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProjectError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WritePrecondition<'a> {
+    /// Replace any existing destination. Used only for an explicit Save As or
+    /// machine-local state that has no retained generation.
+    Any,
+    /// Publish only if no destination exists.
+    Missing,
+    /// Publish only if the destination still has the bytes observed on open.
+    Unchanged(&'a str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicWriteError {
+    Io(String),
+    Conflict {
+        expected_sha256: Option<String>,
+        actual_sha256: Option<String>,
+    },
+}
+
+impl From<AtomicWriteError> for ProjectError {
+    fn from(error: AtomicWriteError) -> Self {
+        match error {
+            AtomicWriteError::Io(error) => Self::Io(error),
+            AtomicWriteError::Conflict {
+                expected_sha256,
+                actual_sha256,
+            } => Self::WriteConflict {
+                expected_sha256,
+                actual_sha256,
+            },
+        }
+    }
+}
+
+pub(crate) fn write_atomic_bytes(
+    path: &Path,
+    bytes: &[u8],
+    precondition: WritePrecondition<'_>,
+) -> Result<String, AtomicWriteError> {
+    write_atomic_bytes_impl(path, bytes, precondition, false)
+}
+
+/// Publish complete bytes through a unique same-directory temporary file.
+///
+/// The compare immediately before rename is optimistic conflict detection, not
+/// a process lock: it prevents ordinary stale writers but cannot make a
+/// cross-process compare-and-swap guarantee on every filesystem.
+fn write_atomic_bytes_impl(
+    path: &Path,
+    bytes: &[u8],
+    precondition: WritePrecondition<'_>,
+    interrupt_after_sync: bool,
+) -> Result<String, AtomicWriteError> {
     let parent = path
         .parent()
-        .ok_or_else(|| ProjectError::Io("project path does not have a parent directory".into()))?;
-    std::fs::create_dir_all(parent).map_err(|error| ProjectError::Io(error.to_string()))?;
+        .ok_or_else(|| AtomicWriteError::Io("path does not have a parent directory".into()))?;
+    std::fs::create_dir_all(parent).map_err(|error| AtomicWriteError::Io(error.to_string()))?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("project");
+        .unwrap_or("data");
     let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .map_err(|error| ProjectError::Io(error.to_string()))?;
+        .map_err(|error| AtomicWriteError::Io(error.to_string()))?;
     if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
         let _ = std::fs::remove_file(&temporary);
-        return Err(ProjectError::Io(error.to_string()));
+        return Err(AtomicWriteError::Io(error.to_string()));
     }
+    drop(file);
+
+    if interrupt_after_sync {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(AtomicWriteError::Io(
+            "injected interruption after temporary-file sync".into(),
+        ));
+    }
+
+    let desired_sha256 = sha256_hex(bytes);
+    let actual_sha256 = file_sha256(path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        AtomicWriteError::Io(error)
+    })?;
+    if actual_sha256.as_deref() == Some(desired_sha256.as_str()) {
+        let _ = std::fs::remove_file(&temporary);
+        sync_parent_directory(parent).map_err(AtomicWriteError::Io)?;
+        return Ok(desired_sha256);
+    }
+    let conflict = match precondition {
+        WritePrecondition::Any => false,
+        WritePrecondition::Missing => actual_sha256.is_some(),
+        WritePrecondition::Unchanged(expected) => actual_sha256.as_deref() != Some(expected),
+    };
+    if conflict {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(AtomicWriteError::Conflict {
+            expected_sha256: match precondition {
+                WritePrecondition::Unchanged(expected) => Some(expected.to_owned()),
+                WritePrecondition::Any | WritePrecondition::Missing => None,
+            },
+            actual_sha256,
+        });
+    }
+
     if let Err(error) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
-        return Err(ProjectError::Io(error.to_string()));
+        return Err(AtomicWriteError::Io(error.to_string()));
     }
-    let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    sync_parent_directory(parent).map_err(AtomicWriteError::Io)?;
+    let published_sha256 = file_sha256(path)
+        .map_err(AtomicWriteError::Io)?
+        .ok_or_else(|| AtomicWriteError::Io("published file disappeared after rename".into()))?;
+    if published_sha256 != desired_sha256 {
+        return Err(AtomicWriteError::Io(format!(
+            "published file verification failed: expected {desired_sha256}, found {published_sha256}"
+        )));
+    }
+    Ok(desired_sha256)
+}
+
+pub(crate) fn file_sha256(path: &Path) -> Result<Option<String>, String> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<(), String> {
+    let directory = std::fs::File::open(parent).map_err(|error| error.to_string())?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn write_atomic_bytes_interrupted_after_sync(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<String, AtomicWriteError> {
+    write_atomic_bytes_impl(path, bytes, WritePrecondition::Any, true)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2121,7 +2315,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(encoded: &str) -> Result<Vec<u8>, String> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return Err("hex payload has an odd number of characters".into());
     }
     encoded
@@ -2627,6 +2821,35 @@ mod tests {
     }
 
     #[test]
+    fn interruption_after_temp_sync_preserves_last_valid_document() {
+        let root = std::env::temp_dir().join(format!(
+            "reyn-project-interrupted-write-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("fixture.reynproj");
+        let project = project_with_run();
+        project.save_atomic(&path).unwrap();
+        let valid_bytes = std::fs::read(&path).unwrap();
+
+        let mut replacement = project;
+        replacement.rename("Interrupted replacement", 80);
+        let replacement_bytes = replacement.to_bytes().unwrap();
+        assert!(write_atomic_bytes_interrupted_after_sync(&path, &replacement_bytes).is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), valid_bytes);
+        assert_eq!(ProjectManifest::open(&path).unwrap().name(), "Fixture");
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn future_schema_and_unknown_evidence_fields_never_silently_drop() {
         let mut value: serde_json::Value =
             serde_json::from_slice(&project_with_run().to_bytes().unwrap()).unwrap();
@@ -2708,6 +2931,21 @@ mod tests {
         document.add_content(source_bytes.clone(), "application/x-pytorch");
         document.add_content(artifact_bytes.clone(), "application/json");
         (document, source_bytes, artifact_bytes)
+    }
+
+    #[test]
+    fn project_serialization_is_deterministic_across_content_insertion_order() {
+        let (document, source_bytes, artifact_bytes) = portable_document();
+        let expected = document.to_bytes().unwrap();
+        assert_eq!(document.to_bytes().unwrap(), expected);
+
+        let mut reverse = ProjectDocument::new(document.manifest().clone());
+        reverse.add_content(artifact_bytes, "application/json");
+        reverse.add_content(source_bytes, "application/x-pytorch");
+        assert_eq!(reverse.to_bytes().unwrap(), expected);
+
+        let reopened = ProjectDocument::from_bytes(&expected).unwrap();
+        assert_eq!(reopened.to_bytes().unwrap(), expected);
     }
 
     #[test]

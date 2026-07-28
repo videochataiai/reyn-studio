@@ -1,0 +1,132 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "creationInfo": {
+    "created": "1980-01-01T00:00:00Z",
+    "creators": [
+      "Organization: Reyn Studio"
+    ]
+  },
+  "dataLicense": "CC0-1.0",
+  "documentNamespace": "https://reyn.studio/spdx/reyn-studio-0.1.0-macos-python-runtime-v1",
+  "name": "Reyn Studio 0.1.0 macOS Python runtime inventory",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-ReynStudio",
+      "comment": "Packaged application and lightweight Python source closure. Python and binary Python dependencies are not bundled.",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "Reyn Studio",
+      "versionInfo": "0.1.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-Python",
+      "comment": "External interpreter requirement; not distributed in this application bundle.",
+      "downloadLocation": "https://www.python.org/downloads/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "PSF-2.0",
+      "licenseDeclared": "PSF-2.0",
+      "name": "Python",
+      "versionInfo": ">=3.14"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-cryptography",
+      "comment": "External Python dependency; not distributed in this application bundle.",
+      "downloadLocation": "https://pypi.org/project/cryptography/49.0.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0 OR BSD-3-Clause",
+      "licenseDeclared": "Apache-2.0 OR BSD-3-Clause",
+      "name": "cryptography",
+      "versionInfo": "49.0.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-numpy",
+      "comment": "External Python dependency; not distributed in this application bundle.",
+      "downloadLocation": "https://pypi.org/project/numpy/2.5.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "NumPy",
+      "versionInfo": "2.5.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-safetensors",
+      "comment": "External Python dependency; not distributed in this application bundle.",
+      "downloadLocation": "https://pypi.org/project/safetensors/0.8.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "name": "safetensors",
+      "versionInfo": "0.8.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-securesystemslib",
+      "comment": "External transitive dependency of python-tuf; not distributed in this application bundle.",
+      "downloadLocation": "https://pypi.org/project/securesystemslib/1.4.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "securesystemslib",
+      "versionInfo": "1.4.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-torch",
+      "comment": "External Python dependency; not distributed in this application bundle.",
+      "downloadLocation": "https://pypi.org/project/torch/2.12.1/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "PyTorch",
+      "versionInfo": "2.12.1"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-tuf",
+      "comment": "External Python dependency (python-tuf); not distributed in this application bundle.",
+      "downloadLocation": "https://pypi.org/project/tuf/7.0.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "python-tuf",
+      "versionInfo": "7.0.0"
+    }
+  ],
+  "relationships": [
+    {
+      "relatedSpdxElement": "SPDXRef-Package-Python",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-cryptography",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-numpy",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-safetensors",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-torch",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-tuf",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-securesystemslib",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-tuf"
+    }
+  ],
+  "spdxVersion": "SPDX-2.3"
+}

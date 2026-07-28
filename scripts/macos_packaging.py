@@ -1,0 +1,1569 @@
+#!/usr/bin/env python3
+"""Shared, dependency-free helpers for Reyn Studio's macOS packaging."""
+
+from __future__ import annotations
+
+import ast
+import base64
+import binascii
+import hashlib
+import json
+import os
+import platform
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import tomllib
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+
+ENGINE_RESOURCES = ("n5_inspector.py", "n5_overlap.py", "reyn_engine.py")
+DOCUMENTATION_RESOURCES = ("PRD.md",)
+RESEARCH_RESOURCES = (
+    "dataset.py",
+    "dataset_3d.py",
+    "flow_contract.py",
+    "flow_quantities.py",
+    "model_bundle.py",
+    "models_3d.py",
+    "obstacle_dataset.py",
+    "obstacle_solver.py",
+    "obstacle_solver_3d.py",
+    "physics_losses.py",
+    "pressure_channel_contract_3d.py",
+    "pressure_model_contract_3d.py",
+    "spectral_solver.py",
+    "spectral_solver_3d.py",
+    "time_moe_operator.py",
+)
+SECURITY_RESOURCES = (
+    "MODEL_TRUST_CONTRACT.json",
+    "SBOM.spdx.json",
+    "THIRD_PARTY_NOTICES.md",
+)
+RUNTIME_DEPENDENCIES = {
+    "Python": (">=3.14", "PSF-2.0"),
+    "cryptography": ("49.0.0", "Apache-2.0 OR BSD-3-Clause"),
+    "NumPy": ("2.5.0", "BSD-3-Clause"),
+    "safetensors": ("0.8.0", "Apache-2.0"),
+    "securesystemslib": ("1.4.0", "MIT"),
+    "PyTorch": ("2.12.1", "BSD-3-Clause"),
+    "python-tuf": ("7.0.0", "MIT"),
+}
+LOCK_PACKAGE_NAMES = {
+    "cryptography": "cryptography",
+    "numpy": "NumPy",
+    "safetensors": "safetensors",
+    "securesystemslib": "securesystemslib",
+    "torch": "PyTorch",
+    "tuf": "python-tuf",
+}
+PROJECT_EXTENSIONS = ("reyn", "reynproj")
+TEMPLATE_EXTENSIONS = ("reyntemplate",)
+DEFAULT_SOURCE_DATE_EPOCH = 315532800  # 1980-01-01, the ZIP format floor.
+ARCHITECTURE_ORDER = ("arm64", "x86_64")
+RUST_TARGET_ARCHITECTURES = {
+    "aarch64-apple-darwin": "arm64",
+    "x86_64-apple-darwin": "x86_64",
+}
+PACKAGE_RUST_TARGETS = {
+    "aarch64-apple-darwin": ("aarch64-apple-darwin",),
+    "x86_64-apple-darwin": ("x86_64-apple-darwin",),
+    "universal2": ("aarch64-apple-darwin", "x86_64-apple-darwin"),
+}
+TARGET_ARCHITECTURES = {
+    target: tuple(RUST_TARGET_ARCHITECTURES[item] for item in rust_targets)
+    for target, rust_targets in PACKAGE_RUST_TARGETS.items()
+}
+DEVELOPER_PATH_BYTE_PATTERNS = (
+    re.compile(rb"file://(?:/|\./)[\x20-\x7e]{0,1024}?PRD\.md"),
+    re.compile(rb"/Users/[^/\x00\s\"']+/"),
+    re.compile(rb"/home/[^/\x00\s\"']+/"),
+    re.compile(rb"[A-Za-z]:\\Users\\[^\\\x00\s\"']+\\"),
+    re.compile(rb"/(?:private/)?var/folders/[^/\x00\s\"']+/"),
+    re.compile(rb"/(?:private/)?tmp/[^/\x00\s\"']+/"),
+    re.compile(rb"/(?:workspace|workspaces|build|builds)/"),
+    re.compile(rb"/Volumes/[^/\x00\s\"']+/"),
+    re.compile(rb"(?:^|/)\.cargo/(?:registry|git)/"),
+    re.compile(rb"/(?:opt/)?cargo/(?:registry|git)/"),
+    re.compile(rb"/(?:opt/)?rustup/toolchains/"),
+)
+TUF_METADATA_NAME = re.compile(
+    r"(?:[1-9][0-9]*\.)?(?:root|snapshot|targets|models)\.json|timestamp\.json"
+)
+FORBIDDEN_SECRET_BYTE_PATTERNS = (
+    re.compile(
+        rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        re.IGNORECASE,
+    ),
+    re.compile(rb"""["'](?:private_key|secret_key|signing_key)["']\s*:""", re.IGNORECASE),
+)
+FORBIDDEN_MODEL_SUFFIXES = (".pth", ".pt", ".ckpt")
+
+
+@dataclass(frozen=True)
+class ReleaseConfig:
+    root: Path
+    package_name: str
+    version: str
+    executable: str
+    bundle_identifier: str
+    display_name: str
+    category: str
+    minimum_system_version: str
+
+
+@dataclass(frozen=True)
+class Check:
+    level: str
+    name: str
+    detail: str
+
+
+def run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    capture: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+    )
+
+
+def load_config(root: Path) -> ReleaseConfig:
+    root = root.resolve()
+    manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    package = manifest["package"]
+    metadata = package.get("metadata", {}).get("reyn-macos", {})
+    required = (
+        "bundle-identifier",
+        "display-name",
+        "category",
+        "minimum-system-version",
+    )
+    missing = [key for key in required if not metadata.get(key)]
+    if missing:
+        raise ValueError(f"missing [package.metadata.reyn-macos] keys: {', '.join(missing)}")
+    return ReleaseConfig(
+        root=root,
+        package_name=str(package["name"]),
+        version=str(package["version"]),
+        executable=str(package["name"]),
+        bundle_identifier=str(metadata["bundle-identifier"]),
+        display_name=str(metadata["display-name"]),
+        category=str(metadata["category"]),
+        minimum_system_version=str(metadata["minimum-system-version"]),
+    )
+
+
+def validate_build_number(build_number: str) -> None:
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", build_number):
+        raise ValueError("build number must contain one to three dot-separated integers")
+
+
+def rustc_host_target(root: Path) -> str:
+    result = run(["rustc", "-vV"], cwd=root, capture=True)
+    for line in result.stdout.splitlines():
+        if line.startswith("host: "):
+            return line.removeprefix("host: ").strip()
+    raise RuntimeError("rustc did not report a host target")
+
+
+def installed_rust_targets(root: Path) -> tuple[str, ...]:
+    result = run(["rustc", "--print", "sysroot"], cwd=root, capture=True)
+    rustlib = Path(result.stdout.strip()) / "lib/rustlib"
+    if not rustlib.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            path.name
+            for path in rustlib.iterdir()
+            if path.is_dir() and (path / "lib").is_dir()
+        )
+    )
+
+
+def require_packaging_toolchain(root: Path, target: str) -> None:
+    if target not in PACKAGE_RUST_TARGETS:
+        raise ValueError(f"unsupported macOS target: {target}")
+    missing_tools = [
+        name for name in ("cargo", "rustc", "lipo", "otool", "xcrun")
+        if shutil.which(name) is None
+    ]
+    if missing_tools:
+        raise RuntimeError(
+            "required macOS packaging tools are unavailable: "
+            f"{', '.join(missing_tools)}; install Rust and Xcode Command Line Tools"
+        )
+    try:
+        sdk = run(["xcrun", "--sdk", "macosx", "--show-sdk-path"], cwd=root, capture=True)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "the macOS SDK is unavailable; run `xcode-select --install` or select a "
+            "complete Xcode developer directory"
+        ) from error
+    if not sdk.stdout.strip():
+        raise RuntimeError(
+            "xcrun returned no macOS SDK path; select a complete Xcode developer directory"
+        )
+    installed = set(installed_rust_targets(root))
+    missing_targets = [
+        item for item in PACKAGE_RUST_TARGETS[target] if item not in installed
+    ]
+    if missing_targets:
+        command = f"rustup target add {' '.join(missing_targets)}"
+        raise RuntimeError(
+            "Rust standard libraries are missing for "
+            f"{', '.join(missing_targets)}; install them with `{command}`"
+        )
+
+
+def rosetta_status() -> str:
+    if platform.system() != "Darwin" or platform.machine() not in {"arm64", "aarch64"}:
+        return "not-required"
+    result = subprocess.run(
+        ["/usr/bin/arch", "-x86_64", "/usr/bin/uname", "-m"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    return (
+        "available"
+        if result.returncode == 0 and result.stdout.strip() == "x86_64"
+        else "unavailable"
+    )
+
+
+def require_local_architecture_runtime(
+    architectures: tuple[str, ...],
+) -> None:
+    if "x86_64" in architectures and rosetta_status() == "unavailable":
+        raise RuntimeError(
+            "x86_64 runtime verification was requested but Rosetta is unavailable; "
+            "install it with `softwareupdate --install-rosetta`"
+        )
+
+
+def info_plist(config: ReleaseConfig, build_number: str) -> dict[str, object]:
+    validate_build_number(build_number)
+    return {
+        "CFBundleDevelopmentRegion": "en",
+        "CFBundleDisplayName": config.display_name,
+        "CFBundleExecutable": config.executable,
+        "CFBundleIconFile": "ReynStudio",
+        "CFBundleIdentifier": config.bundle_identifier,
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleName": config.display_name,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": config.version,
+        "CFBundleSupportedPlatforms": ["MacOSX"],
+        "CFBundleVersion": build_number,
+        "LSApplicationCategoryType": config.category,
+        "LSMinimumSystemVersion": config.minimum_system_version,
+        "NSHighResolutionCapable": True,
+        "UTExportedTypeDeclarations": [
+            {
+                "UTTypeConformsTo": ["public.data", "public.content"],
+                "UTTypeDescription": "Reyn Studio Project",
+                "UTTypeIdentifier": f"{config.bundle_identifier}.project",
+                "UTTypeTagSpecification": {
+                    "public.filename-extension": list(PROJECT_EXTENSIONS),
+                    "public.mime-type": "application/vnd.reyn.project+json",
+                },
+            },
+            {
+                "UTTypeConformsTo": ["public.data", "public.content"],
+                "UTTypeDescription": "Reyn Studio Case Template",
+                "UTTypeIdentifier": f"{config.bundle_identifier}.case-template",
+                "UTTypeTagSpecification": {
+                    "public.filename-extension": list(TEMPLATE_EXTENSIONS),
+                    "public.mime-type": "application/vnd.reyn.case-template+json",
+                },
+            },
+        ],
+    }
+
+
+def runtime_requirements() -> dict[str, object]:
+    return {
+        "schema": "com.reyn.studio.runtime-requirements.v2",
+        "engine": {
+            "bundled_modules": list(ENGINE_RESOURCES),
+            "entrypoint": "engine/reyn_engine.py",
+            "used_by_current_binary": True,
+            "resolution": [
+                "REYN_ENGINE_SCRIPT",
+                "<REYN_RESOURCES_DIR>/engine/reyn_engine.py",
+                "<current_exe_dir>/../Resources/engine/reyn_engine.py",
+                "development ancestors/engine/reyn_engine.py (non-bundle only)",
+            ],
+        },
+        "python": {
+            "bundled": False,
+            "resolution": [
+                "REYN_PYTHON",
+                "<REYN_RESEARCH_DIR>/.venv/bin/python",
+                "python3 on PATH",
+            ],
+            "required_imports": [
+                "cryptography",
+                "numpy",
+                "safetensors",
+                "securesystemslib",
+                "torch",
+                "tuf",
+            ],
+            "required_distributions": {
+                name: version
+                for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+            },
+        },
+        "research_runtime": {
+            "bundled": True,
+            "bundled_modules": list(RESEARCH_RESOURCES),
+            "entrypoint": "research",
+            "environment": "REYN_RESEARCH_DIR",
+            "external_checkout_required": False,
+            "writable": False,
+        },
+        "checkpoints": {
+            "bundled": False,
+            "locations": [
+                "<REYN_RESEARCH_DIR>/*.reynmodel",
+                "<managed-model-dir>/*.reynmodel",
+            ],
+            "pickle_formats_permitted": False,
+        },
+        "model_trust": {
+            "contract": "security/MODEL_TRUST_CONTRACT.json",
+            "detached_signature_required": True,
+            "offline_tuf_metadata_required": True,
+            "production_root_pinned": False,
+            "model_assets_bundled": False,
+            "failure_mode": "fail-closed",
+        },
+        "supply_chain": {
+            "sbom": "security/SBOM.spdx.json",
+            "third_party_notices": "security/THIRD_PARTY_NOTICES.md",
+        },
+        "documentation": {
+            "bundled": True,
+            "entrypoint": "docs/PRD.md",
+            "network_required": False,
+        },
+        "apple_distribution": {
+            "developer_id_signing_performed": False,
+            "notarization_performed": False,
+        },
+    }
+
+
+def standalone_blockers(root: Path) -> list[str]:
+    engine = (root / "src/engine.rs").read_text(encoding="utf-8")
+    main = (root / "src/main.rs").read_text(encoding="utf-8")
+    blockers: list[str] = []
+    if 'concat!(env!("CARGO_MANIFEST_DIR"), "/engine/reyn_engine.py")' in engine:
+        blockers.append(
+            "Python sidecar lookup embeds the build machine's CARGO_MANIFEST_DIR "
+            "instead of resolving Contents/Resources/engine."
+        )
+    if '"/Users/' in engine:
+        blockers.append(
+            "The default research checkout fallback is a developer-specific absolute path."
+        )
+    blockers.append(
+        "Python, NumPy, and PyTorch are not bundled; REYN_PYTHON must select a compatible "
+        "interpreter on the target Mac."
+    )
+    blockers.append(
+        "The production TUF root is intentionally unset, so authenticated model loading "
+        "fails closed until an offline root-key ceremony and source review are complete."
+    )
+    blockers.append(
+        "No authenticated .reynmodel/.sig/.tuf triplet is bundled; models must be supplied "
+        "through the managed import path after the production TUF root is pinned."
+    )
+    blockers.append(
+        "Developer ID signing and Apple notarization are not performed by this workflow."
+    )
+    if "CFBundleDocumentTypes" not in main and "OpenUrls" not in main and "Opened" not in main:
+        blockers.append(
+            "Startup does not consume Finder/LaunchServices document-open events; "
+            "document associations are intentionally not claimed."
+        )
+    return blockers
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_manifest(base: Path, paths: Iterable[Path]) -> list[dict[str, object]]:
+    rows = []
+    for path in sorted(paths, key=lambda item: item.relative_to(base).as_posix()):
+        rows.append(
+            {
+                "path": path.relative_to(base).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return rows
+
+
+def manifest_digest(rows: Iterable[dict[str, object]]) -> str:
+    encoded = json.dumps(
+        list(rows), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def resource_metadata(resources: Path) -> dict[str, object]:
+    paths = [
+        path
+        for path in resources.rglob("*")
+        if path.is_file() and path.name != "release-manifest.json"
+    ]
+    rows = file_manifest(resources, paths)
+    return {
+        "schema": "com.reyn.studio.resource-set.v1",
+        "sha256": manifest_digest(rows),
+        "files": rows,
+    }
+
+
+def validate_resource_metadata(
+    resources: Path, metadata: object
+) -> list[str]:
+    if not isinstance(metadata, dict):
+        return ["release manifest resource_set must be an object"]
+    actual = resource_metadata(resources)
+    errors = []
+    if metadata.get("schema") != actual["schema"]:
+        errors.append(
+            f"resource_set.schema={metadata.get('schema')!r}, "
+            f"expected {actual['schema']!r}"
+        )
+    if metadata.get("files") != actual["files"]:
+        errors.append("release manifest resource_set.files differs from staged resources")
+    if metadata.get("sha256") != actual["sha256"]:
+        errors.append("release manifest resource_set.sha256 differs from staged resources")
+    return errors
+
+
+def resolve_research_source(
+    root: Path, override: Path | None = None
+) -> Path:
+    configured = override
+    if configured is None:
+        environment = os.environ.get("REYN_RESEARCH_SOURCE_DIR", "").strip()
+        configured = Path(environment) if environment else root.parent / "reyn-research"
+    if not configured.is_absolute():
+        configured = root / configured
+    configured = configured.resolve()
+    if not configured.is_dir():
+        raise FileNotFoundError(
+            "research runtime source is missing: "
+            f"{configured}; pass --research-source-dir or set REYN_RESEARCH_SOURCE_DIR"
+        )
+    return configured
+
+
+def validate_research_dependency_lock(research_source: Path) -> list[str]:
+    lock_path = research_source / "uv.lock"
+    project_path = research_source / "pyproject.toml"
+    try:
+        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+        project = tomllib.loads(project_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        return [f"cannot read research dependency metadata: {error}"]
+    locked = {
+        package.get("name"): package.get("version")
+        for package in lock.get("package", [])
+        if isinstance(package, dict)
+    }
+    errors = []
+    for lock_name, inventory_name in LOCK_PACKAGE_NAMES.items():
+        expected = RUNTIME_DEPENDENCIES[inventory_name][0]
+        if locked.get(lock_name) != expected:
+            errors.append(
+                f"uv.lock {lock_name}={locked.get(lock_name)!r}, expected {expected!r}"
+            )
+    python_requirement = project.get("project", {}).get("requires-python")
+    if python_requirement != RUNTIME_DEPENDENCIES["Python"][0]:
+        errors.append(
+            f"pyproject requires-python={python_requirement!r}, "
+            f"expected {RUNTIME_DEPENDENCIES['Python'][0]!r}"
+        )
+    return errors
+
+
+def _json_file(path: Path, label: str) -> tuple[object | None, list[str]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return None, [f"{label} is not valid UTF-8 JSON: {error}"]
+
+
+def _contains_secret_field(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if normalized in {"private", "private_key", "secret", "secret_key", "seed"}:
+                return True
+            if _contains_secret_field(item):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_secret_field(item) for item in value)
+    return False
+
+
+def _target_hash_errors(
+    target: object, path: Path, relative: str, label: str
+) -> list[str]:
+    if not isinstance(target, dict):
+        return [f"{label} target entry is missing"]
+    errors = []
+    hashes = target.get("hashes")
+    expected_hash = hashes.get("sha256") if isinstance(hashes, dict) else None
+    if expected_hash != sha256_file(path):
+        errors.append(f"{label} target SHA-256 does not match {relative}")
+    if target.get("length") != path.stat().st_size:
+        errors.append(f"{label} target length does not match {relative}")
+    return errors
+
+
+def validate_model_assets(
+    resources: Path, *, allow_model_assets: bool = False
+) -> list[str]:
+    """Validate adjacent bundle/signature/TUF layout without claiming TUF trust."""
+    bundles = sorted(resources.rglob("*.reynmodel"))
+    signatures = sorted(resources.rglob("*.reynmodel.sig"))
+    repositories = sorted(
+        path for path in resources.rglob("*.reynmodel.tuf") if path.is_dir()
+    )
+    bundle_names = {str(path) for path in bundles}
+    expected_signatures = {f"{path}.sig" for path in bundles}
+    expected_repositories = {f"{path}.tuf" for path in bundles}
+    errors = [
+        f"orphan detached signature: {path.relative_to(resources).as_posix()}"
+        for path in signatures
+        if str(path).removesuffix(".sig") not in bundle_names
+    ]
+    errors.extend(
+        f"orphan TUF repository: {path.relative_to(resources).as_posix()}"
+        for path in repositories
+        if str(path).removesuffix(".tuf") not in bundle_names
+    )
+    if bundles and not allow_model_assets:
+        errors.append(
+            "model assets are forbidden while the production TUF root is intentionally unset"
+        )
+
+    for bundle in bundles:
+        relative = bundle.relative_to(resources).as_posix()
+        signature = Path(f"{bundle}.sig")
+        repository = Path(f"{bundle}.tuf")
+        if str(signature) not in expected_signatures or not signature.is_file():
+            errors.append(f"{relative} is missing adjacent {bundle.name}.sig")
+            continue
+        if str(repository) not in expected_repositories or not repository.is_dir():
+            errors.append(f"{relative} is missing adjacent {bundle.name}.tuf")
+            continue
+
+        document, document_errors = _json_file(
+            signature, f"{relative}.sig"
+        )
+        errors.extend(document_errors)
+        if not isinstance(document, dict):
+            continue
+        if _contains_secret_field(document):
+            errors.append(f"{relative}.sig contains a forbidden secret field")
+        payload = document.get("signed")
+        if document.get("schema") != "com.reyn.inference-model-signature/1":
+            errors.append(f"{relative}.sig has an incompatible document schema")
+        if not isinstance(payload, dict):
+            errors.append(f"{relative}.sig has no signed payload")
+            continue
+        if payload.get("schema") != "com.reyn.inference-model-signature-payload/1":
+            errors.append(f"{relative}.sig has an incompatible payload schema")
+        if payload.get("bundle_schema") != "com.reyn.inference-model-bundle/1":
+            errors.append(f"{relative}.sig has an incompatible bundle schema")
+        if payload.get("algorithm") != "ed25519":
+            errors.append(f"{relative}.sig does not declare Ed25519")
+        if payload.get("bundle_sha256") != sha256_file(bundle):
+            errors.append(f"{relative}.sig bundle SHA-256 does not match bundle bytes")
+        try:
+            encoded_signature = document.get("signature")
+            decoded_signature = base64.b64decode(encoded_signature, validate=True)
+            if (
+                not isinstance(encoded_signature, str)
+                or len(decoded_signature) != 64
+                or base64.b64encode(decoded_signature).decode("ascii")
+                != encoded_signature
+            ):
+                raise ValueError("not canonical 64-byte base64")
+        except (binascii.Error, TypeError, ValueError):
+            errors.append(f"{relative}.sig has an invalid signature encoding")
+
+        model = payload.get("model")
+        if not isinstance(model, dict):
+            errors.append(f"{relative}.sig has no model identity")
+            continue
+        model_id = model.get("id")
+        model_version = model.get("version")
+        if not all(
+            isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item)
+            for item in (model_id, model_version)
+        ):
+            errors.append(f"{relative}.sig has an invalid model identity")
+            continue
+
+        metadata = repository / "metadata"
+        if not metadata.is_dir() or metadata.is_symlink():
+            errors.append(f"{relative}.tuf must contain a real metadata directory")
+            continue
+        entries = sorted(metadata.iterdir())
+        invalid_entries = [
+            path.name
+            for path in entries
+            if path.is_symlink()
+            or not path.is_file()
+            or not TUF_METADATA_NAME.fullmatch(path.name)
+        ]
+        if invalid_entries:
+            errors.append(
+                f"{relative}.tuf has unsupported metadata entries: "
+                f"{', '.join(invalid_entries)}"
+            )
+            continue
+        names = {path.name for path in entries}
+        for role in ("root", "targets", "models", "snapshot"):
+            if not any(
+                re.fullmatch(rf"[1-9][0-9]*\.{role}\.json", name)
+                for name in names
+            ):
+                errors.append(f"{relative}.tuf is missing versioned {role} metadata")
+        if "timestamp.json" not in names:
+            errors.append(f"{relative}.tuf is missing timestamp.json")
+
+        parsed_metadata: dict[str, object] = {}
+        for entry in entries:
+            value, metadata_errors = _json_file(
+                entry, f"{relative}.tuf/metadata/{entry.name}"
+            )
+            errors.extend(metadata_errors)
+            if value is not None:
+                parsed_metadata[entry.name] = value
+                if _contains_secret_field(value):
+                    errors.append(
+                        f"{relative}.tuf/metadata/{entry.name} contains a forbidden secret field"
+                    )
+
+        model_documents = [
+            value
+            for name, value in parsed_metadata.items()
+            if re.fullmatch(r"[1-9][0-9]*\.models\.json", name)
+        ]
+        if len(model_documents) != 1 or not isinstance(model_documents[0], dict):
+            continue
+        signed = model_documents[0].get("signed")
+        targets = signed.get("targets") if isinstance(signed, dict) else None
+        if not isinstance(targets, dict):
+            errors.append(f"{relative}.tuf models metadata has no targets object")
+            continue
+        target_path = f"models/{model_id}/{model_version}/{bundle.name}"
+        signature_target_path = target_path + ".sig"
+        if Path(target_path).is_absolute() or ".." in Path(target_path).parts:
+            errors.append(f"{relative}.tuf contains a non-relative target path")
+            continue
+        bundle_target = targets.get(target_path)
+        signature_target = targets.get(signature_target_path)
+        errors.extend(
+            _target_hash_errors(bundle_target, bundle, relative, "bundle")
+        )
+        errors.extend(
+            _target_hash_errors(
+                signature_target, signature, f"{relative}.sig", "signature"
+            )
+        )
+        custom = (
+            bundle_target.get("custom")
+            if isinstance(bundle_target, dict)
+            else None
+        )
+        detached = custom.get("detached_signature") if isinstance(custom, dict) else None
+        if (
+            not isinstance(custom, dict)
+            or custom.get("schema") != "com.reyn.tuf-model-target/1"
+            or custom.get("model") != model
+            or custom.get("release_sequence") != payload.get("release_sequence")
+            or not isinstance(detached, dict)
+            or detached.get("target_path") != signature_target_path
+            or detached.get("algorithm") != "ed25519"
+            or detached.get("key_id") != payload.get("key_id")
+        ):
+            errors.append(
+                f"{relative}.tuf target custom metadata is incompatible with its signature"
+            )
+    return errors
+
+
+def forbidden_security_assets(resources: Path) -> list[str]:
+    errors = []
+    for path in sorted(resources.rglob("*")):
+        relative = path.relative_to(resources).as_posix()
+        lowered_parts = tuple(part.lower() for part in path.parts)
+        if any(
+            token in part
+            for part in lowered_parts
+            for token in ("test-root", "test_root", "ephemeral-key", "fixture-key")
+        ):
+            errors.append(f"forbidden test/ephemeral security asset: {relative}")
+        if path.is_symlink():
+            errors.append(f"symbolic links are forbidden in resources: {relative}")
+            continue
+        if not path.is_file():
+            continue
+        lowered_name = path.name.lower()
+        if path.suffix.lower() in (*FORBIDDEN_MODEL_SUFFIXES, ".pem", ".key", ".p12", ".pfx"):
+            errors.append(f"forbidden model/key file: {relative}")
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if any(pattern.search(data) for pattern in FORBIDDEN_SECRET_BYTE_PATTERNS):
+            errors.append(f"forbidden private-key material: {relative}")
+        if lowered_name in {"root.json", "test-root.json", "test_root.json"}:
+            errors.append(f"unversioned or test TUF root is forbidden: {relative}")
+    return errors
+
+
+def validate_security_artifacts(resources: Path) -> list[str]:
+    security = resources / "security"
+    missing = [name for name in SECURITY_RESOURCES if not (security / name).is_file()]
+    if missing:
+        return [f"missing security artifact(s): {', '.join(missing)}"]
+
+    errors: list[str] = []
+    contract, contract_errors = _json_file(
+        security / "MODEL_TRUST_CONTRACT.json", "model trust contract"
+    )
+    errors.extend(contract_errors)
+    if isinstance(contract, dict):
+        expected = {
+            ("schema",): "com.reyn.studio.model-trust-contract.v1",
+            ("production_root", "pinned"): False,
+            ("production_root", "status"): "intentionally-unset",
+            ("model_assets_bundled",): False,
+            ("detached_signature", "required_adjacent_suffix"): ".sig",
+            ("tuf", "detached_repository_suffix"): ".tuf",
+            ("tuf", "metadata_subdirectory"): "metadata",
+            ("tuf", "transport"): "offline-local-only",
+        }
+        for keys, value in expected.items():
+            current: object = contract
+            for key in keys:
+                current = current.get(key) if isinstance(current, dict) else None
+            if current != value:
+                errors.append(
+                    f"model trust contract {'.'.join(keys)}={current!r}, expected {value!r}"
+                )
+        if _contains_secret_field(contract):
+            errors.append("model trust contract contains a forbidden secret field")
+    else:
+        errors.append("model trust contract must be an object")
+
+    model_bundle_path = resources / "research/model_bundle.py"
+    try:
+        tree = ast.parse(model_bundle_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SyntaxError) as error:
+        errors.append(f"cannot inspect staged model_bundle.py trust constants: {error}")
+    else:
+        names = {
+            "PINNED_TUF_ROOT_JSON",
+            "BUNDLE_SCHEMA",
+            "SIGNATURE_DOCUMENT_SCHEMA",
+            "SIGNATURE_PAYLOAD_SCHEMA",
+            "SIGNATURE_SUFFIX",
+            "TUF_TARGET_CUSTOM_SCHEMA",
+            "TUF_REPOSITORY_SUFFIX",
+            "TUF_MIN_ROOT_THRESHOLD",
+            "TUF_MIN_TARGETS_THRESHOLD",
+        }
+        constants: dict[str, object] = {}
+        for node in tree.body:
+            target = None
+            value = None
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                target, value = node.targets[0].id, node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target, value = node.target.id, node.value
+            if target in names and value is not None:
+                try:
+                    constants[target] = ast.literal_eval(value)
+                except (ValueError, TypeError):
+                    constants[target] = object()
+        expected_constants = {
+            "PINNED_TUF_ROOT_JSON": None,
+            "BUNDLE_SCHEMA": "com.reyn.inference-model-bundle/1",
+            "SIGNATURE_DOCUMENT_SCHEMA": "com.reyn.inference-model-signature/1",
+            "SIGNATURE_PAYLOAD_SCHEMA": "com.reyn.inference-model-signature-payload/1",
+            "SIGNATURE_SUFFIX": ".sig",
+            "TUF_TARGET_CUSTOM_SCHEMA": "com.reyn.tuf-model-target/1",
+            "TUF_REPOSITORY_SUFFIX": ".tuf",
+            "TUF_MIN_ROOT_THRESHOLD": 2,
+            "TUF_MIN_TARGETS_THRESHOLD": 2,
+        }
+        for name, value in expected_constants.items():
+            if constants.get(name, object()) != value:
+                errors.append(
+                    f"staged model_bundle.py {name} does not match the fail-closed trust contract"
+                )
+
+    sbom, sbom_errors = _json_file(security / "SBOM.spdx.json", "SBOM")
+    errors.extend(sbom_errors)
+    if isinstance(sbom, dict):
+        packages = sbom.get("packages")
+        indexed = {
+            package.get("name"): package
+            for package in packages
+            if isinstance(package, dict) and isinstance(package.get("name"), str)
+        } if isinstance(packages, list) else {}
+        if sbom.get("spdxVersion") != "SPDX-2.3":
+            errors.append("SBOM must use SPDX-2.3")
+        for name, (version, license_id) in RUNTIME_DEPENDENCIES.items():
+            package = indexed.get(name)
+            if not isinstance(package, dict):
+                errors.append(f"SBOM omits {name}")
+                continue
+            if package.get("versionInfo") != version:
+                errors.append(
+                    f"SBOM {name} version={package.get('versionInfo')!r}, expected {version!r}"
+                )
+            if package.get("licenseDeclared") != license_id:
+                errors.append(
+                    f"SBOM {name} license={package.get('licenseDeclared')!r}, "
+                    f"expected {license_id!r}"
+                )
+            if "not distributed" not in str(package.get("comment", "")):
+                errors.append(f"SBOM must identify {name} as an external dependency")
+    else:
+        errors.append("SBOM must be an object")
+
+    try:
+        notices = (security / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        errors.append(f"third-party notices are unreadable: {error}")
+    else:
+        for name, (version, _license) in RUNTIME_DEPENDENCIES.items():
+            marker = f"{name} {version}" if name != "Python" else "Python 3.14"
+            if marker not in notices:
+                errors.append(f"third-party notices omit {marker}")
+
+    errors.extend(validate_model_assets(resources, allow_model_assets=False))
+    errors.extend(forbidden_security_assets(resources))
+    return errors
+
+
+def developer_path_leaks(
+    bundle: Path,
+    *,
+    forbidden_roots: Iterable[Path] = (),
+) -> list[str]:
+    contents = bundle / "Contents"
+    candidates = sorted(
+        (path for path in contents.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(contents).as_posix(),
+    )
+    markers = {
+        str(root.resolve()).encode("utf-8")
+        for root in forbidden_roots
+        if str(root).strip()
+    }
+    leaks: list[str] = []
+    for path in candidates:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        relative = path.relative_to(contents).as_posix()
+        hits: set[str] = set()
+        for marker in markers:
+            if marker and marker in data:
+                hits.add(marker.decode("utf-8", errors="replace"))
+        for pattern in DEVELOPER_PATH_BYTE_PATTERNS:
+            for match in pattern.finditer(data):
+                hits.add(match.group(0).decode("utf-8", errors="replace"))
+        leaks.extend(f"{relative}: {hit}" for hit in sorted(hits))
+    return leaks
+
+
+def validate_release_manifest(contents: Path, manifest_path: Path) -> list[str]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return [f"cannot read release manifest: {error}"]
+    rows = manifest.get("files")
+    if not isinstance(rows, list):
+        return ["release manifest files must be a list"]
+
+    errors: list[str] = []
+    indexed: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            errors.append("release manifest contains a malformed file row")
+            continue
+        relative = row["path"]
+        path = Path(relative)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or re.match(r"^[A-Za-z]:[\\/]", relative)
+        ):
+            errors.append(f"release manifest path is not portable: {relative}")
+            continue
+        if relative in indexed:
+            errors.append(f"release manifest path is duplicated: {relative}")
+            continue
+        indexed[relative] = row
+
+    expected = {
+        path.relative_to(contents).as_posix()
+        for path in contents.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    listed = set(indexed)
+    for relative in sorted(expected - listed):
+        errors.append(f"release manifest omits {relative}")
+    for relative in sorted(listed - expected):
+        errors.append(f"release manifest references missing {relative}")
+    for relative in sorted(expected & listed):
+        path = contents / relative
+        row = indexed[relative]
+        if row.get("bytes") != path.stat().st_size:
+            errors.append(f"release manifest byte count differs for {relative}")
+        if row.get("sha256") != sha256_file(path):
+            errors.append(f"release manifest SHA-256 differs for {relative}")
+    return errors
+
+
+def validate_runtime_contract(path: Path) -> list[str]:
+    try:
+        contract = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return [f"cannot read runtime contract: {error}"]
+    expected = {
+        ("engine", "used_by_current_binary"): True,
+        ("python", "bundled"): False,
+        ("research_runtime", "bundled"): True,
+        ("checkpoints", "bundled"): False,
+        ("checkpoints", "pickle_formats_permitted"): False,
+        ("model_trust", "production_root_pinned"): False,
+        ("model_trust", "model_assets_bundled"): False,
+        ("model_trust", "failure_mode"): "fail-closed",
+        ("documentation", "bundled"): True,
+        ("documentation", "network_required"): False,
+        ("apple_distribution", "developer_id_signing_performed"): False,
+        ("apple_distribution", "notarization_performed"): False,
+    }
+    errors = [
+        f"{section}.{key}={contract.get(section, {}).get(key)!r}, expected {value!r}"
+        for (section, key), value in expected.items()
+        if contract.get(section, {}).get(key) != value
+    ]
+    if tuple(contract.get("engine", {}).get("bundled_modules", ())) != ENGINE_RESOURCES:
+        errors.append("engine.bundled_modules does not match packaged sidecar resources")
+    if (
+        tuple(contract.get("research_runtime", {}).get("bundled_modules", ()))
+        != RESEARCH_RESOURCES
+    ):
+        errors.append(
+            "research_runtime.bundled_modules does not match packaged research resources"
+        )
+    expected_distributions = {
+        name: version
+        for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+    }
+    if contract.get("python", {}).get("required_distributions") != expected_distributions:
+        errors.append(
+            "python.required_distributions does not match the locked runtime inventory"
+        )
+    expected_security_paths = {
+        "contract": "security/MODEL_TRUST_CONTRACT.json",
+        "sbom": "security/SBOM.spdx.json",
+        "third_party_notices": "security/THIRD_PARTY_NOTICES.md",
+    }
+    actual_security_paths = {
+        "contract": contract.get("model_trust", {}).get("contract"),
+        "sbom": contract.get("supply_chain", {}).get("sbom"),
+        "third_party_notices": contract.get("supply_chain", {}).get(
+            "third_party_notices"
+        ),
+    }
+    if actual_security_paths != expected_security_paths:
+        errors.append("runtime contract security artifact paths are incomplete")
+    return errors
+
+
+def write_json(path: Path, value: object) -> None:
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def deterministic_zip(source: Path, destination: Path, source_date_epoch: int) -> None:
+    timestamp = datetime.fromtimestamp(
+        max(source_date_epoch, DEFAULT_SOURCE_DATE_EPOCH), tz=timezone.utc
+    )
+    zip_time = (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute, 0)
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source.parent).as_posix()):
+            relative = path.relative_to(source.parent).as_posix()
+            if path.is_dir():
+                relative += "/"
+            info = zipfile.ZipInfo(relative, zip_time)
+            mode = path.stat().st_mode
+            info.create_system = 3
+            info.external_attr = ((stat.S_IMODE(mode) | (stat.S_IFDIR if path.is_dir() else stat.S_IFREG)) << 16)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, b"" if path.is_dir() else path.read_bytes())
+
+
+def write_sha256sums(paths: Iterable[Path], destination: Path) -> None:
+    rows = [
+        f"{sha256_file(path)}  {path.name}"
+        for path in sorted(paths, key=lambda item: item.name)
+    ]
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
+    temporary.replace(destination)
+
+
+def executable_architectures(executable: Path) -> tuple[str, ...]:
+    result = run(["lipo", "-archs", str(executable)], cwd=executable.parent, capture=True)
+    discovered = set(result.stdout.strip().split())
+    return tuple(
+        architecture
+        for architecture in ARCHITECTURE_ORDER
+        if architecture in discovered
+    )
+
+
+def require_executable_architectures(
+    executable: Path,
+    expected: tuple[str, ...],
+    *,
+    context: str = "Mach-O executable",
+) -> tuple[str, ...]:
+    actual = executable_architectures(executable)
+    if set(actual) != set(expected):
+        raise RuntimeError(
+            f"{context} has architectures {', '.join(actual) or 'none'}; "
+            f"expected {', '.join(expected)}"
+        )
+    try:
+        run(
+            ["lipo", str(executable), "-verify_arch", *expected],
+            cwd=executable.parent,
+            capture=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"{context} failed lipo slice validation for {', '.join(expected)}"
+        ) from error
+    return actual
+
+
+def linked_libraries(executable: Path, architecture: str | None = None) -> list[str]:
+    command = ["otool"]
+    if architecture is not None:
+        command.extend(["-arch", architecture])
+    command.extend(["-L", str(executable)])
+    result = run(command, cwd=executable.parent, capture=True)
+    libraries = []
+    for line in result.stdout.splitlines()[1:]:
+        value = line.strip().split(" (", 1)[0]
+        if value and not value.endswith(":"):
+            libraries.append(value)
+    return libraries
+
+
+def parse_macho_minimum_macos(output: str) -> str | None:
+    lines = [line.strip() for line in output.splitlines()]
+    for index, line in enumerate(lines):
+        if line == "cmd LC_BUILD_VERSION":
+            for candidate in lines[index + 1 : index + 8]:
+                if candidate.startswith("minos "):
+                    return candidate.removeprefix("minos ").strip()
+        if line == "cmd LC_VERSION_MIN_MACOSX":
+            for candidate in lines[index + 1 : index + 8]:
+                if candidate.startswith("version "):
+                    return candidate.removeprefix("version ").strip()
+    return None
+
+
+def executable_minimum_macos(
+    executable: Path, architecture: str | None = None
+) -> str | None:
+    command = ["otool"]
+    if architecture is not None:
+        command.extend(["-arch", architecture])
+    command.extend(["-l", str(executable)])
+    result = run(command, cwd=executable.parent, capture=True)
+    return parse_macho_minimum_macos(result.stdout)
+
+
+def validate_architecture_metadata(
+    manifest: object,
+    actual_architectures: tuple[str, ...],
+    expected_architectures: tuple[str, ...] | None,
+) -> list[str]:
+    if not isinstance(manifest, dict):
+        return ["release manifest must be an object"]
+    errors = []
+    if manifest.get("schema") != "com.reyn.studio.local-package.v2":
+        errors.append(
+            f"release manifest schema={manifest.get('schema')!r}, "
+            "expected 'com.reyn.studio.local-package.v2'"
+        )
+    target = manifest.get("rust_target")
+    if target not in TARGET_ARCHITECTURES:
+        errors.append(f"release manifest has unsupported rust_target {target!r}")
+        target_architectures: tuple[str, ...] = ()
+    else:
+        target_architectures = TARGET_ARCHITECTURES[target]
+    declared_value = manifest.get("architectures")
+    declared = (
+        tuple(declared_value)
+        if isinstance(declared_value, list)
+        and all(isinstance(item, str) for item in declared_value)
+        else ()
+    )
+    if not declared:
+        errors.append("release manifest architectures must be a non-empty string list")
+    if target_architectures and set(declared) != set(target_architectures):
+        errors.append(
+            f"release manifest target {target!r} requires "
+            f"{', '.join(target_architectures)}, declared {', '.join(declared) or 'none'}"
+        )
+    if set(declared) != set(actual_architectures):
+        errors.append(
+            "release manifest architectures do not match executable slices: "
+            f"declared {', '.join(declared) or 'none'}, "
+            f"actual {', '.join(actual_architectures) or 'none'}"
+        )
+    if expected_architectures is not None and set(declared) != set(
+        expected_architectures
+    ):
+        errors.append(
+            f"release manifest declares {', '.join(declared) or 'none'}, "
+            f"expected {', '.join(expected_architectures)}"
+        )
+
+    slices = manifest.get("architecture_slices")
+    if not isinstance(slices, list):
+        errors.append("release manifest architecture_slices must be a list")
+        return errors
+    slice_map: dict[str, dict[str, object]] = {}
+    for row in slices:
+        if not isinstance(row, dict) or not isinstance(row.get("architecture"), str):
+            errors.append("release manifest contains a malformed architecture slice")
+            continue
+        architecture = str(row["architecture"])
+        if architecture in slice_map:
+            errors.append(f"release manifest duplicates {architecture} slice metadata")
+            continue
+        slice_map[architecture] = row
+    if set(slice_map) != set(declared):
+        errors.append("release manifest architecture_slices do not match architectures")
+    expected_targets = {
+        architecture: rust_target
+        for rust_target, architecture in RUST_TARGET_ARCHITECTURES.items()
+    }
+    for architecture, row in slice_map.items():
+        if row.get("rust_target") != expected_targets.get(architecture):
+            errors.append(
+                f"{architecture} slice has rust_target {row.get('rust_target')!r}, "
+                f"expected {expected_targets.get(architecture)!r}"
+            )
+        if not isinstance(row.get("bytes"), int) or int(row["bytes"]) <= 0:
+            errors.append(f"{architecture} slice has invalid byte count")
+        digest = row.get("source_binary_sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            errors.append(f"{architecture} slice has invalid source binary SHA-256")
+    return errors
+
+
+def signing_state(bundle: Path) -> str:
+    result = subprocess.run(
+        ["codesign", "-dvvv", str(bundle)],
+        cwd=bundle.parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    output = result.stdout
+    if "TeamIdentifier=" in output and "TeamIdentifier=not set" not in output:
+        return "credential-signed"
+    if "Signature=adhoc" in output:
+        return "ad-hoc"
+    return "unsigned"
+
+
+def validate_bundle(
+    bundle: Path,
+    config: ReleaseConfig,
+    *,
+    expected_architectures: tuple[str, ...] | None = None,
+    require_runnable_architectures: bool = False,
+) -> list[Check]:
+    checks: list[Check] = []
+    contents = bundle / "Contents"
+    plist_path = contents / "Info.plist"
+    executable = contents / "MacOS" / config.executable
+    resources = contents / "Resources"
+
+    if not plist_path.is_file():
+        return [Check("FAIL", "Info.plist", f"missing {plist_path}")]
+    with plist_path.open("rb") as stream:
+        plist = plistlib.load(stream)
+
+    expected = {
+        "CFBundleIdentifier": config.bundle_identifier,
+        "CFBundleShortVersionString": config.version,
+        "CFBundleExecutable": config.executable,
+        "LSMinimumSystemVersion": config.minimum_system_version,
+    }
+    metadata_errors = [
+        f"{key}={plist.get(key)!r}, expected {value!r}"
+        for key, value in expected.items()
+        if plist.get(key) != value
+    ]
+    checks.append(
+        Check(
+            "PASS" if not metadata_errors else "FAIL",
+            "bundle metadata",
+            "identity, executable, version, and deployment target match Cargo metadata"
+            if not metadata_errors
+            else "; ".join(metadata_errors),
+        )
+    )
+
+    exported = plist.get("UTExportedTypeDeclarations", [])
+    extensions = {
+        extension
+        for declaration in exported
+        for extension in declaration.get("UTTypeTagSpecification", {}).get(
+            "public.filename-extension", []
+        )
+    }
+    expected_extensions = set(PROJECT_EXTENSIONS + TEMPLATE_EXTENSIONS)
+    checks.append(
+        Check(
+            "PASS" if extensions == expected_extensions else "FAIL",
+            "document type metadata",
+            f"declares {', '.join(sorted(extensions))}; Finder open association remains disabled",
+        )
+    )
+    checks.append(
+        Check(
+            "PASS" if "CFBundleDocumentTypes" not in plist else "FAIL",
+            "association honesty",
+            "does not claim Finder open support before startup handles document-open events",
+        )
+    )
+
+    executable_ok = executable.is_file() and os.access(executable, os.X_OK)
+    checks.append(
+        Check(
+            "PASS" if executable_ok else "FAIL",
+            "bundle executable",
+            str(executable) if executable_ok else "missing or not executable",
+        )
+    )
+    architectures: tuple[str, ...] = ()
+    if executable_ok:
+        try:
+            architectures = executable_architectures(executable)
+            verified_architectures = (
+                expected_architectures
+                if expected_architectures is not None
+                else architectures
+            )
+            require_executable_architectures(executable, verified_architectures)
+            architecture_error = ""
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            architecture_error = str(error)
+        checks.append(
+            Check(
+                "PASS" if not architecture_error else "FAIL",
+                "architecture",
+                (
+                    f"{', '.join(architectures)}; every declared Mach-O slice passed lipo validation"
+                    if not architecture_error
+                    else architecture_error
+                ),
+            )
+        )
+        for architecture in architectures:
+            minimum = executable_minimum_macos(executable, architecture)
+            checks.append(
+                Check(
+                    "PASS" if minimum == config.minimum_system_version else "FAIL",
+                    f"Mach-O deployment target ({architecture})",
+                    minimum or "not found",
+                )
+            )
+            libraries = linked_libraries(executable, architecture)
+            non_system = [
+                item
+                for item in libraries
+                if not item.startswith(("/System/Library/", "/usr/lib/"))
+            ]
+            checks.append(
+                Check(
+                    "PASS" if not non_system else "FAIL",
+                    f"dynamic libraries ({architecture})",
+                    "system frameworks only"
+                    if not non_system
+                    else f"unbundled libraries: {', '.join(non_system)}",
+                )
+            )
+        if "x86_64" in architectures and platform.machine() in {"arm64", "aarch64"}:
+            status = rosetta_status()
+            rosetta_required_but_missing = (
+                require_runnable_architectures and status != "available"
+            )
+            checks.append(
+                Check(
+                    "FAIL"
+                    if rosetta_required_but_missing
+                    else ("PASS" if status == "available" else "BLOCKED"),
+                    "x86_64 execution layer",
+                    (
+                        "Rosetta is available; this verifies local x86_64 execution support, "
+                        "not application startup"
+                        if status == "available"
+                        else "Rosetta is unavailable; install it with "
+                        "`softwareupdate --install-rosetta` before local x86_64 runtime tests"
+                    ),
+                )
+            )
+
+    required_resources = [
+        resources / "ReynStudio.icns",
+        resources / "runtime-requirements.json",
+        resources / "release-manifest.json",
+        *(resources / "docs" / name for name in DOCUMENTATION_RESOURCES),
+        *(resources / "engine" / name for name in ENGINE_RESOURCES),
+        *(resources / "research" / name for name in RESEARCH_RESOURCES),
+        *(resources / "security" / name for name in SECURITY_RESOURCES),
+    ]
+    missing_resources = [
+        path.relative_to(resources).as_posix()
+        for path in required_resources
+        if not path.is_file()
+    ]
+    checks.append(
+        Check(
+            "PASS" if not missing_resources else "FAIL",
+            "resources",
+            "icon, runtime contract, manifest, sidecar, research, and security inventory included"
+            if not missing_resources
+            else f"missing: {', '.join(missing_resources)}",
+        )
+    )
+
+    runtime_path = resources / "runtime-requirements.json"
+    runtime_errors = (
+        validate_runtime_contract(runtime_path)
+        if runtime_path.is_file()
+        else ["runtime contract is missing"]
+    )
+    checks.append(
+        Check(
+            "PASS" if not runtime_errors else "FAIL",
+            "runtime contract honesty",
+            "bundled sidecar/research code and external Python/checkpoint/Apple gates are explicit"
+            if not runtime_errors
+            else "; ".join(runtime_errors),
+        )
+    )
+
+    security_errors = validate_security_artifacts(resources)
+    checks.append(
+        Check(
+            "PASS" if not security_errors else "FAIL",
+            "model trust and supply chain",
+            (
+                "Python closure, external dependency SBOM/licenses, no bundled model material, "
+                "and fail-closed production trust policy agree"
+                if not security_errors
+                else "; ".join(security_errors)
+            ),
+        )
+    )
+
+    manifest_path = resources / "release-manifest.json"
+    manifest_errors = (
+        validate_release_manifest(contents, manifest_path)
+        if manifest_path.is_file()
+        else ["release manifest is missing"]
+    )
+    checks.append(
+        Check(
+            "PASS" if not manifest_errors else "FAIL",
+            "release manifest",
+            "all staged files have matching relative byte counts and SHA-256 digests"
+            if not manifest_errors
+            else "; ".join(manifest_errors),
+        )
+    )
+    try:
+        release_manifest: object = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        release_manifest = None
+    architecture_metadata_errors = validate_architecture_metadata(
+        release_manifest,
+        architectures,
+        expected_architectures,
+    )
+    checks.append(
+        Check(
+            "PASS" if not architecture_metadata_errors else "FAIL",
+            "architecture metadata",
+            (
+                "release target, slice metadata, and executable architectures agree"
+                if not architecture_metadata_errors
+                else "; ".join(architecture_metadata_errors)
+            ),
+        )
+    )
+    resource_metadata_errors = (
+        validate_resource_metadata(resources, release_manifest.get("resource_set"))
+        if isinstance(release_manifest, dict)
+        else ["release manifest resource_set is unavailable"]
+    )
+    checks.append(
+        Check(
+            "PASS" if not resource_metadata_errors else "FAIL",
+            "resource parity metadata",
+            (
+                "architecture-neutral resource inventory and digest match staged files"
+                if not resource_metadata_errors
+                else "; ".join(resource_metadata_errors)
+            ),
+        )
+    )
+
+    path_leaks = developer_path_leaks(
+        bundle,
+        forbidden_roots=(config.root, Path.home()),
+    )
+    checks.append(
+        Check(
+            "PASS" if not path_leaks else "FAIL",
+            "portable staged content",
+            "no workspace, user-home, or build-temporary paths found in any staged file"
+            if not path_leaks
+            else "; ".join(path_leaks),
+        )
+    )
+
+    state = signing_state(bundle)
+    checks.append(
+        Check(
+            "INFO",
+            "Apple distribution",
+            f"{state}; Developer ID signing and notarization were not performed by this workflow",
+        )
+    )
+    for index, blocker in enumerate(standalone_blockers(config.root), start=1):
+        checks.append(Check("BLOCKED", f"standalone gate {index}", blocker))
+    return checks
+
+
+def print_checks(checks: Iterable[Check]) -> None:
+    for check in checks:
+        print(f"[{check.level:7}] {check.name}: {check.detail}")
+
+
+def has_failures(checks: Iterable[Check]) -> bool:
+    return any(check.level == "FAIL" for check in checks)
+
+
+def copy_engine_resources(root: Path, destination: Path) -> list[Path]:
+    destination.mkdir(parents=True)
+    copied = []
+    for name in ENGINE_RESOURCES:
+        source = root / "engine" / name
+        target = destination / name
+        shutil.copy2(source, target)
+        copied.append(target)
+    return copied
+
+
+def copy_documentation_resources(root: Path, destination: Path) -> list[Path]:
+    destination.mkdir(parents=True)
+    copied = []
+    for name in DOCUMENTATION_RESOURCES:
+        source = root / name
+        target = destination / name
+        shutil.copy2(source, target)
+        copied.append(target)
+    return copied
+
+
+def copy_security_resources(root: Path, destination: Path) -> list[Path]:
+    destination.mkdir(parents=True)
+    copied = []
+    source_dir = root / "packaging/macos"
+    for name in SECURITY_RESOURCES:
+        source = source_dir / name
+        if not source.is_file():
+            raise FileNotFoundError(f"required security artifact is missing: {source}")
+        target = destination / name
+        shutil.copy2(source, target)
+        copied.append(target)
+    return copied
+
+
+def copy_research_resources(source: Path, destination: Path) -> list[Path]:
+    destination.mkdir(parents=True)
+    copied = []
+    for name in RESEARCH_RESOURCES:
+        module = source / name
+        if not module.is_file():
+            raise FileNotFoundError(f"required research module is missing: {module}")
+        target = destination / name
+        shutil.copy2(module, target)
+        copied.append(target)
+    return copied
