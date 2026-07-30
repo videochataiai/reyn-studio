@@ -117,10 +117,9 @@ jobs:
             Stop-Process -Id $process.Id -Force
             throw "YC-gated Reyn Studio started its engine before authentication."
           }
-          $process.CloseMainWindow() | Out-Null
+          Stop-Process -Id $process.Id -Force
           if (-not $process.WaitForExit(15000)) {
-            Stop-Process -Id $process.Id -Force
-            throw "Reyn Studio did not exit after a normal window close."
+            throw "Reyn Studio did not terminate under CI runner control."
           }
           Start-Sleep -Seconds 2
           $orphan = Get-CimInstance Win32_Process |
@@ -132,7 +131,7 @@ jobs:
             Select-Object -First 1
           if ($orphan) {
             Stop-Process -Id $orphan.ProcessId -Force
-            throw "Bundled Python engine remained after Reyn Studio exited."
+            throw "Bundled Python engine remained after runner-controlled termination."
           }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

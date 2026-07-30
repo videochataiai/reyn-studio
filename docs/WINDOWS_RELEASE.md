@@ -128,13 +128,14 @@ Automated Windows CI must pass:
 - Runner launch smoke for the staged executable
 - Bundled engine READY on loopback
 - Gated app reaches its login window without starting the engine before unlock,
-  then exits normally without leaving an orphaned Python process
+  then runner-controlled termination leaves no orphaned Python process
 
 On a non-Windows host, a code-only cross-target check can set
 `REYN_SKIP_WINDOWS_RESOURCES=1` while running `cargo check`. This skips only
 the Windows `.ico` resource compiler; CI and release packaging do not set it.
 
 The GitHub-hosted `windows-2025` job is a packaging and integration check. It
+cannot establish interactive normal-close behavior from its service desktop and
 does not qualify Windows 11. The separate manual
 `windows-11-clean-machine.yml` workflow requires a self-hosted Windows 11
 runner and records the exact artifact hash after the manual matrix is attested.

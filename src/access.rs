@@ -93,10 +93,6 @@ impl eframe::App for RootApp {
             return;
         }
 
-        if ui.input(|input| input.viewport().close_requested()) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
         if let Some(gate) = self.gate.as_mut() {
             gate.ui(ui);
         }
