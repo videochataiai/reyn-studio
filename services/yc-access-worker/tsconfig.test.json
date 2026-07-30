@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "types": ["node", "./worker-configuration.d.ts"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "scripts/**/*.d.mts",
+    "worker-configuration.d.ts"
+  ]
+}

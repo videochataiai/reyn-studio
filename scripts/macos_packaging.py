@@ -23,14 +23,18 @@ from pathlib import Path
 from typing import Iterable
 
 
-ENGINE_RESOURCES = ("n5_inspector.py", "n5_overlap.py", "reyn_engine.py")
+ENGINE_RESOURCES = (
+    "model_bundle.py",
+    "n5_inspector.py",
+    "n5_overlap.py",
+    "reyn_engine.py",
+)
 DOCUMENTATION_RESOURCES = ("PRD.md",)
 RESEARCH_RESOURCES = (
     "dataset.py",
     "dataset_3d.py",
     "flow_contract.py",
     "flow_quantities.py",
-    "model_bundle.py",
     "models_3d.py",
     "obstacle_dataset.py",
     "obstacle_solver.py",
@@ -793,7 +797,7 @@ def validate_security_artifacts(resources: Path) -> list[str]:
     else:
         errors.append("model trust contract must be an object")
 
-    model_bundle_path = resources / "research/model_bundle.py"
+    model_bundle_path = resources / "engine/model_bundle.py"
     try:
         tree = ast.parse(model_bundle_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, SyntaxError) as error:
@@ -1378,6 +1382,8 @@ def validate_bundle(
 
     required_resources = [
         resources / "ReynStudio.icns",
+        resources / "LICENSE",
+        resources / "NOTICE",
         resources / "runtime-requirements.json",
         resources / "release-manifest.json",
         *(resources / "docs" / name for name in DOCUMENTATION_RESOURCES),

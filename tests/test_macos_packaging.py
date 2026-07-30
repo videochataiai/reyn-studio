@@ -485,7 +485,11 @@ class MacOSPackagingTests(unittest.TestCase):
             }
             return imports & set(local_modules)
 
-        closure = local_imports(ROOT / "engine/reyn_engine.py")
+        engine_modules = {Path(name).stem for name in ENGINE_RESOURCES}
+        closure = (
+            local_imports(ROOT / "engine/reyn_engine.py")
+            | local_imports(ROOT / "engine/model_bundle.py")
+        ) - engine_modules
         pending = list(closure)
         while pending:
             module = pending.pop()
@@ -501,6 +505,7 @@ class MacOSPackagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             resources = Path(directory)
             copy_security_resources(ROOT, resources / "security")
+            copy_engine_resources(ROOT, resources / "engine")
             copy_research_resources(
                 resolve_research_source(ROOT), resources / "research"
             )
@@ -640,12 +645,12 @@ class MacOSPackagingTests(unittest.TestCase):
 
             first = package_input_fingerprint(copied_root, copied_research)
             self.assertRegex(baseline, r"^[0-9a-f]{64}$")
-            (copied_research / "model_bundle.py").write_bytes(b"# changed\n")
+            (copied_root / "engine/model_bundle.py").write_bytes(b"# changed\n")
             self.assertNotEqual(
                 package_input_fingerprint(copied_root, copied_research), first
             )
-            (copied_research / "model_bundle.py").write_bytes(
-                (research_source / "model_bundle.py").read_bytes()
+            (copied_root / "engine/model_bundle.py").write_bytes(
+                (ROOT / "engine/model_bundle.py").read_bytes()
             )
             (packaging / "SBOM.spdx.json").write_bytes(b"{}\n")
             self.assertNotEqual(
@@ -763,6 +768,7 @@ class MacOSPackagingTests(unittest.TestCase):
                 check for check in checks if check.name == "resources"
             )
             self.assertEqual(resource_check.level, "FAIL")
+            self.assertIn("LICENSE", resource_check.detail)
             self.assertIn("engine/reyn_engine.py", resource_check.detail)
             self.assertIn("research/time_moe_operator.py", resource_check.detail)
             manifest_check = next(
@@ -783,6 +789,8 @@ class MacOSPackagingTests(unittest.TestCase):
             with (contents / "Info.plist").open("wb") as stream:
                 plistlib.dump(info_plist(self.config, "1"), stream)
             (resources / "ReynStudio.icns").write_bytes(b"icns fixture")
+            (resources / "LICENSE").write_bytes((ROOT / "LICENSE").read_bytes())
+            (resources / "NOTICE").write_bytes((ROOT / "NOTICE").read_bytes())
             copy_documentation_resources(ROOT, resources / "docs")
             copy_engine_resources(ROOT, resources / "engine")
             copy_research_resources(

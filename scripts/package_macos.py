@@ -52,6 +52,8 @@ def release_input_fingerprint(root: Path) -> str:
     candidates = [
         root / "Cargo.toml",
         root / "Cargo.lock",
+        root / "LICENSE",
+        root / "NOTICE",
         root / "PRD.md",
         root / "build.rs",
         root / "rust-toolchain",
@@ -77,6 +79,8 @@ def package_input_fingerprint(root: Path, research_source: Path) -> str:
         *(("studio", path) for path in (
             root / "Cargo.toml",
             root / "Cargo.lock",
+            root / "LICENSE",
+            root / "NOTICE",
             root / "PRD.md",
             root / "build.rs",
             root / "rust-toolchain",
@@ -299,6 +303,8 @@ def package(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         shutil.copy2(icon_source, resources / "ReynStudio.icns")
+        shutil.copy2(root / "LICENSE", resources / "LICENSE")
+        shutil.copy2(root / "NOTICE", resources / "NOTICE")
         copy_documentation_resources(root, resources / "docs")
         copy_engine_resources(root, resources / "engine")
         copy_research_resources(research_source, resources / "research")

@@ -31,6 +31,15 @@ pub enum ComputeDevice {
 
 impl ComputeDevice {
     pub const ALL: [Self; 3] = [Self::Auto, Self::Mps, Self::Cpu];
+    const WINDOWS: [Self; 2] = [Self::Auto, Self::Cpu];
+
+    pub fn available() -> &'static [Self] {
+        if cfg!(target_os = "macos") {
+            &Self::ALL
+        } else {
+            &Self::WINDOWS
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -436,6 +445,9 @@ impl AppSettings {
     /// or older settings file can never push the UI into a broken state.
     pub fn normalize(&mut self) {
         self.migrate_legacy_model_defaults();
+        if !cfg!(target_os = "macos") && self.compute_device == ComputeDevice::Mps {
+            self.compute_device = ComputeDevice::Cpu;
+        }
         self.significant_digits = self
             .significant_digits
             .clamp(units::MIN_SIGNIFICANT_DIGITS, units::MAX_SIGNIFICANT_DIGITS);
@@ -475,6 +487,8 @@ impl AppSettings {
             research_dir: self.research_dir.clone(),
             python_path: self.python_path.clone(),
             device: self.compute_device.engine_value().into(),
+            #[cfg(test)]
+            engine_script: None,
         }
     }
 
@@ -614,13 +628,68 @@ fn migrate_legacy_model_id(model: &mut String, fallback: &str) -> bool {
     }
 }
 
-fn default_project_directory() -> String {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Documents/Reyn Studio Projects"))
+fn project_directory_from(
+    documents: Option<PathBuf>,
+    profile: Option<std::ffi::OsString>,
+) -> PathBuf {
+    documents
+        .or_else(|| {
+            profile
+                .map(PathBuf::from)
+                .map(|home| home.join("Documents"))
+        })
+        .map(|documents| documents.join("Reyn Studio Projects"))
         .unwrap_or_else(|| PathBuf::from("Reyn Studio Projects"))
-        .display()
-        .to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_documents_directory() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+
+    let mut raw = std::ptr::null_mut();
+    let result =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut raw) };
+    if result < 0 || raw.is_null() {
+        return None;
+    }
+    let mut length = 0usize;
+    unsafe {
+        while *raw.add(length) != 0 {
+            length += 1;
+        }
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(raw, length)
+    }));
+    unsafe {
+        CoTaskMemFree(raw.cast());
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn default_project_directory() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return project_directory_from(
+            windows_documents_directory(),
+            std::env::var_os("USERPROFILE"),
+        )
+        .to_string_lossy()
+        .into_owned();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        project_directory_from(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join("Documents")),
+            None,
+        )
+        .to_string_lossy()
+        .into_owned()
+    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -635,7 +704,7 @@ pub fn config_path() -> Option<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA")
+        return std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .map(|path| path.join("Reyn Studio/settings.json"));
     }
@@ -1109,7 +1178,11 @@ fn category_compute(
         setting_row_reset(
             ui,
             "Compute device",
-            "Reloads the Python sidecar; Automatic prefers Metal on Apple Silicon.",
+            if cfg!(target_os = "macos") {
+                "Reloads the Python sidecar; Automatic prefers Metal on Apple Silicon."
+            } else {
+                "Reloads the bundled Python sidecar. Windows preview supports Automatic and CPU only; CUDA is not qualified."
+            },
             &mut draft.compute_device,
             AppSettings::default().compute_device,
             |ui, value| {
@@ -1117,7 +1190,7 @@ fn category_compute(
                     .selected_text(value.label())
                     .width(190.0)
                     .show_ui(ui, |ui| {
-                        for device in ComputeDevice::ALL {
+                        for &device in ComputeDevice::available() {
                             ui.selectable_value(value, device, device.label());
                         }
                     });
@@ -1843,6 +1916,28 @@ fn preset_summary(preset: &OperatingPointPreset) -> String {
     )
 }
 
+fn shortcut_labels(
+    is_macos: bool,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if is_macos {
+        ("⌘Z", "⇧⌘Z", "⌘", "⇧⌘", "⌘W / ⌘Q")
+    } else {
+        (
+            "Ctrl+Z",
+            "Ctrl+Shift+Z / Ctrl+Y",
+            "Ctrl+",
+            "Ctrl+Shift+",
+            "Ctrl+W / Alt+F4",
+        )
+    }
+}
+
 fn category_shortcuts(ui: &mut egui::Ui, draft: &mut AppSettings) {
     section(ui, "Keyboard reference", |ui| {
         ui.label(
@@ -1851,28 +1946,37 @@ fn category_shortcuts(ui: &mut egui::Ui, draft: &mut AppSettings) {
                 .color(TEXT_MUTE),
         );
         ui.add_space(8.0);
-        let (undo_keys, redo_keys) = if cfg!(target_os = "macos") {
-            ("⌘Z", "⇧⌘Z")
-        } else {
-            ("Ctrl+Z", "Ctrl+Shift+Z / Ctrl+Y")
-        };
-        let mut rows: Vec<(String, String)> = [
-            ("⌘K", "Command palette — navigate or act"),
+        let (undo_keys, redo_keys, primary, shift_primary, close_keys) =
+            shortcut_labels(cfg!(target_os = "macos"));
+        let mut rows: Vec<(String, String)> = vec![
             (
-                undo_keys,
-                "Undo the last safe Case Setup draft edit (immutable identity excluded)",
+                format!("{primary}K"),
+                "Command palette — navigate or act".into(),
             ),
-            (redo_keys, "Redo the last safe Case Setup draft edit"),
-            ("⌘N", "New project (guarded by unsaved changes)"),
-            ("⌘O", "Open project…"),
-            ("⌘S", "Save project"),
-            ("⇧⌘S", "Save project as…"),
-            ("⌘W / ⌘Q", "Close / quit through the unsaved-changes guard"),
-            ("⌘+ / ⌘− / ⌘0", "Interface zoom in / out / reset (live)"),
-        ]
-        .into_iter()
-        .map(|(keys, description)| (keys.to_owned(), description.to_owned()))
-        .collect();
+            (
+                undo_keys.into(),
+                "Undo the last safe Case Setup draft edit (immutable identity excluded)".into(),
+            ),
+            (
+                redo_keys.into(),
+                "Redo the last safe Case Setup draft edit".into(),
+            ),
+            (
+                format!("{primary}N"),
+                "New project (guarded by unsaved changes)".into(),
+            ),
+            (format!("{primary}O"), "Open project…".into()),
+            (format!("{primary}S"), "Save project".into()),
+            (format!("{shift_primary}S"), "Save project as…".into()),
+            (
+                close_keys.into(),
+                "Close / quit through the unsaved-changes guard".into(),
+            ),
+            (
+                format!("{primary}+ / {primary}− / {primary}0"),
+                "Interface zoom in / out / reset (live)".into(),
+            ),
+        ];
         if draft.developer_research_sandbox {
             rows.push((
                 "G".into(),
@@ -1980,6 +2084,18 @@ fn category_signing(
     state: &mut SettingsUiState,
     action: &mut Option<SettingsAction>,
 ) {
+    if !cfg!(target_os = "macos") {
+        section(ui, "Signing & integrity", |ui| {
+            ui.label(
+                RichText::new(
+                    "Evidence signing is unavailable in the Windows preview. Reyn does not store private keys in an unprotected file or present macOS Keychain controls on Windows.",
+                )
+                .text_style(body())
+                .color(TEXT_DIM),
+            );
+        });
+        return;
+    }
     section(ui, "Signing & integrity", |ui| {
         let key_state = if draft.signing_key_is_revoked() {
             ("REVOKED", DATA_RED)
@@ -2648,6 +2764,62 @@ pub fn case_template_file_name(template: &CaseTemplate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        ignore = "requires the Windows Known Folder API"
+    )]
+    fn windows_known_folder_api_returns_a_usable_native_path() {
+        #[cfg(target_os = "windows")]
+        {
+            let documents = windows_documents_directory()
+                .expect("SHGetKnownFolderPath should return the current Documents folder");
+            assert!(
+                documents.is_absolute(),
+                "Documents Known Folder path must be absolute: {documents:?}"
+            );
+
+            let project_directory = project_directory_from(Some(documents.clone()), None);
+            assert!(
+                project_directory.is_absolute(),
+                "derived project directory must stay absolute: {project_directory:?}"
+            );
+            assert_eq!(project_directory.parent(), Some(documents.as_path()));
+            assert_eq!(
+                project_directory.file_name(),
+                Some(std::ffi::OsStr::new("Reyn Studio Projects"))
+            );
+        }
+    }
+
+    #[test]
+    fn windows_project_directory_prefers_known_folder_and_has_safe_fallbacks() {
+        let documents = PathBuf::from(r"C:\Users\Renée Doe\Cloud Documents");
+        let profile = PathBuf::from(r"C:\Users\Renée Doe");
+        assert_eq!(
+            project_directory_from(Some(documents.clone()), Some(r"C:\Users\ignored".into()),),
+            documents.join("Reyn Studio Projects")
+        );
+        assert_eq!(
+            project_directory_from(None, Some(profile.clone().into_os_string())),
+            profile.join("Documents").join("Reyn Studio Projects")
+        );
+        assert_eq!(
+            project_directory_from(None, None),
+            PathBuf::from("Reyn Studio Projects")
+        );
+        assert_eq!(
+            shortcut_labels(false),
+            (
+                "Ctrl+Z",
+                "Ctrl+Shift+Z / Ctrl+Y",
+                "Ctrl+",
+                "Ctrl+Shift+",
+                "Ctrl+W / Alt+F4",
+            )
+        );
+    }
 
     #[test]
     fn settings_layout_protects_narrow_content_widths() {

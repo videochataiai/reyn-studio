@@ -527,7 +527,16 @@ def benchmark_cell_evidence(prediction, truth, initial):
 class Engine:
     def __init__(self, research_dir, requested_device="auto"):
         self.research_dir = str(Path(research_dir).expanduser().resolve())
-        sys.path.insert(0, research_dir)
+        engine_dir = str(Path(__file__).resolve().parent)
+        sys.path[:] = [
+            engine_dir,
+            self.research_dir,
+            *[
+                entry
+                for entry in sys.path
+                if entry not in {engine_dir, self.research_dir}
+            ],
+        ]
         os.chdir(research_dir)
         import torch  # noqa: imported lazily so startup errors are reported cleanly
         self.torch = torch
