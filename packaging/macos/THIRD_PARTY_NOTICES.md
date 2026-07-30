@@ -69,5 +69,22 @@ licenses.
 
 Copyright (c) 2001-2026 Python Software Foundation; all rights reserved.
 
+## Locked transitive runtime distributions
+
+The exact runtime additionally contains:
+
+- cffi 2.1.0 — MIT
+- filelock 3.32.2 — Unlicense
+- fsspec 2026.7.0 — BSD-3-Clause
+- Jinja2 3.1.6 — BSD-3-Clause
+- MarkupSafe 3.0.3 — BSD-3-Clause
+- mpmath 1.3.0 — BSD-3-Clause
+- networkx 3.6.1 — BSD-3-Clause
+- pycparser 3.0 — BSD-3-Clause
+- setuptools 83.0.0 — MIT
+- sympy 1.14.0 — BSD-3-Clause
+- typing-extensions 4.16.0 — PSF-2.0
+- urllib3 2.7.0 — MIT
+
 The full license texts accompany the upstream distributions in the factory
 runtime. This notice is an inventory and attribution index.

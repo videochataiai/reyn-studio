@@ -244,6 +244,10 @@ pub struct Field2D {
 }
 
 pub enum Cmd {
+    WithContext {
+        request: RequestContext,
+        command: Box<Cmd>,
+    },
     ListModels,
     ImportModel {
         path: String,
@@ -298,6 +302,58 @@ pub enum Cmd {
         seed: u32,
         horizon: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestKind {
+    ListModels,
+    ImportModel,
+    DeleteModel,
+    Predict,
+    Predict2D,
+    PredictIc,
+    CadPredict,
+    RunBenchmark,
+    InspectBenchmarkCell,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestContext {
+    pub id: String,
+    pub kind: RequestKind,
+}
+
+impl Cmd {
+    fn request_context(&self) -> RequestContext {
+        let (kind, existing_id) = match self {
+            Self::WithContext { request, .. } => return request.clone(),
+            Self::ListModels => (RequestKind::ListModels, None),
+            Self::ImportModel { .. } => (RequestKind::ImportModel, None),
+            Self::DeleteModel { .. } => (RequestKind::DeleteModel, None),
+            Self::Predict { .. } => (RequestKind::Predict, None),
+            Self::Predict2D { .. } => (RequestKind::Predict2D, None),
+            Self::PredictIC { .. } => (RequestKind::PredictIc, None),
+            Self::CadPredict { request_id, .. } => {
+                (RequestKind::CadPredict, Some(request_id.clone()))
+            }
+            Self::RunBenchmark { .. } => (RequestKind::RunBenchmark, None),
+            Self::InspectBenchmarkCell { .. } => (RequestKind::InspectBenchmarkCell, None),
+        };
+        RequestContext {
+            id: existing_id.unwrap_or_else(|| format!("engine-{}", uuid::Uuid::new_v4())),
+            kind,
+        }
+    }
+
+    fn into_request(self) -> (RequestContext, Cmd) {
+        match self {
+            Self::WithContext { request, command } => (request, *command),
+            command => {
+                let request = command.request_context();
+                (request, command)
+            }
+        }
+    }
 }
 
 /// CAD prediction: model velocity + recovered pressure + the smoothed mask.
@@ -407,6 +463,10 @@ pub struct BenchInspector {
 }
 
 pub enum Msg {
+    Correlated {
+        request: RequestContext,
+        response: Box<Msg>,
+    },
     Status(String),
     Models(Vec<ModelCard>),
     ModelImported {
@@ -490,6 +550,17 @@ impl Drop for EngineHandle {
 }
 
 impl EngineHandle {
+    /// Queue a request with an identity allocated before dispatch so callers
+    /// can match the eventual response to the exact pending UI operation.
+    pub fn send(&self, command: Cmd) -> Result<RequestContext, std::sync::mpsc::SendError<Cmd>> {
+        let request = command.request_context();
+        self.tx.send(Cmd::WithContext {
+            request: request.clone(),
+            command: Box::new(command),
+        })?;
+        Ok(request)
+    }
+
     /// Interrupt any blocking request, join the worker, and terminate the
     /// sidecar process before returning. Safe to call more than once.
     pub fn terminate(&mut self) {
@@ -539,8 +610,9 @@ fn bundle_resources_for(current_exe: &Path, platform: &str) -> Option<PathBuf> {
     ) {
         let directory = current_exe.parent()?;
         let resources = directory.join("resources");
-        return (resources.is_dir() || directory.join("release-manifest.json").is_file())
-            .then_some(resources);
+        if resources.is_dir() || directory.join("release-manifest.json").is_file() {
+            return Some(resources);
+        }
     }
     let macos = current_exe.parent()?;
     let contents = macos.parent()?;
@@ -1002,38 +1074,38 @@ fn worker(
     let (ref mut conn, ref health, ref mut child) = conn;
     let mut recorded_runtime_success = false;
     while let Ok(cmd) = cmd_rx.recv() {
+        let (request_context, cmd) = cmd.into_request();
         let res = match cmd {
+            Cmd::WithContext { .. } => Err(std::io::Error::other("nested engine request context")),
             Cmd::ListModels => request(conn, r#"{"op":"list_models"}"#.into(), &[])
                 .map(|(j, _)| Msg::Models(parse_model_cards(&j["models"]))),
             Cmd::ImportModel { path } => {
                 if !is_model_bundle_id(&path) {
                     let validation = model_format_rejection(&path);
-                    let _ = msg_tx.send(Msg::ModelImportRejected(validation));
-                    continue;
-                }
-                if let Err(error) = require_model_signature(&path) {
+                    Ok(Msg::ModelImportRejected(validation))
+                } else if let Err(error) = require_model_signature(&path) {
                     let validation = model_signature_rejection(&path, &error);
-                    let _ = msg_tx.send(Msg::ModelImportRejected(validation));
-                    continue;
-                }
-                let req = serde_json::json!({"op": "import_model", "path": path}).to_string();
-                request(conn, req, &[]).map(|(j, _)| {
-                    if !j["ok"].as_bool().unwrap_or(false) {
-                        if let Some(validation) = parse_model_validation(&j["validation"]) {
-                            return Msg::ModelImportRejected(validation);
+                    Ok(Msg::ModelImportRejected(validation))
+                } else {
+                    let req = serde_json::json!({"op": "import_model", "path": path}).to_string();
+                    request(conn, req, &[]).map(|(j, _)| {
+                        if !j["ok"].as_bool().unwrap_or(false) {
+                            if let Some(validation) = parse_model_validation(&j["validation"]) {
+                                return Msg::ModelImportRejected(validation);
+                            }
+                            return Msg::Error(
+                                j["error"].as_str().unwrap_or("model import failed").into(),
+                            );
                         }
-                        return Msg::Error(
-                            j["error"].as_str().unwrap_or("model import failed").into(),
-                        );
-                    }
-                    let Some(model) = parse_model_card(&j["imported"]) else {
-                        return Msg::Error("model import returned malformed metadata".into());
-                    };
-                    Msg::ModelImported {
-                        model,
-                        models: parse_model_cards(&j["models"]),
-                    }
-                })
+                        let Some(model) = parse_model_card(&j["imported"]) else {
+                            return Msg::Error("model import returned malformed metadata".into());
+                        };
+                        Msg::ModelImported {
+                            model,
+                            models: parse_model_cards(&j["models"]),
+                        }
+                    })
+                }
             }
             Cmd::DeleteModel { model } => {
                 let req = serde_json::json!({"op": "delete_model", "model": model}).to_string();
@@ -1249,7 +1321,7 @@ fn worker(
             }
         }
         let crash = res.as_ref().err().map(ToString::to_string);
-        let _ = msg_tx.send(res.unwrap_or_else(|error| {
+        let response = res.unwrap_or_else(|error| {
             let prefix = if matches!(
                 error.kind(),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
@@ -1259,7 +1331,11 @@ fn worker(
                 "engine io"
             };
             Msg::Error(format!("{prefix}: {error}"))
-        }));
+        });
+        let _ = msg_tx.send(Msg::Correlated {
+            request: request_context,
+            response: Box::new(response),
+        });
         if let Some(detail) = crash {
             if let Some(health) = health.as_ref() {
                 let _ = runtime::record_runtime_failure(
@@ -1904,7 +1980,8 @@ mod tests {
             assert!(matches!(dimension, 2 | 3));
             let temp = TempFixture::new(&format!("verified-{dimension}d"));
             let defaults = EngineConfig::default();
-            let source_research = PathBuf::from(&defaults.research_dir);
+            let source_research = nonempty_env("REYN_RESEARCH_SOURCE_DIR")
+                .unwrap_or_else(|| PathBuf::from(&defaults.research_dir));
             let source_engine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine");
             let research = temp.root.join("research");
             let engine = temp.root.join("engine");
@@ -2060,9 +2137,15 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
     fn wait_for(h: &EngineHandle, pred: impl Fn(&Msg) -> bool, secs: u64) -> Option<Msg> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
-            if let Ok(m) = h.rx.recv_timeout(Duration::from_millis(200)) {
-                if pred(&m) {
-                    return Some(m);
+            if let Ok(message) = h.rx.recv_timeout(Duration::from_millis(200)) {
+                match message {
+                    Msg::Correlated { response, .. } if pred(&response) => {
+                        return Some(*response);
+                    }
+                    uncorrelated if pred(&uncorrelated) => {
+                        return Some(uncorrelated);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2216,8 +2299,20 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         let error = resolve_engine_script_at(&executable, &developer_dir, None, None).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("Python sidecar is missing"));
-        assert!(message.contains("Contents/Resources/engine/reyn_engine.py"));
-        assert!(!message.contains("developer-checkout/engine/reyn_engine.py"));
+        assert!(message.contains(
+            &fixture
+                .root
+                .join("Reyn Studio.app/Contents/Resources/engine/reyn_engine.py")
+                .display()
+                .to_string()
+        ));
+        assert!(!message.contains(
+            &fixture
+                .root
+                .join("developer-checkout/engine/reyn_engine.py")
+                .display()
+                .to_string()
+        ));
     }
 
     #[test]

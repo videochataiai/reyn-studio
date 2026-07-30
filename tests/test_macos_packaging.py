@@ -58,6 +58,7 @@ from macos_packaging import (  # noqa: E402
     validate_resource_metadata,
     validate_runtime_contract,
     validate_runtime_dependency_lock,
+    validate_runtime_sboms,
     validate_factory_runtime_manifest,
     validate_model_assets,
     validate_security_artifacts,
@@ -540,21 +541,48 @@ class MacOSPackagingTests(unittest.TestCase):
             [],
         )
         self.assertEqual(validate_runtime_dependency_lock(ROOT), [])
+        self.assertEqual(validate_runtime_sboms(ROOT), [])
         pins = load_macos_release_pins(ROOT)
         self.assertRegex(pins["research_revision"], r"^[0-9a-f]{40}$")
         self.assertEqual(pins["runtime_architecture"], "arm64")
+        locked_names = {
+            distribution["name"]
+            for distribution in json.loads(
+                (ROOT / "packaging/macos/python-runtime.lock.json").read_text()
+            )["distributions"]
+        }
         for name in (
             "cryptography",
             "safetensors",
             "securesystemslib",
             "python-tuf",
         ):
-            self.assertIn(
-                name,
-                json.loads(
-                    (ROOT / "packaging/macos/python-runtime.lock.json").read_text()
-                )["distributions"],
-            )
+            self.assertIn(name, locked_names)
+
+    def test_spdx_and_cyclonedx_cover_every_locked_distribution(self):
+        lock = json.loads(
+            (ROOT / "packaging/macos/python-runtime.lock.json").read_text()
+        )
+        expected = {
+            (distribution["name"], distribution["version"])
+            for distribution in lock["distributions"]
+        }
+        spdx = json.loads((ROOT / "packaging/macos/SBOM.spdx.json").read_text())
+        cyclonedx = json.loads(
+            (ROOT / "packaging/macos/runtime-sbom.cdx.json").read_text()
+        )
+        spdx_inventory = {
+            (package["name"], package["versionInfo"])
+            for package in spdx["packages"]
+            if package["name"] != "Reyn Studio"
+        }
+        cyclonedx_inventory = {
+            (component["name"], component["version"])
+            for component in cyclonedx["components"]
+        }
+        self.assertEqual(spdx_inventory, expected)
+        self.assertEqual(cyclonedx_inventory, expected)
+        self.assertEqual(len(spdx_inventory), len(lock["distributions"]))
 
     def test_research_lock_requires_the_full_security_runtime_closure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -602,9 +630,11 @@ class MacOSPackagingTests(unittest.TestCase):
                     (resources / folder / name).write_text(name, encoding="utf-8")
             observed = {
                 "architecture": "arm64",
-                **{
+                "Python": RUNTIME_DEPENDENCIES["Python"][0],
+                "distributions": {
                     name: version
                     for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+                    if name != "Python"
                 },
                 "prefix": str((root / "factory").resolve()),
             }
@@ -914,9 +944,11 @@ class MacOSPackagingTests(unittest.TestCase):
             runtime_destination = contents / "Frameworks/ReynPython"
             observed = {
                 "architecture": "arm64",
-                **{
+                "Python": RUNTIME_DEPENDENCIES["Python"][0],
+                "distributions": {
                     name: version
                     for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+                    if name != "Python"
                 },
                 "prefix": str(runtime_destination.resolve()),
             }

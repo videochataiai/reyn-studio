@@ -7,7 +7,7 @@
     ]
   },
   "dataLicense": "CC0-1.0",
-  "documentNamespace": "https://reyn.studio/spdx/reyn-studio-0.1.1-macos-python-runtime-v2",
+  "documentNamespace": "https://reyn.studio/spdx/reyn-studio-0.1.1-macos-python-runtime-v3",
   "name": "Reyn Studio 0.1.1 macOS arm64 Python runtime inventory",
   "packages": [
     {
@@ -22,7 +22,7 @@
     },
     {
       "SPDXID": "SPDXRef-Package-Python",
-      "comment": "Bundled arm64 factory interpreter.",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://www.python.org/downloads/",
       "filesAnalyzed": false,
       "licenseConcluded": "PSF-2.0",
@@ -31,8 +31,18 @@
       "versionInfo": "3.14.6"
     },
     {
+      "SPDXID": "SPDXRef-Package-cffi",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/cffi/2.1.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "cffi",
+      "versionInfo": "2.1.0"
+    },
+    {
       "SPDXID": "SPDXRef-Package-cryptography",
-      "comment": "Bundled arm64 factory-runtime dependency.",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://pypi.org/project/cryptography/49.0.0/",
       "filesAnalyzed": false,
       "licenseConcluded": "Apache-2.0 OR BSD-3-Clause",
@@ -41,8 +51,68 @@
       "versionInfo": "49.0.0"
     },
     {
-      "SPDXID": "SPDXRef-Package-numpy",
-      "comment": "Bundled arm64 factory-runtime dependency.",
+      "SPDXID": "SPDXRef-Package-filelock",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/filelock/3.32.2/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Unlicense",
+      "licenseDeclared": "Unlicense",
+      "name": "filelock",
+      "versionInfo": "3.32.2"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-fsspec",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/fsspec/2026.7.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "fsspec",
+      "versionInfo": "2026.7.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-Jinja2",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/jinja2/3.1.6/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "Jinja2",
+      "versionInfo": "3.1.6"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-MarkupSafe",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/markupsafe/3.0.3/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "MarkupSafe",
+      "versionInfo": "3.0.3"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-mpmath",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/mpmath/1.3.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "mpmath",
+      "versionInfo": "1.3.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-networkx",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/networkx/3.6.1/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "networkx",
+      "versionInfo": "3.6.1"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-NumPy",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://pypi.org/project/numpy/2.5.1/",
       "filesAnalyzed": false,
       "licenseConcluded": "BSD-3-Clause",
@@ -51,8 +121,18 @@
       "versionInfo": "2.5.1"
     },
     {
+      "SPDXID": "SPDXRef-Package-pycparser",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/pycparser/3.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "pycparser",
+      "versionInfo": "3.0"
+    },
+    {
       "SPDXID": "SPDXRef-Package-safetensors",
-      "comment": "Bundled arm64 factory-runtime dependency.",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://pypi.org/project/safetensors/0.8.0/",
       "filesAnalyzed": false,
       "licenseConcluded": "Apache-2.0",
@@ -62,7 +142,7 @@
     },
     {
       "SPDXID": "SPDXRef-Package-securesystemslib",
-      "comment": "Bundled arm64 factory-runtime dependency of python-tuf.",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://pypi.org/project/securesystemslib/1.4.0/",
       "filesAnalyzed": false,
       "licenseConcluded": "MIT",
@@ -71,8 +151,28 @@
       "versionInfo": "1.4.0"
     },
     {
-      "SPDXID": "SPDXRef-Package-torch",
-      "comment": "Bundled arm64 factory-runtime dependency.",
+      "SPDXID": "SPDXRef-Package-setuptools",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/setuptools/83.0.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "setuptools",
+      "versionInfo": "83.0.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-sympy",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/sympy/1.14.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "sympy",
+      "versionInfo": "1.14.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-PyTorch",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://pypi.org/project/torch/2.13.0/",
       "filesAnalyzed": false,
       "licenseConcluded": "BSD-3-Clause",
@@ -81,14 +181,34 @@
       "versionInfo": "2.13.0"
     },
     {
-      "SPDXID": "SPDXRef-Package-tuf",
-      "comment": "Bundled arm64 factory-runtime dependency.",
+      "SPDXID": "SPDXRef-Package-python-tuf",
+      "comment": "Bundled arm64 factory-runtime distribution.",
       "downloadLocation": "https://pypi.org/project/tuf/7.0.0/",
       "filesAnalyzed": false,
       "licenseConcluded": "MIT",
       "licenseDeclared": "MIT",
       "name": "python-tuf",
       "versionInfo": "7.0.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-typing-extensions",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/typing-extensions/4.16.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "PSF-2.0",
+      "licenseDeclared": "PSF-2.0",
+      "name": "typing-extensions",
+      "versionInfo": "4.16.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-urllib3",
+      "comment": "Bundled arm64 factory-runtime distribution.",
+      "downloadLocation": "https://pypi.org/project/urllib3/2.7.0/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "urllib3",
+      "versionInfo": "2.7.0"
     }
   ],
   "relationships": [
@@ -98,12 +218,52 @@
       "spdxElementId": "SPDXRef-Package-ReynStudio"
     },
     {
+      "relatedSpdxElement": "SPDXRef-Package-cffi",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
       "relatedSpdxElement": "SPDXRef-Package-cryptography",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-ReynStudio"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-numpy",
+      "relatedSpdxElement": "SPDXRef-Package-filelock",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-fsspec",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-Jinja2",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-MarkupSafe",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-mpmath",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-networkx",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-NumPy",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-pycparser",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-ReynStudio"
     },
@@ -113,19 +273,39 @@
       "spdxElementId": "SPDXRef-Package-ReynStudio"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-torch",
-      "relationshipType": "DEPENDS_ON",
-      "spdxElementId": "SPDXRef-Package-ReynStudio"
-    },
-    {
-      "relatedSpdxElement": "SPDXRef-Package-tuf",
-      "relationshipType": "DEPENDS_ON",
-      "spdxElementId": "SPDXRef-Package-ReynStudio"
-    },
-    {
       "relatedSpdxElement": "SPDXRef-Package-securesystemslib",
       "relationshipType": "DEPENDS_ON",
-      "spdxElementId": "SPDXRef-Package-tuf"
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-setuptools",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-sympy",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-PyTorch",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-python-tuf",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-typing-extensions",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-urllib3",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-ReynStudio"
     }
   ],
   "spdxVersion": "SPDX-2.3"

@@ -3063,7 +3063,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "reyn-settings-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let path = root.join("settings.json");
         let settings = AppSettings {
@@ -3221,7 +3224,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "reyn-settings-model-migration-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let path = root.join("settings.json");
         std::fs::create_dir_all(&root).unwrap();

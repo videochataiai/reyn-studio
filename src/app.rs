@@ -532,6 +532,71 @@ enum CadResultDisposition {
     DiscardStale,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineErrorDisposition {
+    CurrentRun,
+    Preview(u32),
+    Field2D,
+    Benchmark,
+    BenchmarkInspector,
+    Library(engine::RequestKind),
+    Global,
+    DiscardStale,
+}
+
+fn classify_engine_error(
+    request: Option<&engine::RequestContext>,
+    preview_fetch: Option<(u32, &str)>,
+    pending_run: Option<&str>,
+) -> EngineErrorDisposition {
+    let Some(request) = request else {
+        return EngineErrorDisposition::Global;
+    };
+    match request.kind {
+        engine::RequestKind::CadPredict => {
+            if pending_run == Some(request.id.as_str()) {
+                EngineErrorDisposition::CurrentRun
+            } else if let Some((step, fetching)) = preview_fetch {
+                if fetching == request.id {
+                    EngineErrorDisposition::Preview(step)
+                } else {
+                    EngineErrorDisposition::DiscardStale
+                }
+            } else {
+                EngineErrorDisposition::DiscardStale
+            }
+        }
+        engine::RequestKind::Predict2D | engine::RequestKind::PredictIc => {
+            EngineErrorDisposition::Field2D
+        }
+        engine::RequestKind::RunBenchmark => EngineErrorDisposition::Benchmark,
+        engine::RequestKind::InspectBenchmarkCell => EngineErrorDisposition::BenchmarkInspector,
+        engine::RequestKind::ListModels
+        | engine::RequestKind::ImportModel
+        | engine::RequestKind::DeleteModel => EngineErrorDisposition::Library(request.kind),
+        engine::RequestKind::Predict => EngineErrorDisposition::Global,
+    }
+}
+
+fn library_response_is_current(
+    pending: Option<&engine::RequestContext>,
+    request: Option<&engine::RequestContext>,
+) -> bool {
+    pending
+        .zip(request)
+        .is_some_and(|(pending, request)| pending == request)
+}
+
+fn engine_error_is_stale(
+    disposition: EngineErrorDisposition,
+    pending_library: Option<&engine::RequestContext>,
+    request: Option<&engine::RequestContext>,
+) -> bool {
+    disposition == EngineErrorDisposition::DiscardStale
+        || matches!(disposition, EngineErrorDisposition::Library(_))
+            && !library_response_is_current(pending_library, request)
+}
+
 fn classify_cad_result(
     request_id: &str,
     preview_fetch: Option<(u32, &str)>,
@@ -701,6 +766,7 @@ pub struct ReynApp {
     current_model: String,
     models: Vec<engine::ModelCard>,
     library: library::LibraryState,
+    library_pending_request: Option<engine::RequestContext>,
     settings: settings::AppSettings,
     settings_draft: settings::AppSettings,
     settings_notice: Option<(String, bool)>,
@@ -851,7 +917,7 @@ impl Default for ReynApp {
         let engine = engine::EngineHandle::spawn_with_config(settings.engine_config());
         let current_model = settings.default_3d_model.clone();
         let f2d_model = settings.default_2d_model.clone();
-        let _ = engine.tx.send(engine::Cmd::ListModels);
+        let library_pending_request = engine.send(engine::Cmd::ListModels).ok();
         let next_autosave_utc_unix =
             now.saturating_add(settings.autosave_interval_seconds.max(1) as u64);
         let (screenshot_result_tx, screenshot_result_rx) = std::sync::mpsc::channel();
@@ -879,6 +945,7 @@ impl Default for ReynApp {
             current_model,
             models: Vec::new(),
             library: library::LibraryState::default(),
+            library_pending_request,
             settings_draft: settings.clone(),
             settings,
             settings_notice: settings_warning.map(|warning| (warning, true)),
@@ -1209,7 +1276,15 @@ impl eframe::App for ReynApp {
             };
             engine_messages += 1;
             self.dependencies_dirty = true;
+            let (request_context, msg) = match msg {
+                engine::Msg::Correlated { request, response } => (Some(request), *response),
+                uncorrelated => (None, uncorrelated),
+            };
             match msg {
+                engine::Msg::Correlated { .. } => {
+                    self.engine_status = "○ malformed nested engine response".into();
+                    self.engine_ok = false;
+                }
                 engine::Msg::Status(s) => {
                     self.engine_status = s;
                     self.engine_ok = true;
@@ -1218,11 +1293,25 @@ impl eframe::App for ReynApp {
                     }
                 }
                 engine::Msg::Models(m) => {
+                    if !library_response_is_current(
+                        self.library_pending_request.as_ref(),
+                        request_context.as_ref(),
+                    ) {
+                        continue;
+                    }
                     self.models = m;
                     self.library.busy = false;
+                    self.library_pending_request = None;
                 }
                 engine::Msg::ModelImported { model, models } => {
+                    if !library_response_is_current(
+                        self.library_pending_request.as_ref(),
+                        request_context.as_ref(),
+                    ) {
+                        continue;
+                    }
                     self.library.busy = false;
+                    self.library_pending_request = None;
                     self.library.validation = None;
                     self.library.notice = Some((
                         format!(
@@ -1235,7 +1324,14 @@ impl eframe::App for ReynApp {
                     self.activate_model(&model.id);
                 }
                 engine::Msg::ModelImportRejected(validation) => {
+                    if !library_response_is_current(
+                        self.library_pending_request.as_ref(),
+                        request_context.as_ref(),
+                    ) {
+                        continue;
+                    }
                     self.library.busy = false;
+                    self.library_pending_request = None;
                     // Single owner: the structured-validation panel renders the
                     // rejection (summary + verbatim issue codes) once; a second
                     // notice with the same string would duplicate it (A3).
@@ -1243,7 +1339,14 @@ impl eframe::App for ReynApp {
                     self.library.validation = Some(validation);
                 }
                 engine::Msg::ModelDeleted { model, models } => {
+                    if !library_response_is_current(
+                        self.library_pending_request.as_ref(),
+                        request_context.as_ref(),
+                    ) {
+                        continue;
+                    }
                     self.library.busy = false;
+                    self.library_pending_request = None;
                     self.library.pending_delete = None;
                     self.library.notice = Some((format!("Deleted {model}"), false));
                     self.models = models;
@@ -1503,12 +1606,26 @@ impl eframe::App for ReynApp {
                     self.engine_ok = true;
                 }
                 engine::Msg::Error(e) => {
-                    if let Some(run_id) = self
-                        .cad
-                        .as_ref()
-                        .and_then(|case| case.pending_run.as_ref())
-                        .map(|pending| pending.run_id.clone())
-                    {
+                    let disposition = classify_engine_error(
+                        request_context.as_ref(),
+                        self.cad.as_ref().and_then(|case| {
+                            case.playback
+                                .fetching
+                                .as_ref()
+                                .map(|(step, request_id)| (*step, request_id.as_str()))
+                        }),
+                        self.cad
+                            .as_ref()
+                            .and_then(|case| case.pending_run.as_ref())
+                            .map(|pending| pending.request_id.as_str()),
+                    );
+                    if disposition == EngineErrorDisposition::CurrentRun {
+                        let run_id = self
+                            .cad
+                            .as_ref()
+                            .and_then(|case| case.pending_run.as_ref())
+                            .map(|pending| pending.run_id.clone())
+                            .expect("current-run errors have a matching pending run");
                         let is_timeout = e.to_ascii_lowercase().contains("timed out")
                             || e.to_ascii_lowercase().contains("timeout");
                         let reason = if is_timeout {
@@ -1541,37 +1658,56 @@ impl eframe::App for ReynApp {
                         });
                         continue;
                     }
-                    let inspector_failed = self.bench_inspector_pending;
-                    let suite_failed = self.bench_running;
-                    let library_failed = self.library.busy;
+                    if engine_error_is_stale(
+                        disposition,
+                        self.library_pending_request.as_ref(),
+                        request_context.as_ref(),
+                    ) {
+                        continue;
+                    }
+                    let fatal = e.starts_with("engine io:")
+                        || e.starts_with("engine unavailable:")
+                        || e.starts_with("engine timeout:");
                     self.engine_status = format!("○ {e}");
-                    if e.starts_with("engine io:") || e.starts_with("engine unavailable:") {
+                    if fatal {
                         self.engine_ok = false;
                     }
-                    self.f2d_pending = false;
-                    self.bench_running = false;
-                    self.bench_inspector_pending = false;
-                    self.library.busy = false;
-                    if let Some(case) = &mut self.cad {
-                        if case.pending {
-                            case.pending = false;
-                            case.pending_request_id = None;
-                            case.pending_run = None;
-                            case.workflow.stage = engineering::CaseStage::Ready;
+                    match disposition {
+                        EngineErrorDisposition::Preview(step) => {
+                            if let Some(case) = self.cad.as_mut() {
+                                case.playback.fetching = None;
+                                case.playback.failed.insert(step);
+                                case.playback.playing = false;
+                            }
                         }
-                        // A failed playback fetch is recorded per step so the
-                        // view can say that step is unavailable, not blank out.
-                        if let Some((step, _)) = case.playback.fetching.take() {
-                            case.playback.failed.insert(step);
-                            case.playback.playing = false;
+                        EngineErrorDisposition::Field2D => {
+                            self.f2d_pending = false;
                         }
-                    }
-                    if inspector_failed {
-                        self.bench_inspector_error = Some(e);
-                    } else if suite_failed {
-                        self.bench_error = Some(e);
-                    } else if library_failed {
-                        self.library.notice = Some((e, true));
+                        EngineErrorDisposition::Benchmark => {
+                            self.bench_running = false;
+                            self.bench_error = Some(e);
+                        }
+                        EngineErrorDisposition::BenchmarkInspector => {
+                            self.bench_inspector_pending = false;
+                            self.bench_inspector_error = Some(e);
+                        }
+                        EngineErrorDisposition::Library(kind) => {
+                            if library_response_is_current(
+                                self.library_pending_request.as_ref(),
+                                request_context.as_ref(),
+                            ) && self
+                                .library_pending_request
+                                .as_ref()
+                                .is_some_and(|request| request.kind == kind)
+                            {
+                                self.library.busy = false;
+                                self.library_pending_request = None;
+                                self.library.notice = Some((e, true));
+                            }
+                        }
+                        EngineErrorDisposition::Global => {}
+                        EngineErrorDisposition::DiscardStale => {}
+                        EngineErrorDisposition::CurrentRun => unreachable!(),
                     }
                 }
             }
@@ -1730,6 +1866,69 @@ fn write_calculation_export<W: std::io::Write>(
         )
     })
     .map_err(|error| format!("Calculation export write failed: {error}"))
+}
+
+fn calculation_export_provenance(
+    project_manifest: &project::ProjectManifest,
+    active_run_id: Option<&str>,
+) -> serde_json::Value {
+    let selected = active_run_id.and_then(|run_id| {
+        project_manifest.cases().iter().find_map(|case| {
+            let run = case.runs().iter().find(|run| run.run_id() == run_id)?;
+            let revision = case
+                .revisions()
+                .iter()
+                .find(|revision| revision.case_revision_id == run.case_revision_id())?;
+            Some((case, run, revision))
+        })
+    });
+    let sources = selected
+        .map(|(_, _, revision)| {
+            revision
+                .source_revision_ids
+                .iter()
+                .filter_map(|source_id| {
+                    project_manifest
+                        .source_revisions()
+                        .iter()
+                        .find(|source| source.source_revision_id == *source_id)
+                })
+                .map(|source| {
+                    serde_json::json!({
+                        "source_revision_id": source.source_revision_id,
+                        "source_sha256": source.content_sha256,
+                        "source_kind": source.source_kind,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let solver = selected.and_then(|(_, run, _)| {
+        run.manifest()
+            .solver
+            .as_ref()
+            .or(run.manifest().engine.as_ref())
+    });
+    serde_json::json!({
+        "schema": "reyn_calculation_export.v1",
+        "project_id": project_manifest.project_id(),
+        "case_id": selected.map(|(case, _, _)| case.case_id()),
+        "case_revision_id": selected.map(|(_, run, _)| run.case_revision_id()),
+        "run_id": selected.map(|(_, run, _)| run.run_id()),
+        "parent_run_id": selected.and_then(|(_, run, _)| run.parent_run_id()),
+        "sources": sources,
+        "model_id": selected.and_then(|(_, run, _)| run.manifest().model.as_ref().map(|model| model.name.as_str())),
+        "model_sha256": selected.and_then(|(_, run, _)| run.manifest().model.as_ref().and_then(|model| model.sha256.as_deref())),
+        "solver": solver.map(|component| serde_json::json!({
+            "name": component.name,
+            "version": component.version,
+            "sha256": component.sha256,
+        })),
+        "run_exact_contract": selected.map(|(_, run, _)| &run.manifest().exact_contract),
+        "run_exact_settings": selected.map(|(_, run, _)| &run.manifest().exact_settings),
+        "field_source": "current rendered model field",
+        "limitations": "Viewport diagnostics are display-normalized derived quantities, not solver-reference validation metrics.",
+    })
 }
 
 fn now_utc_unix() -> u64 {
@@ -2117,7 +2316,7 @@ impl ReynApp {
             density_kg_m3: case.workflow.operating.density as f32,
             reference_pressure_pa: case.workflow.operating.reference_pressure as f32,
         };
-        if self.engine.tx.send(request).is_err() {
+        if self.engine.send(request).is_err() {
             case.playback.failed.insert(step);
             self.project_notice = Some(("Engine request channel is unavailable.".into(), true));
             return;
@@ -3018,22 +3217,18 @@ impl ReynApp {
             Vec::new(),
         );
         let case_id = workflow.case_id.clone();
-        if let Err(error) = self.transact_project(
-            "Persisting the immutable run attempt",
-            started_utc_unix,
-            move |project_manifest| {
-                project_manifest.append_run(&case_id, running_attempt, started_utc_unix)
-            },
-        ) {
+        if let Err(error) = self
+            .project_write_access("Persisting the immutable run attempt")
+            .and_then(|()| {
+                self.project
+                    .start_run_attempt_checkpointed(&case_id, running_attempt, started_utc_unix)
+                    .map_err(|error| error.to_string())
+            })
+        {
             self.project_notice = Some((
-                format!("Run did not start because its immutable attempt could not be recorded: {error}"),
-                true,
-            ));
-            return;
-        }
-        if let Err(error) = self.project.checkpoint_recovery(started_utc_unix) {
-            self.project_notice = Some((
-                format!("Run did not start because its recovery checkpoint could not be persisted: {error}"),
+                format!(
+                    "Run did not start because its immutable attempt could not be safely checkpointed: {error}"
+                ),
                 true,
             ));
             return;
@@ -3067,7 +3262,7 @@ impl ReynApp {
             started_at: std::time::Instant::now(),
             manifest,
         });
-        if self.engine.tx.send(request).is_err() {
+        if self.engine.send(request).is_err() {
             let error = "engine request channel unavailable";
             let _ =
                 self.finish_pending_external_flow_attempt(project::LifecycleState::Failed, error);
@@ -3474,7 +3669,7 @@ impl ReynApp {
                 cancel_run = ui
                     .button("Cancel run")
                     .on_hover_text(
-                        "Stop waiting for this run. The engine pass already started cannot be interrupted, but its result is discarded on arrival and never becomes a run, a result, or evidence.",
+                        "Cancel this run, persist the attempt as cancelled, terminate the blocking sidecar, and start a fresh engine for retry. No result evidence is created.",
                     )
                     .clicked();
             });
@@ -6932,6 +7127,7 @@ impl ReynApp {
                 .case_history_gate_reason(CaseHistoryAction::Redo)
                 .is_none(),
             analysis_available: matches!(self.nav, Nav::Case | Nav::Results),
+            fea_export_available: self.cad.as_ref().is_some_and(has_complete_fea_load_field),
             sandbox_enabled: self.settings.developer_research_sandbox,
             sandbox_live: self.live,
             recents: self
@@ -7472,7 +7668,7 @@ impl ReynApp {
                             cancel_run = ui
                                 .small_button("Cancel")
                                 .on_hover_text(
-                                    "Stop waiting for this run. The pass already under way in the engine cannot be interrupted, but its result is discarded on arrival and never becomes evidence.",
+                                    "Persist this attempt as cancelled, terminate the blocking sidecar, and start a fresh engine for retry. No result evidence is created.",
                                 )
                                 .clicked();
                         }
@@ -7537,7 +7733,7 @@ impl ReynApp {
                     .and_then(|name| name.to_str())
                     .unwrap_or("not saved");
                 ui.label(
-                    RichText::new(format!("{project_location} · schema v2"))
+                    RichText::new(format!("{project_location} · schema v3"))
                         .text_style(mono_s())
                         .color(TEXT_MUTE),
                 );
@@ -9700,7 +9896,7 @@ impl ReynApp {
         self.schedule_autosave_from_now();
         self.engine_status = "○ Project context changed · revalidating engine…".into();
         self.library.busy = true;
-        let _ = self.engine.tx.send(engine::Cmd::ListModels);
+        self.library_pending_request = self.engine.send(engine::Cmd::ListModels).ok();
     }
 
     fn prepare_benchmark_case(&mut self, clear_selection: bool) -> Result<String, String> {
@@ -11128,7 +11324,7 @@ impl ReynApp {
     fn regenerate(&mut self) {
         self.seed = self.seed.wrapping_add(1);
         if self.engine_ok {
-            let _ = self.engine.tx.send(engine::Cmd::Predict {
+            let _ = self.engine.send(engine::Cmd::Predict {
                 model: self.current_model.clone(),
                 seed: self.seed,
             });
@@ -11180,7 +11376,7 @@ impl ReynApp {
                 .into(),
             }
         };
-        let _ = self.engine.tx.send(cmd);
+        let _ = self.engine.send(cmd);
         self.f2d_pending = true;
         self.f2d_req_at = Some(std::time::Instant::now());
     }
@@ -11638,9 +11834,12 @@ impl ReynApp {
             self.library.busy = true;
             self.library.validation = None;
             self.library.notice = Some(("Validating model-bundle contract…".into(), false));
-            let _ = self.engine.tx.send(engine::Cmd::ImportModel {
-                path: path.to_string_lossy().into_owned(),
-            });
+            self.library_pending_request = self
+                .engine
+                .send(engine::Cmd::ImportModel {
+                    path: path.to_string_lossy().into_owned(),
+                })
+                .ok();
             self.nav = Nav::Models;
         }
     }
@@ -11656,38 +11855,7 @@ impl ReynApp {
                 .cad
                 .as_ref()
                 .and_then(|case| case.active_run_id.as_deref());
-            let active_run = active_run_id.and_then(|run_id| {
-                self.project
-                    .manifest()
-                    .cases()
-                    .iter()
-                    .flat_map(|case| case.runs())
-                    .find(|run| run.run_id() == run_id)
-            });
-            let solver = active_run.and_then(|run| {
-                run.manifest()
-                    .solver
-                    .as_ref()
-                    .or(run.manifest().engine.as_ref())
-            });
-            let provenance = serde_json::json!({
-                "schema": "reyn_calculation_export.v1",
-                "project_id": self.project.manifest().project_id(),
-                "case_id": self.cad.as_ref().map(|case| case.workflow.case_id.as_str()),
-                "case_revision_id": self.cad.as_ref().and_then(|case| case.workflow.case_revision_id.as_deref()),
-                "run_id": active_run_id,
-                "source_revision_id": self.cad.as_ref().and_then(|case| case.workflow.source_revision_id.as_deref()),
-                "source_sha256": self.cad.as_ref().map(|case| case.workflow.preflight.source_sha256.as_str()),
-                "model_id": self.current_model,
-                "model_sha256": self.cad.as_ref().and_then(|case| case.workflow.model_sha256.as_deref()),
-                "solver": solver.map(|component| serde_json::json!({
-                    "name": component.name,
-                    "version": component.version,
-                    "sha256": component.sha256,
-                })),
-                "field_source": "current rendered model field",
-                "limitations": "Viewport diagnostics are display-normalized derived quantities, not solver-reference validation metrics.",
-            });
+            let provenance = calculation_export_provenance(self.project.manifest(), active_run_id);
             let mut bytes = Vec::new();
             if let Err(error) = write_calculation_export(
                 &mut bytes,
@@ -11813,7 +11981,7 @@ impl ReynApp {
         }
         let persistence = self.persist_model_default(&model.id, model.dimension);
         if self.engine_ok && model.dimension == 3 && self.settings.developer_research_sandbox {
-            let _ = self.engine.tx.send(engine::Cmd::Predict {
+            let _ = self.engine.send(engine::Cmd::Predict {
                 model: self.current_model.clone(),
                 seed: self.seed,
             });
@@ -11851,13 +12019,14 @@ impl ReynApp {
             library::LibraryAction::Delete(model) => {
                 self.library.busy = true;
                 self.library.notice = Some(("Deleting managed model bundle…".into(), false));
-                let _ = self.engine.tx.send(engine::Cmd::DeleteModel { model });
+                self.library_pending_request =
+                    self.engine.send(engine::Cmd::DeleteModel { model }).ok();
             }
             library::LibraryAction::Import => self.import_model(),
             library::LibraryAction::Refresh => {
                 self.library.busy = true;
                 self.library.notice = Some(("Refreshing model-bundle metadata…".into(), false));
-                let _ = self.engine.tx.send(engine::Cmd::ListModels);
+                self.library_pending_request = self.engine.send(engine::Cmd::ListModels).ok();
             }
         }
     }
@@ -12079,7 +12248,7 @@ impl ReynApp {
         self.dependencies_dirty = true;
         self.engine_status = "○ Restarting engine…".into();
         self.library.busy = true;
-        let _ = self.engine.tx.send(engine::Cmd::ListModels);
+        self.library_pending_request = self.engine.send(engine::Cmd::ListModels).ok();
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
@@ -17677,6 +17846,100 @@ mod tests {
         .contains("simulated full disk"));
     }
 
+    #[test]
+    fn calculation_export_keeps_run_model_after_current_model_switches() {
+        let mut project_manifest = project::ProjectManifest::new("Model switch", 1);
+        project_manifest
+            .add_source_revision(
+                project::SourceRevision {
+                    source_revision_id: "source-a".into(),
+                    source_kind: project::SourceKind::Geometry,
+                    revision: 1,
+                    imported_utc_unix: 2,
+                    uri_hint: None,
+                    byte_size: 4,
+                    content_sha256: "a".repeat(64),
+                    declared_units: Some("m".into()),
+                    frame: Some("source_frame".into()),
+                    transform_4x4: [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ],
+                    parent_revision_id: None,
+                    warnings: Vec::new(),
+                },
+                2,
+            )
+            .unwrap();
+        project_manifest
+            .create_case(
+                "case-a",
+                "Case A",
+                project::CaseRevision {
+                    case_revision_id: "revision-a".into(),
+                    parent_revision_id: None,
+                    created_utc_unix: 3,
+                    source_revision_ids: vec!["source-a".into()],
+                    contract: serde_json::json!({"model_id": "model-a.reynmodel"}),
+                    discretization: serde_json::json!({"grid": 64}),
+                    outputs: serde_json::json!({"loads": true}),
+                },
+                3,
+            )
+            .unwrap();
+        project_manifest
+            .append_run(
+                "case-a",
+                project::RunRecord::new(
+                    "run-a",
+                    None,
+                    "revision-a",
+                    4,
+                    5,
+                    project::LifecycleState::Succeeded,
+                    project::RunManifest {
+                        schema_version: project::PROJECT_SCHEMA_VERSION,
+                        app: project::VersionedComponent {
+                            name: "Reyn Studio".into(),
+                            version: "0.1.1".into(),
+                            sha256: None,
+                        },
+                        engine: None,
+                        model: Some(project::VersionedComponent {
+                            name: "model-a.reynmodel".into(),
+                            version: "bundle-v1".into(),
+                            sha256: Some("b".repeat(64)),
+                        }),
+                        solver: None,
+                        converter: None,
+                        exact_contract: serde_json::json!({"model_id": "model-a.reynmodel"}),
+                        exact_settings: serde_json::json!({"submitted_request_id": "request-a"}),
+                        seeds: vec![7],
+                        device: "cpu".into(),
+                        runtime_ms: 1,
+                        stop_reason: "completed".into(),
+                        warnings: Vec::new(),
+                        waivers: Vec::new(),
+                        missing_dependencies: Vec::new(),
+                        output_sha256: vec!["c".repeat(64)],
+                        scalar_outputs: Vec::new(),
+                        determinism: None,
+                    },
+                    Vec::new(),
+                ),
+                5,
+            )
+            .unwrap();
+
+        let current_model_after_switch = "model-b.reynmodel";
+        let provenance = calculation_export_provenance(&project_manifest, Some("run-a"));
+        assert_eq!(current_model_after_switch, "model-b.reynmodel");
+        assert_eq!(provenance["model_id"], "model-a.reynmodel");
+        assert_eq!(provenance["model_sha256"], "b".repeat(64));
+        assert_eq!(provenance["case_revision_id"], "revision-a");
+        assert_eq!(provenance["sources"][0]["source_revision_id"], "source-a");
+    }
+
     fn benchmark_fixture() -> engine::BenchResult {
         engine::BenchResult {
             model: "fixture.reynmodel".into(),
@@ -18039,6 +18302,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failing_uncached_preview_does_not_fail_a_new_run() {
+        let preview = engine::RequestContext {
+            id: "preview-a".into(),
+            kind: engine::RequestKind::CadPredict,
+        };
+        assert_eq!(
+            classify_engine_error(Some(&preview), Some((7, "preview-a")), Some("new-run"),),
+            EngineErrorDisposition::Preview(7)
+        );
+        assert_eq!(
+            classify_cad_result("new-run", None, Some("new-run")),
+            CadResultDisposition::Record
+        );
+    }
+
+    #[test]
+    fn stale_cad_error_after_cancel_and_restart_is_discarded() {
+        let stale = engine::RequestContext {
+            id: "cancelled-generation".into(),
+            kind: engine::RequestKind::CadPredict,
+        };
+        assert_eq!(
+            classify_engine_error(Some(&stale), None, Some("retry-generation")),
+            EngineErrorDisposition::DiscardStale
+        );
+    }
+
+    #[test]
+    fn unrelated_request_failure_cannot_change_current_run() {
+        let list_models = engine::RequestContext {
+            id: "list-models".into(),
+            kind: engine::RequestKind::ListModels,
+        };
+        assert_eq!(
+            classify_engine_error(Some(&list_models), None, Some("run-a")),
+            EngineErrorDisposition::Library(engine::RequestKind::ListModels)
+        );
+        assert_eq!(
+            classify_cad_result("run-a", None, Some("run-a")),
+            CadResultDisposition::Record
+        );
+    }
+
+    #[test]
+    fn stale_list_error_cannot_finish_a_new_import() {
+        let stale_list = engine::RequestContext {
+            id: "list-before-import".into(),
+            kind: engine::RequestKind::ListModels,
+        };
+        let current_import = engine::RequestContext {
+            id: "current-import".into(),
+            kind: engine::RequestKind::ImportModel,
+        };
+        assert!(!library_response_is_current(
+            Some(&current_import),
+            Some(&stale_list),
+        ));
+        assert!(library_response_is_current(
+            Some(&current_import),
+            Some(&current_import),
+        ));
+    }
+
+    #[test]
+    fn stale_list_response_cannot_finish_a_new_list_request() {
+        let stale = engine::RequestContext {
+            id: "list-old".into(),
+            kind: engine::RequestKind::ListModels,
+        };
+        let current = engine::RequestContext {
+            id: "list-new".into(),
+            kind: engine::RequestKind::ListModels,
+        };
+        assert!(!library_response_is_current(Some(&current), Some(&stale)));
+        assert!(library_response_is_current(Some(&current), Some(&current)));
+        assert!(engine_error_is_stale(
+            EngineErrorDisposition::Library(engine::RequestKind::ListModels),
+            Some(&current),
+            Some(&stale),
+        ));
+        assert!(!engine_error_is_stale(
+            EngineErrorDisposition::Library(engine::RequestKind::ListModels),
+            Some(&current),
+            Some(&current),
+        ));
+    }
+
+    #[test]
+    fn successful_run_is_isolated_from_stale_preview_success() {
+        assert_eq!(
+            classify_cad_result("old-preview", Some((5, "different-preview")), Some("run-b"),),
+            CadResultDisposition::DiscardStale
+        );
+        assert_eq!(
+            classify_cad_result("run-b", Some((5, "different-preview")), Some("run-b")),
+            CadResultDisposition::Record
+        );
+    }
+
     /// Horizon previews are cached for instant scrubbing, evicted from the far
     /// end first, and never displace the recorded step.
     #[test]
@@ -18110,6 +18473,24 @@ mod tests {
             pending_run: None,
             playback: HorizonPlayback::default(),
         }
+    }
+
+    #[test]
+    fn fea_menu_predicate_requires_the_complete_load_field() {
+        let complete = playback_case_fixture();
+        assert!(has_complete_fea_load_field(&complete));
+
+        let mut missing_traction = playback_case_fixture();
+        missing_traction.traction.pop();
+        assert!(!has_complete_fea_load_field(&missing_traction));
+
+        let mut preview_only = playback_case_fixture();
+        preview_only.active_run_id = None;
+        assert!(!has_complete_fea_load_field(&preview_only));
+
+        let mut running = playback_case_fixture();
+        running.pending = true;
+        assert!(!has_complete_fea_load_field(&running));
     }
 
     fn pending_orientation(

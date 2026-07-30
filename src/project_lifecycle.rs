@@ -1,12 +1,12 @@
 //! Application-level N6 project lifecycle.
 //!
-//! Project documents remain strict schema-v2 manifests inside self-contained,
+//! Project documents remain strict schema-v3 manifests inside self-contained,
 //! content-addressed bundles. Machine-local recent paths and recovery snapshots
 //! live beside settings and never become authoritative project dependencies.
 use crate::project::{
     file_sha256, write_atomic_bytes, AtomicWriteError, BundleSummary, ContentDiagnosticKind,
-    ContentInsert, ContentRole, ProjectDocument, ProjectError, ProjectManifest, SourceKind,
-    WritePrecondition,
+    ContentInsert, ContentRole, LifecycleState, ProjectDocument, ProjectError, ProjectManifest,
+    RunRecord, SourceKind, WritePrecondition,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -622,6 +622,44 @@ impl ProjectLifecycle {
         }
         self.last_autosave_attempt_utc_unix = now_utc_unix;
         self.write_recovery_snapshot(now_utc_unix)
+    }
+
+    /// Record a Running attempt and make its recovery snapshot durable before
+    /// execution. If checkpointing fails, the in-memory attempt is immediately
+    /// terminalized so a later Save can never preserve a false Running state.
+    pub fn start_run_attempt_checkpointed(
+        &mut self,
+        case_id: &str,
+        attempt: RunRecord,
+        now_utc_unix: u64,
+    ) -> Result<(), LifecycleError> {
+        self.transact(now_utc_unix, |manifest| {
+            manifest.append_run(case_id, attempt.clone(), now_utc_unix)
+        })?;
+        if let Err(checkpoint_error) = self.checkpoint_recovery(now_utc_unix) {
+            let mut terminal_manifest = attempt.manifest().clone();
+            terminal_manifest.runtime_ms = 0;
+            terminal_manifest.stop_reason =
+                format!("recovery_checkpoint_failed: {checkpoint_error}");
+            let interrupted = RunRecord::new(
+                attempt.run_id(),
+                attempt.parent_run_id().map(str::to_owned),
+                attempt.case_revision_id(),
+                attempt.created_utc_unix(),
+                now_utc_unix,
+                LifecycleState::Failed,
+                terminal_manifest,
+                Vec::new(),
+            );
+            self.transact(now_utc_unix, |manifest| {
+                manifest.finish_run_attempt(case_id, interrupted, now_utc_unix)
+            })?;
+            // Best effort only: the original path may still be unavailable.
+            // The dirty terminal state remains available to normal Save/Save As.
+            let _ = self.checkpoint_recovery(now_utc_unix);
+            return Err(checkpoint_error);
+        }
+        Ok(())
     }
 
     fn write_recovery_snapshot(&mut self, now_utc_unix: u64) -> Result<bool, LifecycleError> {
@@ -1422,6 +1460,57 @@ mod tests {
         let (after_save, warnings) = ProjectLifecycle::load(&state, 66);
         assert!(warnings.is_empty());
         assert!(after_save.recovery_entries().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_start_checkpoint_terminalizes_attempt_before_save_and_reopen() {
+        let root = test_root("attempt-checkpoint-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("blocked-state");
+        let source = root.join("attempt.reynproj");
+        fixture_project().save_atomic(&source).unwrap();
+
+        let (mut lifecycle, _) = ProjectLifecycle::load(&state, 70);
+        lifecycle.open(&source, 71).unwrap();
+        let prior = lifecycle.manifest().run("run-1").unwrap();
+        let mut manifest = prior.manifest().clone();
+        manifest.runtime_ms = 0;
+        manifest.stop_reason = "running".into();
+        manifest.output_sha256.clear();
+        manifest.scalar_outputs.clear();
+        manifest.determinism = None;
+        let attempt = RunRecord::new(
+            "run-checkpoint-failed",
+            Some("run-1".into()),
+            prior.case_revision_id(),
+            72,
+            0,
+            LifecycleState::Running,
+            manifest,
+            Vec::new(),
+        );
+
+        std::fs::remove_dir_all(&state).unwrap();
+        std::fs::write(&state, b"blocks recovery directory creation").unwrap();
+        let error = lifecycle
+            .start_run_attempt_checkpointed("case-1", attempt, 72)
+            .unwrap_err();
+        assert!(error.to_string().contains("project state I/O"));
+        let terminal = lifecycle.manifest().run("run-checkpoint-failed").unwrap();
+        assert_eq!(terminal.state(), LifecycleState::Failed);
+        assert!(terminal
+            .manifest()
+            .stop_reason
+            .starts_with("recovery_checkpoint_failed:"));
+
+        lifecycle.save(73).unwrap();
+        let (mut reopened, warnings) = ProjectLifecycle::load(root.join("fresh-state"), 74);
+        assert!(warnings.is_empty());
+        reopened.open(&source, 75).unwrap();
+        let persisted = reopened.manifest().run("run-checkpoint-failed").unwrap();
+        assert_eq!(persisted.state(), LifecycleState::Failed);
+        assert_eq!(persisted.completed_utc_unix(), 72);
         let _ = std::fs::remove_dir_all(root);
     }
 

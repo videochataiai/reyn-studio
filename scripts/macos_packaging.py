@@ -51,14 +51,14 @@ SECURITY_RESOURCES = (
     "SBOM.spdx.json",
     "THIRD_PARTY_NOTICES.md",
 )
+RUNTIME_LOCK_PATH = (
+    Path(__file__).resolve().parents[1] / "packaging/macos/python-runtime.lock.json"
+)
+_RUNTIME_LOCK = json.loads(RUNTIME_LOCK_PATH.read_text(encoding="utf-8"))
+RUNTIME_DISTRIBUTIONS = tuple(_RUNTIME_LOCK["distributions"])
 RUNTIME_DEPENDENCIES = {
-    "Python": ("3.14.6", "PSF-2.0"),
-    "cryptography": ("49.0.0", "Apache-2.0 OR BSD-3-Clause"),
-    "NumPy": ("2.5.1", "BSD-3-Clause"),
-    "safetensors": ("0.8.0", "Apache-2.0"),
-    "securesystemslib": ("1.4.0", "MIT"),
-    "PyTorch": ("2.13.0", "BSD-3-Clause"),
-    "python-tuf": ("7.0.0", "MIT"),
+    distribution["name"]: (distribution["version"], distribution["license"])
+    for distribution in RUNTIME_DISTRIBUTIONS
 }
 LOCK_PACKAGE_NAMES = {
     "cryptography": "cryptography",
@@ -441,6 +441,112 @@ def canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def runtime_sbom_documents(app_version: str = "0.1.1") -> tuple[dict, dict]:
+    components = []
+    packages = [
+        {
+            "SPDXID": "SPDXRef-Package-ReynStudio",
+            "comment": "Packaged application, lightweight Python source closure, and exact arm64 factory compute runtime.",
+            "downloadLocation": "NOASSERTION",
+            "filesAnalyzed": False,
+            "licenseConcluded": "NOASSERTION",
+            "licenseDeclared": "NOASSERTION",
+            "name": "Reyn Studio",
+            "versionInfo": app_version,
+        }
+    ]
+    relationships = []
+    for distribution in RUNTIME_DISTRIBUTIONS:
+        name = distribution["name"]
+        version = distribution["version"]
+        license_id = distribution["license"]
+        component = {
+            "type": "framework" if name == "Python" else "library",
+            "name": name,
+            "version": version,
+            "purl": distribution["purl"],
+            "licenses": [
+                {"expression": license_id}
+                if " OR " in license_id
+                else {"license": {"id": license_id}}
+            ],
+        }
+        components.append(component)
+        spdx_id = "SPDXRef-Package-" + re.sub(r"[^A-Za-z0-9.-]", "-", name)
+        packages.append(
+            {
+                "SPDXID": spdx_id,
+                "comment": "Bundled arm64 factory-runtime distribution.",
+                "downloadLocation": (
+                    "https://www.python.org/downloads/"
+                    if name == "Python"
+                    else f"https://pypi.org/project/{distribution['purl'].split('/')[1].split('@')[0]}/{version}/"
+                ),
+                "filesAnalyzed": False,
+                "licenseConcluded": license_id,
+                "licenseDeclared": license_id,
+                "name": name,
+                "versionInfo": version,
+            }
+        )
+        relationships.append(
+            {
+                "relatedSpdxElement": spdx_id,
+                "relationshipType": "DEPENDS_ON",
+                "spdxElementId": "SPDXRef-Package-ReynStudio",
+            }
+        )
+    cyclonedx = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "serialNumber": "urn:uuid:48f1f77f-012f-4b20-a928-fb861be3f011",
+        "version": 1,
+        "metadata": {
+            "component": {
+                "type": "application",
+                "name": "Reyn Studio arm64 factory runtime",
+                "version": app_version,
+            }
+        },
+        "components": components,
+    }
+    spdx = {
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "creationInfo": {
+            "created": "1980-01-01T00:00:00Z",
+            "creators": ["Organization: Reyn Studio"],
+        },
+        "dataLicense": "CC0-1.0",
+        "documentNamespace": f"https://reyn.studio/spdx/reyn-studio-{app_version}-macos-python-runtime-v3",
+        "name": f"Reyn Studio {app_version} macOS arm64 Python runtime inventory",
+        "packages": packages,
+        "relationships": relationships,
+        "spdxVersion": "SPDX-2.3",
+    }
+    return spdx, cyclonedx
+
+
+def validate_runtime_sboms(root: Path) -> list[str]:
+    expected_spdx, expected_cyclonedx = runtime_sbom_documents()
+    errors = []
+    for path, expected, label in (
+        (root / "packaging/macos/SBOM.spdx.json", expected_spdx, "SPDX SBOM"),
+        (
+            root / "packaging/macos/runtime-sbom.cdx.json",
+            expected_cyclonedx,
+            "CycloneDX SBOM",
+        ),
+    ):
+        try:
+            observed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            errors.append(f"{label} is unreadable: {error}")
+            continue
+        if observed != expected:
+            errors.append(f"{label} does not match python-runtime.lock.json")
+    return errors
+
+
 def research_closure_sha256(resources: Path) -> str:
     closure_paths = [
         *(resources / "engine" / name for name in ENGINE_RESOURCES),
@@ -483,15 +589,21 @@ def validate_factory_runtime(runtime_root: Path) -> list[str]:
             resolved.relative_to(runtime_root.resolve())
         except (OSError, ValueError) as error:
             errors.append(f"factory runtime symlink escapes its prefix: {path}: {error}")
+    metadata_names = {
+        name: {
+            "PyTorch": "torch",
+            "NumPy": "numpy",
+            "python-tuf": "tuf",
+        }.get(name, name)
+        for name in RUNTIME_DEPENDENCIES
+        if name != "Python"
+    }
     probe = (
         "import importlib.metadata as m,json,platform,sys;"
+        f"names={metadata_names!r};"
         "print(json.dumps({'architecture':platform.machine(),"
-        "'python':platform.python_version(),"
-        "'PyTorch':m.version('torch'),'NumPy':m.version('numpy'),"
-        "'cryptography':m.version('cryptography'),"
-        "'safetensors':m.version('safetensors'),"
-        "'securesystemslib':m.version('securesystemslib'),"
-        "'python-tuf':m.version('tuf'),"
+        "'Python':platform.python_version(),"
+        "'distributions':{name:m.version(metadata) for name,metadata in names.items()},"
         "'prefix':sys.prefix},sort_keys=True))"
     )
     try:
@@ -511,15 +623,21 @@ def validate_factory_runtime(runtime_root: Path) -> list[str]:
     else:
         expected = {
             "architecture": "arm64",
-            **{
-                name: version
-                for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
-            },
+            "Python": RUNTIME_DEPENDENCIES["Python"][0],
         }
         for name, version in expected.items():
             if observed.get(name) != version:
                 errors.append(
                     f"factory runtime {name}={observed.get(name)!r}, expected {version!r}"
+                )
+        observed_distributions = observed.get("distributions", {})
+        for name, (version, _license) in RUNTIME_DEPENDENCIES.items():
+            if name == "Python":
+                continue
+            if observed_distributions.get(name) != version:
+                errors.append(
+                    f"factory runtime {name}={observed_distributions.get(name)!r}, "
+                    f"expected {version!r}"
                 )
         try:
             Path(str(observed.get("prefix", ""))).resolve().relative_to(
@@ -549,9 +667,13 @@ def stage_factory_runtime(
     shutil.copytree(source, destination, symlinks=True)
     for stale in ("runtime-manifest.cjson", "runtime-manifest.sig"):
         (destination / stale).unlink(missing_ok=True)
-    shutil.copy2(
-        compliance_root / "runtime-sbom.cdx.json",
-        destination / "runtime-sbom.cdx.json",
+    sbom_errors = validate_runtime_sboms(compliance_root.parents[1])
+    if sbom_errors:
+        raise RuntimeError("runtime SBOM validation failed: " + "; ".join(sbom_errors))
+    _, runtime_cyclonedx = runtime_sbom_documents()
+    (destination / "runtime-sbom.cdx.json").write_text(
+        json.dumps(runtime_cyclonedx, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     shutil.copy2(
         compliance_root / "RUNTIME_THIRD_PARTY_NOTICES.html",
@@ -788,9 +910,7 @@ def validate_runtime_dependency_lock(root: Path) -> list[str]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         return [f"cannot read macOS Python runtime lock: {error}"]
     errors = []
-    expected = {
-        name: version for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
-    }
+    expected = [dict(distribution) for distribution in RUNTIME_DISTRIBUTIONS]
     if lock.get("distributions") != expected:
         errors.append("macOS Python runtime lock does not match the release inventory")
     for key, expected_value in (
