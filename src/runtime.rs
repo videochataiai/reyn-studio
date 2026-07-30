@@ -2702,18 +2702,23 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
     }
 
     #[test]
-    fn incompatible_host_does_not_attempt_arm64_runtime() {
+    fn incompatible_host_does_not_attempt_factory_runtime() {
         let fixture = Fixture::new("intel");
         let closure = digest(8);
         fixture.create_factory(&closure);
         let factory = fixture.factory_root();
         let managed = fixture.managed_root();
+        let incompatible_architecture = if TARGET_ARCHITECTURE == "arm64" {
+            "x86_64"
+        } else {
+            "arm64"
+        };
         let discovery = discover_runtime(RuntimeDiscoveryRequest {
             factory_root: Some(&factory),
             managed_root: Some(&managed),
             host: &HostCompatibility {
                 platform: TARGET_PLATFORM.into(),
-                architecture: "x86_64".into(),
+                architecture: incompatible_architecture.into(),
                 macos_version: Some("26.5".into()),
             },
             expected_research_closure_sha256: &closure,

@@ -1982,6 +1982,16 @@ mod tests {
             let defaults = EngineConfig::default();
             let source_research = nonempty_env("REYN_RESEARCH_SOURCE_DIR")
                 .unwrap_or_else(|| PathBuf::from(&defaults.research_dir));
+            let source_python = if cfg!(target_os = "windows") {
+                source_research.join(".venv/Scripts/python.exe")
+            } else {
+                source_research.join(".venv/bin/python")
+            };
+            let fixture_python = if source_python.is_file() {
+                source_python.to_string_lossy().into_owned()
+            } else {
+                defaults.python_path.clone()
+            };
             let source_engine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine");
             let research = temp.root.join("research");
             let engine = temp.root.join("engine");
@@ -2089,7 +2099,7 @@ with open(fixture_module, "a", encoding="utf-8") as stream:
 loaded = load_model_bundle(destination, development_allow_unsigned=True)
 assert loaded.authenticity["status"] == "development_unsigned_override"
 "#;
-            let output = Command::new(&defaults.python_path)
+            let output = Command::new(&fixture_python)
                 .arg("-B")
                 .arg("-c")
                 .arg(script)
@@ -2118,7 +2128,7 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
                 _temp: temp,
                 config: EngineConfig {
                     research_dir: research.to_string_lossy().into_owned(),
-                    python_path: defaults.python_path,
+                    python_path: fixture_python,
                     device: "cpu".into(),
                     engine_script: Some(
                         engine.join("reyn_engine.py").to_string_lossy().into_owned(),
