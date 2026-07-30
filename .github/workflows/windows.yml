@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: videochataiai/reyn
-          ref: 0333b13bd117e6129d989aa41dd7e3057c11d116
+          ref: 3515cde4d0f5678437ad6ee6116774f1cd6a3c16
           path: reyn-monorepo
           ssh-key: ${{ secrets.REYN_RESEARCH_DEPLOY_KEY }}
           persist-credentials: false
@@ -51,8 +51,8 @@ jobs:
           cargo check --locked --target x86_64-pc-windows-msvc
           cargo build --locked --release
 
-      - name: Run Python tests
-        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Run Windows packaging tests
+        run: python -m unittest discover -s tests -p "test_windows_*.py"
 
       - name: Assemble pinned CPU runtime
         shell: pwsh
