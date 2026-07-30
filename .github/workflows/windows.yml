@@ -88,7 +88,7 @@ jobs:
           $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
           python scripts/validate_windows_package.py "$($stage.FullName)" --runtime-smoke
 
-      - name: Engine readiness and launch cleanup smoke
+      - name: Engine readiness and gated launch cleanup smoke
         shell: pwsh
         run: |
           $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
@@ -96,21 +96,26 @@ jobs:
           $exe = Join-Path $stage.FullName "Reyn Studio.exe"
           $process = Start-Process $exe -PassThru
           $deadline = (Get-Date).AddSeconds(30)
-          $child = $null
           while ((Get-Date) -lt $deadline -and -not $process.HasExited) {
-            $child = Get-CimInstance Win32_Process |
-              Where-Object {
-                $_.ParentProcessId -eq $process.Id -and
-                $_.Name -eq "python.exe" -and
-                $_.CommandLine -match "reyn_engine.py"
-              } |
-              Select-Object -First 1
-            if ($child) { break }
+            $process.Refresh()
+            if ($process.MainWindowHandle -ne 0) { break }
             Start-Sleep -Milliseconds 500
           }
-          if ($process.HasExited -or -not $child) {
+          if ($process.HasExited -or $process.MainWindowHandle -eq 0) {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
-            throw "Reyn Studio did not reach a running bundled-engine state."
+            throw "Reyn Studio did not reach the running YC access gate."
+          }
+          $preUnlockEngine = Get-CimInstance Win32_Process |
+            Where-Object {
+              $_.ParentProcessId -eq $process.Id -and
+              $_.Name -eq "python.exe" -and
+              $_.CommandLine -match "reyn_engine.py"
+            } |
+            Select-Object -First 1
+          if ($preUnlockEngine) {
+            Stop-Process -Id $preUnlockEngine.ProcessId -Force
+            Stop-Process -Id $process.Id -Force
+            throw "YC-gated Reyn Studio started its engine before authentication."
           }
           $process.CloseMainWindow() | Out-Null
           if (-not $process.WaitForExit(15000)) {
@@ -118,7 +123,13 @@ jobs:
             throw "Reyn Studio did not exit after a normal window close."
           }
           Start-Sleep -Seconds 2
-          $orphan = Get-CimInstance Win32_Process -Filter "ProcessId = $($child.ProcessId)"
+          $orphan = Get-CimInstance Win32_Process |
+            Where-Object {
+              $_.ParentProcessId -eq $process.Id -and
+              $_.Name -eq "python.exe" -and
+              $_.CommandLine -match "reyn_engine.py"
+            } |
+            Select-Object -First 1
           if ($orphan) {
             Stop-Process -Id $orphan.ProcessId -Force
             throw "Bundled Python engine remained after Reyn Studio exited."

@@ -126,7 +126,9 @@ Automated Windows CI must pass:
 - CPU runtime, app-owned model loader, model-card, and import probes from the staged directory
 - Package inventory, SBOM, notices, checksum, and deterministic ZIP validation
 - Runner launch smoke for the staged executable
-- Engine READY on loopback and no Python child remaining after normal app exit
+- Bundled engine READY on loopback
+- Gated app reaches its login window without starting the engine before unlock,
+  then exits normally without leaving an orphaned Python process
 
 On a non-Windows host, a code-only cross-target check can set
 `REYN_SKIP_WINDOWS_RESOURCES=1` while running `cargo check`. This skips only
