@@ -60,7 +60,7 @@ function fixture(options: { validPassword?: boolean; rateLimited?: boolean } = {
     } as unknown as RateLimit,
     TERMS_VERSION: "1.0",
     PRIVACY_VERSION: "1.0",
-    SESSION_TTL_SECONDS: "86400",
+    SESSION_TTL_SECONDS: "86340",
     EVENT_RETENTION_SECONDS: "2592000",
     YC_USERNAME: username,
     YC_PASSWORD_DIGEST_HEX: digest,
@@ -238,6 +238,19 @@ test("deployment preflight requires exactly the configured secret names", () => 
     [...(wrangler.secrets?.required ?? [])].sort(),
     [...REQUIRED_SECRET_NAMES].sort(),
   );
+});
+
+test("production session TTL leaves a clock-skew safety margin", () => {
+  const wrangler = JSON.parse(
+    readFileSync(
+      fileURLToPath(new NodeURL("../wrangler.jsonc", import.meta.url)),
+      "utf8",
+    ),
+  ) as { vars?: { SESSION_TTL_SECONDS?: string } };
+  const sessionTtlSeconds = Number(wrangler.vars?.SESSION_TTL_SECONDS);
+  assert.ok(Number.isInteger(sessionTtlSeconds));
+  assert.ok(sessionTtlSeconds > 0);
+  assert.ok(sessionTtlSeconds <= 24 * 60 * 60 - 30);
 });
 
 test("secret generator rejects malformed keys without writing a bundle", () => {
