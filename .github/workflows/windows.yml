@@ -8,11 +8,14 @@ on:
 
 jobs:
   windows-x64:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-2025
     timeout-minutes: 90
     env:
       SOURCE_DATE_EPOCH: "315532800"
-      REYN_RESEARCH_SOURCE_DIR: ${{ github.workspace }}/reyn-research
+      REYN_RESEARCH_SOURCE_DIR: ${{ github.workspace }}/reyn-monorepo/reyn-research
       REYN_ACCESS_REQUIRED: "1"
       REYN_ACCESS_ENDPOINT: https://reynflow.com/api/yc-access/v1/session
     steps:
@@ -21,9 +24,11 @@ jobs:
       - name: Check out research runtime source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: videochataiai/reyn-research
+          repository: videochataiai/reyn
           ref: 0333b13bd117e6129d989aa41dd7e3057c11d116
-          path: reyn-research
+          path: reyn-monorepo
+          ssh-key: ${{ secrets.REYN_RESEARCH_DEPLOY_KEY }}
+          persist-credentials: false
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -72,7 +77,7 @@ jobs:
         run: |
           python scripts/package_windows.py `
             --runtime-dir "$env:REYN_WINDOWS_RUNTIME_DIR" `
-            --research-source-dir "reyn-research" `
+            --research-source-dir "$env:REYN_RESEARCH_SOURCE_DIR" `
             --binary "target/release/reyn-studio.exe" `
             --runtime-smoke
           $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
