@@ -33,33 +33,52 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $pins = Get-Content "packaging/windows/release-pins.json" | ConvertFrom-Json
           rustup toolchain install $pins.rust_toolchain `
             --profile minimal `
             --component rustfmt `
             --target $pins.target
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE" }
           rustup default $pins.rust_toolchain
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed with exit code $LASTEXITCODE" }
 
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
 
       - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed with exit code $LASTEXITCODE" }
 
       - name: Run Rust tests and checks
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           cargo test --locked --all-targets
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
           cargo check --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" }
           cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 
       - name: Run Windows packaging tests
-        run: python -m unittest discover -s tests -p "test_windows_*.py"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m unittest discover -s tests -p "test_windows_*.py"
+          if ($LASTEXITCODE -ne 0) { throw "Windows packaging tests failed with exit code $LASTEXITCODE" }
 
       - name: Assemble pinned CPU runtime
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $pins = Get-Content "packaging/windows/release-pins.json" | ConvertFrom-Json
           uv python install $pins.python
+          if ($LASTEXITCODE -ne 0) { throw "uv python install failed with exit code $LASTEXITCODE" }
           $python = (uv python find $pins.python).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "uv python find failed with exit code $LASTEXITCODE" }
           $source = Split-Path $python
           $runtime = Join-Path $env:RUNNER_TEMP "ReynPython"
           Copy-Item $source $runtime -Recurse
@@ -71,28 +90,35 @@ jobs:
             --extra-index-url https://pypi.org/simple `
             --index-strategy unsafe-best-match `
             --requirements "packaging/windows/python-runtime.lock"
+          if ($LASTEXITCODE -ne 0) { throw "uv pip install failed with exit code $LASTEXITCODE" }
           uv pip uninstall --python (Join-Path $runtime "python.exe") `
             --system `
             --break-system-packages `
             pip
+          if ($LASTEXITCODE -ne 0) { throw "uv pip uninstall failed with exit code $LASTEXITCODE" }
           "REYN_WINDOWS_RUNTIME_DIR=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build and validate portable ZIP
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           python scripts/package_windows.py `
             --runtime-dir "$env:REYN_WINDOWS_RUNTIME_DIR" `
             --research-source-dir "$env:REYN_RESEARCH_SOURCE_DIR" `
             --binary "target/release/reyn-studio.exe" `
             --runtime-smoke
+          if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed with exit code $LASTEXITCODE" }
           $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
           python scripts/validate_windows_package.py "$($stage.FullName)" --runtime-smoke
+          if ($LASTEXITCODE -ne 0) { throw "Windows package validation failed with exit code $LASTEXITCODE" }
 
       - name: Engine readiness and gated launch cleanup smoke
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
           python scripts/windows_engine_smoke.py "$($stage.FullName)"
+          if ($LASTEXITCODE -ne 0) { throw "Windows engine smoke failed with exit code $LASTEXITCODE" }
           $exe = Join-Path $stage.FullName "Reyn Studio.exe"
           $process = Start-Process $exe -PassThru
           $deadline = (Get-Date).AddSeconds(30)

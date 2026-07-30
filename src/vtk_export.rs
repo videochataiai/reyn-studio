@@ -174,7 +174,7 @@ impl VtkFieldExport {
     fn validate(&self) -> Result<ValidatedGrid, String> {
         if !matches!(
             self.run_state,
-            LifecycleState::Complete | LifecycleState::EvidenceLocked
+            LifecycleState::Succeeded | LifecycleState::EvidenceLocked
         ) {
             return Err(
                 "VTK evidence export requires a completed persisted run; draft, running, stale, and failed runs are rejected."
@@ -525,13 +525,15 @@ fn reyn_index(n: usize, i: usize, j: usize, k: usize) -> usize {
 
 fn run_state_name(state: LifecycleState) -> &'static str {
     match state {
-        LifecycleState::Complete => "complete",
+        LifecycleState::Pending => "pending",
+        LifecycleState::Succeeded => "succeeded",
         LifecycleState::EvidenceLocked => "evidence_locked",
         LifecycleState::Draft => "draft",
         LifecycleState::Ready => "ready",
         LifecycleState::Running => "running",
         LifecycleState::Stale => "stale",
         LifecycleState::Failed => "failed",
+        LifecycleState::Cancelled => "cancelled",
     }
 }
 
@@ -627,7 +629,7 @@ mod tests {
             ],
             meters_per_source_unit: 1.0,
             transform_approved: true,
-            run_state: LifecycleState::Complete,
+            run_state: LifecycleState::Succeeded,
             provenance: VtkFieldProvenance {
                 source_revision_id: "source-revision-1".into(),
                 case_revision_id: "case-revision-1".into(),

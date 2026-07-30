@@ -52,12 +52,12 @@ SECURITY_RESOURCES = (
     "THIRD_PARTY_NOTICES.md",
 )
 RUNTIME_DEPENDENCIES = {
-    "Python": (">=3.14", "PSF-2.0"),
+    "Python": ("3.14.6", "PSF-2.0"),
     "cryptography": ("49.0.0", "Apache-2.0 OR BSD-3-Clause"),
-    "NumPy": ("2.5.0", "BSD-3-Clause"),
+    "NumPy": ("2.5.1", "BSD-3-Clause"),
     "safetensors": ("0.8.0", "Apache-2.0"),
     "securesystemslib": ("1.4.0", "MIT"),
-    "PyTorch": ("2.12.1", "BSD-3-Clause"),
+    "PyTorch": ("2.13.0", "BSD-3-Clause"),
     "python-tuf": ("7.0.0", "MIT"),
 }
 LOCK_PACKAGE_NAMES = {
@@ -305,7 +305,7 @@ def info_plist(config: ReleaseConfig, build_number: str) -> dict[str, object]:
 
 def runtime_requirements() -> dict[str, object]:
     return {
-        "schema": "com.reyn.studio.runtime-requirements.v2",
+        "schema": "com.reyn.studio.runtime-requirements.v3",
         "engine": {
             "bundled_modules": list(ENGINE_RESOURCES),
             "entrypoint": "engine/reyn_engine.py",
@@ -318,11 +318,16 @@ def runtime_requirements() -> dict[str, object]:
             ],
         },
         "python": {
-            "bundled": False,
+            "bundled": True,
+            "architecture": "arm64",
+            "minimum_macos": "14.0",
+            "compute_supported_on": ["arm64"],
+            "compute_unsupported_on": ["x86_64"],
             "resolution": [
                 "REYN_PYTHON",
-                "<REYN_RESEARCH_DIR>/.venv/bin/python",
-                "python3 on PATH",
+                "<current_exe_dir>/../Frameworks/ReynPython/bin/python3.14",
+                "<managed-runtime-slot>/ReynPython/bin/python3.14",
+                "Developer-mode custom Python only when explicitly configured",
             ],
             "required_imports": [
                 "cryptography",
@@ -391,10 +396,6 @@ def standalone_blockers(root: Path) -> list[str]:
             "The default research checkout fallback is a developer-specific absolute path."
         )
     blockers.append(
-        "Python, NumPy, and PyTorch are not bundled; REYN_PYTHON must select a compatible "
-        "interpreter on the target Mac."
-    )
-    blockers.append(
         "The production TUF root is intentionally unset, so authenticated model loading "
         "fails closed until an offline root-key ceremony and source review are complete."
     )
@@ -432,6 +433,221 @@ def file_manifest(base: Path, paths: Iterable[Path]) -> list[dict[str, object]]:
             }
         )
     return rows
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+
+
+def research_closure_sha256(resources: Path) -> str:
+    closure_paths = [
+        *(resources / "engine" / name for name in ENGINE_RESOURCES),
+        *(resources / "research" / name for name in RESEARCH_RESOURCES),
+    ]
+    rows = [
+        {
+            "path": path.relative_to(resources).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in closure_paths
+    ]
+    rows.sort(key=lambda row: row["path"])
+    return hashlib.sha256(canonical_json_bytes(rows)).hexdigest()
+
+
+def validate_factory_runtime(runtime_root: Path) -> list[str]:
+    errors = []
+    interpreter = runtime_root / "bin/python3.14"
+    if not interpreter.is_file():
+        return [f"factory runtime interpreter is missing: {interpreter}"]
+    if not os.access(interpreter, os.X_OK):
+        errors.append(f"factory runtime interpreter is not executable: {interpreter}")
+    try:
+        architectures = executable_architectures(interpreter)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        errors.append(f"cannot inspect factory runtime architecture: {error}")
+    else:
+        if architectures != ("arm64",):
+            errors.append(
+                f"factory runtime interpreter architectures are {architectures}, "
+                "expected arm64 only"
+            )
+    for path in runtime_root.rglob("*"):
+        if not path.is_symlink():
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(runtime_root.resolve())
+        except (OSError, ValueError) as error:
+            errors.append(f"factory runtime symlink escapes its prefix: {path}: {error}")
+    probe = (
+        "import importlib.metadata as m,json,platform,sys;"
+        "print(json.dumps({'architecture':platform.machine(),"
+        "'python':platform.python_version(),"
+        "'PyTorch':m.version('torch'),'NumPy':m.version('numpy'),"
+        "'cryptography':m.version('cryptography'),"
+        "'safetensors':m.version('safetensors'),"
+        "'securesystemslib':m.version('securesystemslib'),"
+        "'python-tuf':m.version('tuf'),"
+        "'prefix':sys.prefix},sort_keys=True))"
+    )
+    try:
+        completed = run(
+            [str(interpreter), "-I", "-s", "-c", probe],
+            cwd=runtime_root,
+            capture=True,
+        )
+        observed = json.loads(completed.stdout.strip())
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        errors.append(f"factory runtime dependency probe failed: {error}")
+    else:
+        expected = {
+            "architecture": "arm64",
+            **{
+                name: version
+                for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+            },
+        }
+        for name, version in expected.items():
+            if observed.get(name) != version:
+                errors.append(
+                    f"factory runtime {name}={observed.get(name)!r}, expected {version!r}"
+                )
+        try:
+            Path(str(observed.get("prefix", ""))).resolve().relative_to(
+                runtime_root.resolve()
+            )
+        except ValueError:
+            errors.append("factory runtime reports a non-relocatable external sys.prefix")
+    return errors
+
+
+def stage_factory_runtime(
+    source: Path,
+    destination: Path,
+    *,
+    resources: Path,
+    source_revision: str,
+    build_epoch: int,
+    compliance_root: Path,
+) -> dict[str, object]:
+    if not source.is_dir():
+        raise FileNotFoundError(
+            f"exact arm64 factory runtime is missing: {source}; "
+            "pass --runtime-dir with a preassembled relocatable prefix"
+        )
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(source, destination, symlinks=True)
+    for stale in ("runtime-manifest.cjson", "runtime-manifest.sig"):
+        (destination / stale).unlink(missing_ok=True)
+    shutil.copy2(
+        compliance_root / "runtime-sbom.cdx.json",
+        destination / "runtime-sbom.cdx.json",
+    )
+    shutil.copy2(
+        compliance_root / "RUNTIME_THIRD_PARTY_NOTICES.html",
+        destination / "THIRD_PARTY_NOTICES.html",
+    )
+    errors = validate_factory_runtime(destination)
+    if errors:
+        raise RuntimeError("factory runtime validation failed: " + "; ".join(errors))
+    payload_paths = [
+        path
+        for path in destination.rglob("*")
+        if path.is_file() and path.name != "runtime-manifest.cjson"
+    ]
+    files = [
+        {
+            "path": path.relative_to(destination).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in payload_paths
+    ]
+    files.sort(key=lambda row: row["path"])
+    by_path = {row["path"]: row for row in files}
+    manifest = {
+        "schema": "com.reyn.runtime-manifest/1",
+        "runtime_id": "",
+        "platform": "macos",
+        "architecture": "arm64",
+        "minimum_macos": "14.0",
+        "python": RUNTIME_DEPENDENCIES["Python"][0],
+        "torch": RUNTIME_DEPENDENCIES["PyTorch"][0],
+        "numpy": RUNTIME_DEPENDENCIES["NumPy"][0],
+        "engine_protocol": 1,
+        "research_closure_sha256": research_closure_sha256(resources),
+        "source_revision": source_revision,
+        "build_epoch": build_epoch,
+        "files": files,
+        "sbom_sha256": by_path["runtime-sbom.cdx.json"]["sha256"],
+        "notices_sha256": by_path["THIRD_PARTY_NOTICES.html"]["sha256"],
+    }
+    identity = dict(manifest)
+    identity.pop("runtime_id")
+    manifest["runtime_id"] = "sha256:" + hashlib.sha256(
+        canonical_json_bytes(identity)
+    ).hexdigest()
+    (destination / "runtime-manifest.cjson").write_bytes(
+        canonical_json_bytes(manifest)
+    )
+    return manifest
+
+
+def validate_factory_runtime_manifest(runtime_root: Path) -> list[str]:
+    manifest_path = runtime_root / "runtime-manifest.cjson"
+    try:
+        encoded = manifest_path.read_bytes()
+        manifest = json.loads(encoded)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return [f"factory runtime manifest is unreadable: {error}"]
+    errors = []
+    if encoded != canonical_json_bytes(manifest):
+        errors.append("factory runtime manifest is not canonical JSON")
+    identity = dict(manifest)
+    declared_id = identity.pop("runtime_id", None)
+    calculated_id = "sha256:" + hashlib.sha256(
+        canonical_json_bytes(identity)
+    ).hexdigest()
+    if declared_id != calculated_id:
+        errors.append(
+            f"factory runtime identity is {declared_id!r}, expected {calculated_id!r}"
+        )
+    declared_files = manifest.get("files")
+    if not isinstance(declared_files, list):
+        return [*errors, "factory runtime manifest files must be a list"]
+    actual_paths = {
+        path.relative_to(runtime_root).as_posix()
+        for path in runtime_root.rglob("*")
+        if path.is_file() and path.name != "runtime-manifest.cjson"
+    }
+    declared_paths = {
+        row.get("path") for row in declared_files if isinstance(row, dict)
+    }
+    if declared_paths != actual_paths:
+        errors.append("factory runtime manifest file inventory differs from staged prefix")
+    for row in declared_files:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            errors.append("factory runtime manifest contains a malformed file row")
+            continue
+        path = runtime_root / row["path"]
+        if not path.is_file():
+            continue
+        if row.get("size") != path.stat().st_size or row.get("sha256") != sha256_file(
+            path
+        ):
+            errors.append(f"factory runtime file digest differs: {row['path']}")
+    errors.extend(validate_factory_runtime(runtime_root))
+    return errors
 
 
 def manifest_digest(rows: Iterable[dict[str, object]]) -> str:
@@ -480,7 +696,20 @@ def resolve_research_source(
     configured = override
     if configured is None:
         environment = os.environ.get("REYN_RESEARCH_SOURCE_DIR", "").strip()
-        configured = Path(environment) if environment else root.parent / "reyn-research"
+        if environment:
+            configured = Path(environment)
+        else:
+            candidates = [
+                root.parent / "reyn-research",
+                *(
+                    ancestor / "reyn-research"
+                    for ancestor in list(root.parents)[:3]
+                ),
+            ]
+            configured = next(
+                (candidate for candidate in candidates if candidate.is_dir()),
+                candidates[0],
+            )
     if not configured.is_absolute():
         configured = root / configured
     configured = configured.resolve()
@@ -490,6 +719,91 @@ def resolve_research_source(
             f"{configured}; pass --research-source-dir or set REYN_RESEARCH_SOURCE_DIR"
         )
     return configured
+
+
+def load_macos_release_pins(root: Path) -> dict[str, object]:
+    path = root / "packaging/macos/release-pins.json"
+    try:
+        pins = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"macOS release pins are unreadable: {error}") from error
+    required = {
+        "research_repository",
+        "research_revision",
+        "research_subdirectory",
+        "runtime_architecture",
+        "minimum_compute_macos",
+        "python",
+        "torch",
+        "numpy",
+    }
+    missing = sorted(key for key in required if not pins.get(key))
+    if missing:
+        raise RuntimeError(f"macOS release pins omit: {', '.join(missing)}")
+    revision = str(pins["research_revision"])
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError("macOS research revision must be an exact lowercase Git commit")
+    expected_versions = {
+        "python": RUNTIME_DEPENDENCIES["Python"][0],
+        "torch": RUNTIME_DEPENDENCIES["PyTorch"][0],
+        "numpy": RUNTIME_DEPENDENCIES["NumPy"][0],
+    }
+    for key, expected in expected_versions.items():
+        if pins.get(key) != expected:
+            raise RuntimeError(
+                f"macOS release pin {key}={pins.get(key)!r}, expected {expected!r}"
+            )
+    if pins["runtime_architecture"] != "arm64":
+        raise RuntimeError("the qualified macOS compute runtime must be arm64")
+    return pins
+
+
+def validate_research_source_pin(root: Path, research_source: Path) -> list[str]:
+    pins = load_macos_release_pins(root)
+    errors = [
+        f"pinned research source omits {name}"
+        for name in RESEARCH_RESOURCES
+        if not (research_source / name).is_file()
+    ]
+    try:
+        revision = run(
+            ["git", "-C", str(research_source), "rev-parse", "HEAD"],
+            cwd=root,
+            capture=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        errors.append(f"cannot verify pinned research Git revision: {error}")
+    else:
+        if revision != pins["research_revision"]:
+            errors.append(
+                f"research checkout is {revision}, expected {pins['research_revision']}"
+            )
+    return errors
+
+
+def validate_runtime_dependency_lock(root: Path) -> list[str]:
+    path = root / "packaging/macos/python-runtime.lock.json"
+    try:
+        lock = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return [f"cannot read macOS Python runtime lock: {error}"]
+    errors = []
+    expected = {
+        name: version for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+    }
+    if lock.get("distributions") != expected:
+        errors.append("macOS Python runtime lock does not match the release inventory")
+    for key, expected_value in (
+        ("platform", "macos"),
+        ("architecture", "arm64"),
+        ("minimum_macos", "14.0"),
+    ):
+        if lock.get(key) != expected_value:
+            errors.append(
+                f"macOS Python runtime lock {key}={lock.get(key)!r}, "
+                f"expected {expected_value!r}"
+            )
+    return errors
 
 
 def validate_research_dependency_lock(research_source: Path) -> list[str]:
@@ -506,17 +820,20 @@ def validate_research_dependency_lock(research_source: Path) -> list[str]:
         if isinstance(package, dict)
     }
     errors = []
-    for lock_name, inventory_name in LOCK_PACKAGE_NAMES.items():
-        expected = RUNTIME_DEPENDENCIES[inventory_name][0]
-        if locked.get(lock_name) != expected:
-            errors.append(
-                f"uv.lock {lock_name}={locked.get(lock_name)!r}, expected {expected!r}"
-            )
+    for lock_name in (
+        "cryptography",
+        "numpy",
+        "safetensors",
+        "securesystemslib",
+        "torch",
+        "tuf",
+    ):
+        if not locked.get(lock_name):
+            errors.append(f"research uv.lock omits {lock_name}")
     python_requirement = project.get("project", {}).get("requires-python")
-    if python_requirement != RUNTIME_DEPENDENCIES["Python"][0]:
+    if not isinstance(python_requirement, str) or "3.14" not in python_requirement:
         errors.append(
-            f"pyproject requires-python={python_requirement!r}, "
-            f"expected {RUNTIME_DEPENDENCIES['Python'][0]!r}"
+            f"research pyproject requires-python={python_requirement!r}, expected Python 3.14"
         )
     return errors
 
@@ -873,8 +1190,8 @@ def validate_security_artifacts(resources: Path) -> list[str]:
                     f"SBOM {name} license={package.get('licenseDeclared')!r}, "
                     f"expected {license_id!r}"
                 )
-            if "not distributed" not in str(package.get("comment", "")):
-                errors.append(f"SBOM must identify {name} as an external dependency")
+            if "Bundled arm64" not in str(package.get("comment", "")):
+                errors.append(f"SBOM must identify {name} as a bundled arm64 dependency")
     else:
         errors.append("SBOM must be an object")
 
@@ -982,7 +1299,7 @@ def validate_runtime_contract(path: Path) -> list[str]:
         return [f"cannot read runtime contract: {error}"]
     expected = {
         ("engine", "used_by_current_binary"): True,
-        ("python", "bundled"): False,
+        ("python", "bundled"): True,
         ("research_runtime", "bundled"): True,
         ("checkpoints", "bundled"): False,
         ("checkpoints", "pickle_formats_permitted"): False,
@@ -1416,9 +1733,23 @@ def validate_bundle(
         Check(
             "PASS" if not runtime_errors else "FAIL",
             "runtime contract honesty",
-            "bundled sidecar/research code and external Python/checkpoint/Apple gates are explicit"
+            "bundled arm64 Python/research code and checkpoint/Apple gates are explicit"
             if not runtime_errors
             else "; ".join(runtime_errors),
+        )
+    )
+    factory_runtime = contents / "Frameworks/ReynPython"
+    factory_runtime_errors = validate_factory_runtime_manifest(factory_runtime)
+    checks.append(
+        Check(
+            "PASS" if not factory_runtime_errors else "FAIL",
+            "arm64 factory runtime",
+            (
+                "relocatable arm64 interpreter, exact dependencies, canonical manifest, "
+                "SBOM, and notices validated"
+                if not factory_runtime_errors
+                else "; ".join(factory_runtime_errors)
+            ),
         )
     )
 

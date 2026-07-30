@@ -1,7 +1,7 @@
 # Reyn Studio — Canonical Product Requirements
 
 **Status:** canonical implementation contract  
-**Current-state baseline:** 2026-07-23  
+**Current-state baseline:** 2026-07-30 · corrective release 0.1.1
 **Applies to:** Reyn Studio native app, Python engine integration, project schema, evidence, packaging, and product UX  
 **Companion evidence:** [`docs/CFD_APP_LANDSCAPE.md`](docs/CFD_APP_LANDSCAPE.md)
 
@@ -43,7 +43,9 @@ evidence-complete result and explain what produced every important number.**
 4. **Fast expert interaction.** The shell stays responsive; long engine work is asynchronous.
 5. **Progressive disclosure.** Broad capability is organized into coherent journeys, not exposed
    as every possible control at once.
-6. **Local ownership.** Core creation, execution, export, and review require no cloud account.
+6. **Local ownership.** Public source builds are account-free. Official gated artifacts require YC
+   authentication before constructing the studio or starting compute; after access is granted,
+   project data, execution, export, and review remain local.
 
 ### 1.2 Non-goals
 
@@ -166,8 +168,8 @@ This section is historical grounding, not permission to infer unlisted features.
 | N4 — Flow Painter | Done | Brush, symmetries, presets, native divergence-free projection, diagnostics, and prediction handoff. | A solver reference for painted ICs remains deferred until viscosity/regime are explicit. |
 | N5.1 — Benchmark suite | Done | Seed × horizon suite, persistence comparison, CSV, and deterministic canonical JSON with SHA-256 integrity. | SHA-256 is not a signature. |
 | N5.2 — coherent evidence slice | Done, milestone still partial | Exact stream classification; legacy provenance findings; selected-cell velocity, vorticity, recovered-pressure, error, and spatial-divergence evidence with source/unit/method metadata and shared calibrated scales (`N5X-INSP-01` passed); energy spectra; legacy, mask-conditioned, and fixed-body-v2 benchmark contracts. Deterministic PNG/PDF reports derive from the same run/model/protocol/hash-linked canonical JSON (`N5X-EXPORT-01` passed). The signing slice now implements detached Ed25519 signatures over the raw canonical-payload SHA-256, explicit key ID/public-key fingerprint/signature bytes/verification state, portable offline CLI verification, revocation-aware trust, deterministic JSON/PNG/PDF sidecar lineage, append-only project evidence, and non-secret provider tests. | `N5X-SIGN-01` remains open until the production macOS Keychain/user-presence path is safely exercised on a supported app build; the canonical report remains explicitly `UNSIGNED` and authenticity lives in its derived sidecar. The overlap analysis is not yet integrated with an archived candidate artifact, so `N5X-VV-01` and `N5X-VV-02` also remain open. |
-| External engineering case | Implementation complete; interactive release smoke pending | The landing action imports STL into **Project → Case Setup → Run → Results → Evidence**. Source bytes/hash, units, topology, transform, voxel adequacy, named waivers, model support, and the operating point gate execution. Results carry physical-reference `Cp`, pressure and viscous fluid traction, integrated force/moment coefficients, velocity/vorticity volume evidence, hotspots, CAD-linked sections, immutable field/scalar evidence, variant lineage, FEA-load CSV provenance, and a streaming legacy-VTK StructuredGrid export of the completed persisted run in approved source-frame SI coordinates. | This remains managed tessellated import, not embedded/associative CAD. Pressure is recovered from predicted velocity; no structural stress or independent spatial error is shown without a reference. Neutral field export has automated format/provenance tests but still requires an external ParaView/manual-open smoke. `N5X-CAD-01`–`04`, `N5X-PHYS-01`, and the full first-user path still require an interactive packaged-app smoke before release status is marked passed. |
-| N6 | Partial; release gate open | `N6-MODEL-01`, `N6-MODEL-02`, and `N6-PROJ-01` through `N6-PROJ-07` passed. The case-centered IA candidate and shared-unit parent/current variant comparison are implemented; procedural 3D, Flow Painter, standalone 2D, and Benchmark Lab now remain permanently available behind the persisted Developer-mode Research Sandbox. External engineering field blobs reopen from content-addressed project evidence. | `N6-SET-01` remains open for production Keychain/user-presence exercise. `N6-IA-01` and `N6-COMP-01` remain release candidates until the interactive acceptance path is exercised. Packaging, notarization, clean-machine, and offline gates remain open. |
+| External engineering case | Implementation complete; interactive release smoke pending | The default path is **Project → Case Setup → Run → Results → Evidence**. Run attempts are checkpointed at start and retain running/succeeded/failed/cancelled state and exact lineage. Cancellation and timeout terminate and replace the sidecar. FEA CSV is explicitly **source-frame surface traction/load data** with the complete transform, units, operating references, integration-area weights, source/model/run/solver lineage, and reported-versus-exported force/moment reconciliation metadata. | This remains managed tessellated import, not embedded/associative CAD or conservative target-mesh mapping. Pressure is recovered from predicted velocity; no structural stress or independent spatial error is shown without a reference. The full first-user path still requires an interactive packaged-app smoke. |
+| N6 | Partial; release gate open | `N6-MODEL-01`, `N6-MODEL-02`, and `N6-PROJ-01` through `N6-PROJ-07` passed. Gated builds defer all sensitive studio/engine initialization until authentication. Malformed settings are quarantined before defaults can save. macOS packaging now requires the exact research pin and an arm64 factory-runtime prefix with manifest, lock, SBOM, and notices. | `N6-SET-01` remains open for production Keychain/user-presence exercise. Developer ID signing/notarization, clean-machine qualification, production TUF-root ceremony, and a separately qualified signed model remain external gates. Intel may run a universal2 review shell, but Intel compute is unsupported. |
 
 Closeout verification on 2026-07-24: **89 Rust correctness tests passed** (the explicit GPU
 performance benchmark remains ignored by default), **27 Python engine tests passed**,
@@ -185,8 +187,9 @@ the persisted-project, immutable-rerun, migration, and navigation gates.
   remains recovered from model-predicted velocity, not an independent reference. Legacy sandbox
   views continue to say recovered pressure rather than `Cp`.
 - **Surface loads:** pressure plus Newtonian viscous traction is integrated over the diffuse
-  immersed interface. These model-derived fluid loads can be exported with run/source provenance
-  for downstream mapping; they are not structural stress or independently validated loads.
+  immersed interface. Exports are source-frame sample data with integration weights and
+  reconciliation metadata, not conservative target-mesh mapping, structural stress, or
+  independently validated loads.
 - **Internal/HVAC:** the internal-flow contract is reference-only and execution-blocked until a
   compatible solver/model implements inlet, outlet, wall, material, and conservation semantics.
 - **Transport:** framed loopback TCP is current. Named shared memory is a planned,
@@ -395,7 +398,7 @@ Priority meanings: **P0** blocks the named phase/release; **P1** is the next coh
 | REQ-UX-01 | P0 | Preserve the grounded premium scientific-instrument design and complete state coverage. | — | UX-AC-01 |
 | REQ-UX-02 | P0 | Organize breadth through journeys, lifecycle stages, contextual inspectors, and progressive disclosure. | REQ-UX-01 | UX-AC-02 |
 | REQ-SCI-01 | P0 | Keep prediction, reference, recovered, derived, verification, validation, consistency, provenance, integrity, and authenticity semantics distinct. | — | SCI-AC-01, SCI-AC-02, SCI-AC-03 |
-| REQ-LOCAL-01 | P0 | Core creation, run, export, reopen, and read-only review remain local-first and account-free. | — | LOCAL-AC-01 |
+| REQ-LOCAL-01 | P0 | Public builds remain account-free. Official gated artifacts authenticate before studio initialization; authorized creation, run, export, reopen, and review remain local-first. | — | LOCAL-AC-01 |
 | REQ-PERF-01 | P0 | Keep UI rendering/input off engine work; coalesce interactive inference and degrade gracefully. | — | PERF-AC-01 |
 
 ### 9.2 N5.x requirements
@@ -411,7 +414,7 @@ Priority meanings: **P0** blocks the named phase/release; **P1** is the next coh
 | REQ-N5-CAD-01 | P0 | Add source-aware CAD preflight, transform approval, adequacy/support gates, and waivers. | REQ-N5-EV-01 | N5X-CAD-01, N5X-CAD-02, N5X-CAD-03, N5X-CAD-04 |
 | REQ-N5-CAD-02 | P0 | Classify occupancy independently along X/Y/Z, persist normalized axis disagreement and odd scanline counts, block disagreement above 2%, and hard-gate open, non-manifold, inconsistent-winding, multi-shell, or self-intersecting sources. Pre-v2 single-axis projects must re-import. | REQ-N5-CAD-01 | N5X-CAD-05 |
 | REQ-N5-PHYS-01 | P0 | Correct pressure terminology and permit `Cp` only after physical nondimensionalization is recorded. | REQ-N5-EV-02 | N5X-PHYS-01 |
-| REQ-N5-LOAD-01 | P0 | Produce versioned pressure/viscous fluid traction, force/moment integration, hotspots, wake indicators, and mapped FEA-load export with exact reference quantities and lineage. | REQ-N5-CAD-01, REQ-N5-PHYS-01 | N5X-LOAD-01, N5X-LOAD-02, N5X-LOAD-03 |
+| REQ-N5-LOAD-01 | P0 | Produce versioned pressure/viscous fluid traction, force/moment integration, hotspots, wake indicators, and source-frame FEA-load export with transform, exact reference quantities, lineage, area weights, and reconciliation metadata. Do not claim conservative target-mesh mapping. | REQ-N5-CAD-01, REQ-N5-PHYS-01 | N5X-LOAD-01, N5X-LOAD-02, N5X-LOAD-03 |
 
 ### 9.3 N6 requirements
 

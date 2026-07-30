@@ -21,7 +21,7 @@ if (!username || !password) {
 }
 
 const client = {
-  app_version: "0.1.0-test",
+  app_version: "0.1.1-test",
   platform: "windows",
   architecture: "x86_64",
 };

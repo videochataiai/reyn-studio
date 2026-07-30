@@ -485,6 +485,14 @@ pub struct EngineHandle {
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+impl EngineHandle {
+    /// Interrupt any blocking request, join the worker, and terminate the
+    /// sidecar process before returning. Safe to call more than once.
+    pub fn terminate(&mut self) {
         cancel_engine_stream(&self.shutdown_stream);
         let (replacement, _) = std::sync::mpsc::channel();
         drop(std::mem::replace(&mut self.tx, replacement));
@@ -1241,7 +1249,17 @@ fn worker(
             }
         }
         let crash = res.as_ref().err().map(ToString::to_string);
-        let _ = msg_tx.send(res.unwrap_or_else(|e| Msg::Error(format!("engine io: {e}"))));
+        let _ = msg_tx.send(res.unwrap_or_else(|error| {
+            let prefix = if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                "engine timeout"
+            } else {
+                "engine io"
+            };
+            Msg::Error(format!("{prefix}: {error}"))
+        }));
         if let Some(detail) = crash {
             if let Some(health) = health.as_ref() {
                 let _ = runtime::record_runtime_failure(
@@ -2090,7 +2108,7 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
     }
 
     #[test]
-    fn engine_handle_drop_cancels_an_inflight_request() {
+    fn explicit_termination_interrupts_an_inflight_request_and_is_idempotent() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2109,7 +2127,7 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         });
         let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
         let (_msg_tx, msg_rx) = std::sync::mpsc::channel();
-        let handle = EngineHandle {
+        let mut handle = EngineHandle {
             tx: cmd_tx,
             rx: msg_rx,
             worker: Some(worker),
@@ -2117,7 +2135,8 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         };
         thread::sleep(Duration::from_millis(25));
         let started = Instant::now();
-        drop(handle);
+        handle.terminate();
+        handle.terminate();
         let result = result_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("cancelled request returns");

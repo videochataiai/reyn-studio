@@ -8,7 +8,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const PROJECT_SCHEMA_VERSION: u32 = 2;
+pub const PROJECT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -86,12 +86,15 @@ pub struct CaseRevision {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleState {
+    Pending,
     Draft,
     Ready,
     Running,
-    Complete,
+    #[serde(alias = "complete")]
+    Succeeded,
     Stale,
     Failed,
+    Cancelled,
     EvidenceLocked,
 }
 
@@ -869,50 +872,98 @@ impl ProjectDocument {
         let version = value["schema_version"].as_u64().ok_or_else(|| {
             ProjectError::Json("project envelope is missing schema_version".into())
         })? as u32;
-        let (manifest, migrated_from, bundled_content, bundle_digest) = match version {
-            1 => {
-                let envelope: ProjectEnvelopeV1 = serde_json::from_value(value)
-                    .map_err(|error| ProjectError::Json(error.to_string()))?;
-                if envelope.manifest.schema_version != 1 {
-                    return Err(ProjectError::UnsupportedSchema(
-                        envelope.manifest.schema_version,
-                    ));
+        let (manifest, migrated_from, bundled_content, bundle_digest, mut load_diagnostics) =
+            match version {
+                1 => {
+                    let envelope: ProjectEnvelopeV1 = serde_json::from_value(value)
+                        .map_err(|error| ProjectError::Json(error.to_string()))?;
+                    if envelope.manifest.schema_version != 1 {
+                        return Err(ProjectError::UnsupportedSchema(
+                            envelope.manifest.schema_version,
+                        ));
+                    }
+                    verify_manifest_integrity(
+                        &envelope.manifest,
+                        &envelope.integrity_sha256,
+                        true,
+                    )?;
+                    (
+                        envelope.manifest.into(),
+                        Some(1),
+                        Vec::new(),
+                        None,
+                        Vec::new(),
+                    )
                 }
-                let canonical = serde_json::to_vec(&envelope.manifest)
-                    .map_err(|error| ProjectError::Json(error.to_string()))?;
-                if sha256_hex(&canonical) != envelope.integrity_sha256 {
-                    return Err(ProjectError::IntegrityMismatch);
+                2 => {
+                    let envelope: ProjectEnvelope = serde_json::from_value(value)
+                        .map_err(|error| ProjectError::Json(error.to_string()))?;
+                    if envelope.manifest.schema_version != 2 {
+                        return Err(ProjectError::UnsupportedSchema(
+                            envelope.manifest.schema_version,
+                        ));
+                    }
+                    let manifest_integrity = verify_manifest_integrity(
+                        &envelope.manifest,
+                        &envelope.integrity_sha256,
+                        true,
+                    )?;
+                    let mut diagnostics = Vec::new();
+                    if let Some(expected) = envelope.bundle_integrity_sha256.as_deref() {
+                        let actual = bundle_integrity_for_schema(
+                            2,
+                            &manifest_integrity,
+                            &envelope.bundled_content,
+                        )?;
+                        if actual != expected {
+                            diagnostics.push(ContentDiagnostic {
+                            kind: ContentDiagnosticKind::BundleIntegrity,
+                            content_sha256: None,
+                            references: Vec::new(),
+                            detail: format!(
+                                "Bundle index integrity mismatch: expected {expected}, received {actual}"
+                            ),
+                        });
+                        }
+                    }
+                    let mut manifest = envelope.manifest;
+                    manifest.schema_version = PROJECT_SCHEMA_VERSION;
+                    (
+                        manifest,
+                        Some(2),
+                        envelope.bundled_content,
+                        None,
+                        diagnostics,
+                    )
                 }
-                (envelope.manifest.into(), Some(1), Vec::new(), None)
-            }
-            PROJECT_SCHEMA_VERSION => {
-                let envelope: ProjectEnvelope = serde_json::from_value(value)
-                    .map_err(|error| ProjectError::Json(error.to_string()))?;
-                if envelope.manifest.schema_version != PROJECT_SCHEMA_VERSION {
-                    return Err(ProjectError::UnsupportedSchema(
-                        envelope.manifest.schema_version,
-                    ));
+                PROJECT_SCHEMA_VERSION => {
+                    let envelope: ProjectEnvelope = serde_json::from_value(value)
+                        .map_err(|error| ProjectError::Json(error.to_string()))?;
+                    if envelope.manifest.schema_version != PROJECT_SCHEMA_VERSION {
+                        return Err(ProjectError::UnsupportedSchema(
+                            envelope.manifest.schema_version,
+                        ));
+                    }
+                    verify_manifest_integrity(
+                        &envelope.manifest,
+                        &envelope.integrity_sha256,
+                        false,
+                    )?;
+                    (
+                        envelope.manifest,
+                        None,
+                        envelope.bundled_content,
+                        envelope.bundle_integrity_sha256,
+                        Vec::new(),
+                    )
                 }
-                let canonical = serde_json::to_vec(&envelope.manifest)
-                    .map_err(|error| ProjectError::Json(error.to_string()))?;
-                if sha256_hex(&canonical) != envelope.integrity_sha256 {
-                    return Err(ProjectError::IntegrityMismatch);
-                }
-                (
-                    envelope.manifest,
-                    None,
-                    envelope.bundled_content,
-                    envelope.bundle_integrity_sha256,
-                )
-            }
-            unsupported => return Err(ProjectError::UnsupportedSchema(unsupported)),
-        };
+                unsupported => return Err(ProjectError::UnsupportedSchema(unsupported)),
+            };
         manifest.validate_loaded()?;
         let manifest_integrity = sha256_hex(
             &serde_json::to_vec(&manifest)
                 .map_err(|error| ProjectError::Json(error.to_string()))?,
         );
-        let mut load_diagnostics = Vec::new();
         if let Some(expected) = bundle_digest {
             let actual = bundle_integrity(&manifest_integrity, &bundled_content)?;
             if actual != expected {
@@ -1297,12 +1348,6 @@ impl ProjectManifest {
         now_utc_unix: u64,
     ) -> Result<(), ProjectError> {
         self.ensure_unique_id(&run.run_id)?;
-        if !matches!(
-            run.state,
-            LifecycleState::Complete | LifecycleState::Failed | LifecycleState::EvidenceLocked
-        ) {
-            return Err(ProjectError::NonTerminalRun(run.run_id));
-        }
         validate_run(&run)?;
         let case = self
             .cases
@@ -1337,7 +1382,12 @@ impl ProjectManifest {
                 run.run_id
             )));
         }
-        if run.case_revision_id == case.active_revision_id {
+        if run.case_revision_id == case.active_revision_id
+            && matches!(
+                run.state,
+                LifecycleState::Succeeded | LifecycleState::EvidenceLocked
+            )
+        {
             case.stale_stages.retain(|stage| {
                 !matches!(
                     stage,
@@ -1348,6 +1398,95 @@ impl ProjectManifest {
             });
         }
         case.runs.push(run);
+        self.modified_utc_unix = now_utc_unix;
+        Ok(())
+    }
+
+    /// Move a persisted pending/running attempt to one terminal state while
+    /// preserving its identity, exact submitted inputs, and lineage.
+    pub fn finish_run_attempt(
+        &mut self,
+        case_id: &str,
+        run: RunRecord,
+        now_utc_unix: u64,
+    ) -> Result<(), ProjectError> {
+        if !matches!(
+            run.state,
+            LifecycleState::Succeeded
+                | LifecycleState::Failed
+                | LifecycleState::Cancelled
+                | LifecycleState::EvidenceLocked
+        ) {
+            return Err(ProjectError::NonTerminalRun(run.run_id));
+        }
+        validate_run(&run)?;
+        let case = self
+            .cases
+            .iter_mut()
+            .find(|case| case.case_id == case_id)
+            .ok_or_else(|| ProjectError::MissingObject {
+                object_id: case_id.into(),
+            })?;
+        let run_index = case
+            .runs
+            .iter()
+            .position(|candidate| candidate.run_id == run.run_id)
+            .ok_or_else(|| ProjectError::MissingObject {
+                object_id: run.run_id.clone(),
+            })?;
+        let prior = &case.runs[run_index];
+        if !matches!(
+            prior.state,
+            LifecycleState::Pending | LifecycleState::Running
+        ) {
+            return Err(ProjectError::InvalidLineage(format!(
+                "run attempt {} is already terminal",
+                run.run_id
+            )));
+        }
+        if prior.parent_run_id != run.parent_run_id
+            || prior.case_revision_id != run.case_revision_id
+            || prior.created_utc_unix != run.created_utc_unix
+            || !same_attempt_inputs(&prior.manifest, &run.manifest)
+        {
+            return Err(ProjectError::InvalidLineage(format!(
+                "run attempt {} changed immutable submitted inputs or lineage",
+                run.run_id
+            )));
+        }
+        if let Some(parent) = &run.parent_run_id {
+            let parent_run = case
+                .runs
+                .iter()
+                .find(|candidate| candidate.run_id == *parent)
+                .ok_or_else(|| {
+                    ProjectError::InvalidLineage(format!(
+                        "rerun parent {parent} is not in case {case_id}"
+                    ))
+                })?;
+            validate_determinism(&run, parent_run)?;
+        } else if run.manifest.determinism.is_some() {
+            return Err(ProjectError::InvalidLineage(format!(
+                "run {} has determinism evidence without a parent run",
+                run.run_id
+            )));
+        }
+        let clears_run_staleness = run.case_revision_id == case.active_revision_id
+            && matches!(
+                run.state,
+                LifecycleState::Succeeded | LifecycleState::EvidenceLocked
+            );
+        case.runs[run_index] = run;
+        if clears_run_staleness {
+            case.stale_stages.retain(|stage| {
+                !matches!(
+                    stage,
+                    DependencyStage::Contract
+                        | DependencyStage::Discretization
+                        | DependencyStage::Run
+                )
+            });
+        }
         self.modified_utc_unix = now_utc_unix;
         Ok(())
     }
@@ -1575,14 +1714,6 @@ impl ProjectManifest {
             let mut prior_runs = std::collections::HashSet::new();
             for run in &case.runs {
                 insert(&run.run_id)?;
-                if !matches!(
-                    run.state,
-                    LifecycleState::Complete
-                        | LifecycleState::Failed
-                        | LifecycleState::EvidenceLocked
-                ) {
-                    return Err(ProjectError::NonTerminalRun(run.run_id.clone()));
-                }
                 if !prior_revisions.contains(&run.case_revision_id) {
                     return Err(ProjectError::MissingObject {
                         object_id: run.case_revision_id.clone(),
@@ -1910,21 +2041,64 @@ fn require_sha256(object_id: &str, digest: &str) -> Result<(), ProjectError> {
     }
 }
 
+fn same_attempt_inputs(left: &RunManifest, right: &RunManifest) -> bool {
+    left.schema_version == right.schema_version
+        && left.app == right.app
+        && left.engine == right.engine
+        && left.model == right.model
+        && left.solver == right.solver
+        && left.converter == right.converter
+        && left.exact_contract == right.exact_contract
+        && left.exact_settings == right.exact_settings
+        && left.seeds == right.seeds
+        && left.device == right.device
+        && left.waivers == right.waivers
+        && left.missing_dependencies == right.missing_dependencies
+}
+
 fn validate_run(run: &RunRecord) -> Result<(), ProjectError> {
     if run.manifest.schema_version == 0 || run.manifest.schema_version > PROJECT_SCHEMA_VERSION {
         return Err(ProjectError::UnsupportedSchema(run.manifest.schema_version));
     }
-    if run.completed_utc_unix < run.created_utc_unix {
-        return Err(ProjectError::InvalidLineage(format!(
-            "run {} completes before it starts",
-            run.run_id
-        )));
-    }
-    if run.manifest.stop_reason.trim().is_empty() {
-        return Err(ProjectError::InvalidLineage(format!(
-            "run {} has no stop reason",
-            run.run_id
-        )));
+    match run.state {
+        LifecycleState::Pending | LifecycleState::Running => {
+            if run.completed_utc_unix != 0
+                || run.manifest.runtime_ms != 0
+                || !run.manifest.output_sha256.is_empty()
+                || !run.manifest.scalar_outputs.is_empty()
+                || run.manifest.determinism.is_some()
+                || !run.calibrated_views.is_empty()
+                || !matches!(run.manifest.stop_reason.as_str(), "pending" | "running")
+            {
+                return Err(ProjectError::InvalidLineage(format!(
+                    "run {} has terminal outputs or timestamps before completion",
+                    run.run_id
+                )));
+            }
+        }
+        LifecycleState::Succeeded
+        | LifecycleState::Failed
+        | LifecycleState::Cancelled
+        | LifecycleState::EvidenceLocked => {
+            if run.completed_utc_unix < run.created_utc_unix {
+                return Err(ProjectError::InvalidLineage(format!(
+                    "run {} completes before it starts",
+                    run.run_id
+                )));
+            }
+            if run.manifest.stop_reason.trim().is_empty() {
+                return Err(ProjectError::InvalidLineage(format!(
+                    "run {} has no stop reason",
+                    run.run_id
+                )));
+            }
+        }
+        LifecycleState::Draft | LifecycleState::Ready | LifecycleState::Stale => {
+            return Err(ProjectError::InvalidLineage(format!(
+                "run {} uses a non-attempt lifecycle state",
+                run.run_id
+            )));
+        }
     }
     for component in [
         Some(&run.manifest.app),
@@ -2108,8 +2282,16 @@ fn bundle_integrity(
     manifest_integrity_sha256: &str,
     objects: &[BundledContentWire],
 ) -> Result<String, ProjectError> {
+    bundle_integrity_for_schema(PROJECT_SCHEMA_VERSION, manifest_integrity_sha256, objects)
+}
+
+fn bundle_integrity_for_schema(
+    schema_version: u32,
+    manifest_integrity_sha256: &str,
+    objects: &[BundledContentWire],
+) -> Result<String, ProjectError> {
     let payload = BundleIntegrityPayload {
-        schema_version: PROJECT_SCHEMA_VERSION,
+        schema_version,
         manifest_integrity_sha256,
         objects: objects
             .iter()
@@ -2345,6 +2527,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn verify_manifest_integrity(
+    manifest: &impl Serialize,
+    expected: &str,
+    allow_legacy_complete_state: bool,
+) -> Result<String, ProjectError> {
+    let canonical =
+        serde_json::to_vec(manifest).map_err(|error| ProjectError::Json(error.to_string()))?;
+    if sha256_hex(&canonical) == expected {
+        return Ok(expected.to_owned());
+    }
+    if allow_legacy_complete_state {
+        let current =
+            String::from_utf8(canonical).map_err(|error| ProjectError::Json(error.to_string()))?;
+        let legacy = current.replace("\"state\":\"succeeded\"", "\"state\":\"complete\"");
+        if sha256_hex(legacy.as_bytes()) == expected {
+            return Ok(expected.to_owned());
+        }
+    }
+    Err(ProjectError::IntegrityMismatch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2392,7 +2595,7 @@ mod tests {
             revision_id,
             30,
             31,
-            LifecycleState::Complete,
+            LifecycleState::Succeeded,
             RunManifest {
                 schema_version: 1,
                 app: VersionedComponent {
@@ -2436,6 +2639,19 @@ mod tests {
                 method: "direct_flow_map".into(),
             }],
         )
+    }
+
+    fn running_run(id: &str, parent: Option<&str>, revision_id: &str) -> RunRecord {
+        let mut attempt = run(id, parent, revision_id);
+        attempt.completed_utc_unix = 0;
+        attempt.state = LifecycleState::Running;
+        attempt.manifest.runtime_ms = 0;
+        attempt.manifest.stop_reason = "running".into();
+        attempt.manifest.output_sha256.clear();
+        attempt.manifest.scalar_outputs.clear();
+        attempt.manifest.determinism = None;
+        attempt.calibrated_views.clear();
+        attempt
     }
 
     fn project_with_run() -> ProjectManifest {
@@ -2531,6 +2747,72 @@ mod tests {
     }
 
     #[test]
+    fn attempts_persist_at_start_finish_once_and_allow_immediate_retry() {
+        let mut project = project_with_run();
+        let running = running_run("run-2", Some("run-1"), "case-rev-1");
+        let submitted_contract = running.manifest.exact_contract.clone();
+        let submitted_settings = running.manifest.exact_settings.clone();
+        project.append_run("case-1", running, 40).unwrap();
+
+        let bytes = project.to_bytes().unwrap();
+        let mut reopened = ProjectManifest::from_bytes(&bytes).unwrap();
+        let persisted = reopened.run("run-2").unwrap();
+        assert_eq!(persisted.state(), LifecycleState::Running);
+        assert_eq!(persisted.manifest().exact_contract, submitted_contract);
+        assert_eq!(persisted.manifest().exact_settings, submitted_settings);
+
+        let mut changed = persisted.clone();
+        changed.state = LifecycleState::Cancelled;
+        changed.completed_utc_unix = 41;
+        changed.manifest.stop_reason = "operator_cancelled".into();
+        changed.manifest.exact_settings = json!({"changed": true});
+        assert!(reopened
+            .finish_run_attempt("case-1", changed, 41)
+            .unwrap_err()
+            .to_string()
+            .contains("immutable submitted inputs"));
+        assert_eq!(
+            reopened.run("run-2").unwrap().state(),
+            LifecycleState::Running
+        );
+
+        let mut cancelled = reopened.run("run-2").unwrap().clone();
+        cancelled.state = LifecycleState::Cancelled;
+        cancelled.completed_utc_unix = 42;
+        cancelled.manifest.runtime_ms = 12;
+        cancelled.manifest.stop_reason = "operator_cancelled".into();
+        reopened
+            .finish_run_attempt("case-1", cancelled, 42)
+            .unwrap();
+
+        let retry = running_run("run-3", Some("run-1"), "case-rev-1");
+        reopened.append_run("case-1", retry, 43).unwrap();
+        let mut failed = reopened.run("run-3").unwrap().clone();
+        failed.state = LifecycleState::Failed;
+        failed.completed_utc_unix = 44;
+        failed.manifest.runtime_ms = 8;
+        failed.manifest.stop_reason = "timeout: deterministic fixture".into();
+        reopened.finish_run_attempt("case-1", failed, 44).unwrap();
+
+        let saved = ProjectManifest::from_bytes(&reopened.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            saved.run("run-2").unwrap().state(),
+            LifecycleState::Cancelled
+        );
+        assert_eq!(
+            saved.run("run-2").unwrap().manifest().stop_reason,
+            "operator_cancelled"
+        );
+        assert_eq!(saved.run("run-3").unwrap().state(), LifecycleState::Failed);
+        assert!(saved
+            .run("run-3")
+            .unwrap()
+            .manifest()
+            .stop_reason
+            .starts_with("timeout:"));
+    }
+
+    #[test]
     fn rerun_appends_new_id_and_parent_without_mutating_completed_run() {
         let mut project = project_with_run();
         let original = project.cases()[0].runs()[0].clone();
@@ -2622,7 +2904,7 @@ mod tests {
         assert_eq!(project.cases()[0].runs()[0], original);
         assert_eq!(
             project.cases()[0].runs()[1].state(),
-            LifecycleState::Complete
+            LifecycleState::Succeeded
         );
     }
 
@@ -2691,7 +2973,7 @@ mod tests {
                     case_revision_id: "case-rev-1".into(),
                     created_utc_unix: 4,
                     completed_utc_unix: 5,
-                    state: LifecycleState::Complete,
+                    state: LifecycleState::Succeeded,
                     manifest: RunManifestV1 {
                         schema_version: 1,
                         app: VersionedComponent {
@@ -2766,6 +3048,41 @@ mod tests {
                 .unwrap()
                 .evidence(),
             migrated.evidence()
+        );
+    }
+
+    #[test]
+    fn schema_v2_migration_preserves_legacy_complete_runs_and_bundle_integrity() {
+        let mut envelope: ProjectEnvelope =
+            serde_json::from_slice(&project_with_run().to_bytes().unwrap()).unwrap();
+        envelope.schema_version = 2;
+        envelope.manifest.schema_version = 2;
+        let canonical = serde_json::to_string(&envelope.manifest)
+            .unwrap()
+            .replace("\"state\":\"succeeded\"", "\"state\":\"complete\"");
+        let manifest_digest = sha256_hex(canonical.as_bytes());
+        envelope.integrity_sha256 = manifest_digest.clone();
+        envelope.bundle_integrity_sha256 =
+            Some(bundle_integrity_for_schema(2, &manifest_digest, &[]).unwrap());
+        let mut value = serde_json::to_value(envelope).unwrap();
+        value["manifest"]["cases"][0]["runs"][0]["state"] = json!("complete");
+
+        let (migrated, from) =
+            ProjectManifest::decode(&serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        assert_eq!(from, Some(2));
+        assert_eq!(migrated.schema_version(), PROJECT_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.cases()[0].runs()[0].state(),
+            LifecycleState::Succeeded
+        );
+        assert_eq!(
+            ProjectManifest::from_bytes(&migrated.to_bytes().unwrap())
+                .unwrap()
+                .cases()[0]
+                .runs()[0]
+                .state(),
+            LifecycleState::Succeeded
         );
     }
 

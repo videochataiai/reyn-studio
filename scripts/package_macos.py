@@ -29,6 +29,7 @@ from macos_packaging import (
     file_manifest,
     has_failures,
     info_plist,
+    load_macos_release_pins,
     load_config,
     print_checks,
     require_executable_architectures,
@@ -36,6 +37,7 @@ from macos_packaging import (
     require_packaging_toolchain,
     resolve_research_source,
     resource_metadata,
+    stage_factory_runtime,
     run,
     rustc_host_target,
     runtime_requirements,
@@ -43,6 +45,8 @@ from macos_packaging import (
     standalone_blockers,
     validate_bundle,
     validate_research_dependency_lock,
+    validate_research_source_pin,
+    validate_runtime_dependency_lock,
     write_sha256sums,
     write_json,
 )
@@ -261,7 +265,12 @@ def package(args: argparse.Namespace) -> int:
         f"{', '.join(TARGET_ARCHITECTURES[target])}"
     )
     research_source = resolve_research_source(root, args.research_source_dir)
-    dependency_errors = validate_research_dependency_lock(research_source)
+    pins = load_macos_release_pins(root)
+    dependency_errors = [
+        *validate_research_source_pin(root, research_source),
+        *validate_research_dependency_lock(research_source),
+        *validate_runtime_dependency_lock(root),
+    ]
     if dependency_errors:
         raise RuntimeError(
             "research dependency inventory does not match packaged SBOM: "
@@ -280,8 +289,10 @@ def package(args: argparse.Namespace) -> int:
         contents = bundle / "Contents"
         macos = contents / "MacOS"
         resources = contents / "Resources"
+        frameworks = contents / "Frameworks"
         macos.mkdir(parents=True)
         resources.mkdir(parents=True)
+        frameworks.mkdir(parents=True)
 
         binary, architecture_slices, source_fingerprint = build_binary(
             config, target, target_dir, stage_root
@@ -310,6 +321,14 @@ def package(args: argparse.Namespace) -> int:
         copy_research_resources(research_source, resources / "research")
         copy_security_resources(root, resources / "security")
         write_json(resources / "runtime-requirements.json", runtime_requirements())
+        runtime_manifest = stage_factory_runtime(
+            args.runtime_dir.resolve(),
+            frameworks / "ReynPython",
+            resources=resources,
+            source_revision=str(pins["research_revision"]),
+            build_epoch=args.source_date_epoch,
+            compliance_root=root / "packaging/macos",
+        )
         current_package_fingerprint = package_input_fingerprint(root, research_source)
         if current_package_fingerprint != package_fingerprint:
             raise RuntimeError(
@@ -332,7 +351,13 @@ def package(args: argparse.Namespace) -> int:
             "minimum_macos_version": config.minimum_system_version,
             "rust_target": target,
             "architectures": list(actual_architectures),
+            "compute_architectures": ["arm64"],
+            "unsupported_compute_architectures": ["x86_64"],
             "architecture_slices": architecture_slices,
+            "factory_runtime_id": runtime_manifest["runtime_id"],
+            "factory_runtime_manifest_sha256": sha256_file(
+                frameworks / "ReynPython/runtime-manifest.cjson"
+            ),
             "resource_set": resource_metadata(resources),
             "apple_credentials_used": False,
             "developer_id_signed": False,
@@ -421,6 +446,12 @@ def parse_args() -> argparse.Namespace:
             "source directory for lightweight research modules "
             "(default: REYN_RESEARCH_SOURCE_DIR or sibling reyn-research)"
         ),
+    )
+    parser.add_argument(
+        "--runtime-dir",
+        type=Path,
+        required=True,
+        help="preassembled relocatable macOS arm64 ReynPython prefix",
     )
     parser.add_argument(
         "--source-date-epoch",

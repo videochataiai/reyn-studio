@@ -5,7 +5,10 @@
 //! `REYN_ACCESS_ENDPOINT` are set at build time. Credentials and server secrets
 //! never enter the binary or repository.
 
-use crate::{app::ReynApp, theme};
+use crate::{
+    app::{AppBootstrap, ReynApp},
+    theme,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::mpsc::{self, Receiver},
@@ -65,35 +68,69 @@ pub fn build_contract_json() -> String {
 }
 
 pub struct RootApp {
-    studio: ReynApp,
+    studio: Option<ReynApp>,
+    bootstrap: AppBootstrap,
     gate: Option<AccessGate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StudioLifecycleAction {
+    Keep,
+    Start,
+    Drop,
+}
+
+fn studio_lifecycle_action(
+    gate_required: bool,
+    access_granted: bool,
+    studio_running: bool,
+) -> StudioLifecycleAction {
+    let should_run = !gate_required || access_granted;
+    match (should_run, studio_running) {
+        (true, false) => StudioLifecycleAction::Start,
+        (false, true) => StudioLifecycleAction::Drop,
+        _ => StudioLifecycleAction::Keep,
+    }
 }
 
 impl RootApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let gate_required = access_required();
+        let bootstrap = AppBootstrap::prepare(cc);
+        let studio = (!gate_required).then(|| bootstrap.start());
         Self {
-            studio: ReynApp::new(cc),
-            gate: access_required().then(AccessGate::new),
+            studio,
+            bootstrap,
+            gate: gate_required.then(AccessGate::new),
         }
     }
 }
 
 impl eframe::App for RootApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let gate_required = self.gate.is_some();
         if let Some(gate) = self.gate.as_mut() {
             let now_utc_unix = unix_now().unwrap_or(u64::MAX);
+            gate.poll_at(now_utc_unix);
             gate.expire_if_needed(now_utc_unix);
             if let Some(delay) = gate.time_until_expiry(now_utc_unix) {
                 ui.ctx().request_repaint_after(delay);
             }
         }
-        let unlocked = self.gate.as_ref().is_none_or(AccessGate::is_granted);
-        if unlocked {
-            eframe::App::ui(&mut self.studio, ui, frame);
-            return;
+        let access_granted = self.gate.as_ref().is_none_or(AccessGate::is_granted);
+        match studio_lifecycle_action(gate_required, access_granted, self.studio.is_some()) {
+            StudioLifecycleAction::Start => self.studio = Some(self.bootstrap.start()),
+            StudioLifecycleAction::Drop => {
+                // Dropping ReynApp first drops EngineHandle, interrupts an
+                // in-flight sidecar request, joins its worker, and terminates
+                // the child before any login UI is shown again.
+                self.studio.take();
+            }
+            StudioLifecycleAction::Keep => {}
         }
-
-        if let Some(gate) = self.gate.as_mut() {
+        if let Some(studio) = self.studio.as_mut() {
+            eframe::App::ui(studio, ui, frame);
+        } else if let Some(gate) = self.gate.as_mut() {
             gate.ui(ui);
         }
     }
@@ -560,6 +597,30 @@ mod tests {
         if option_env!("REYN_ACCESS_REQUIRED").is_none() {
             assert!(!access_required());
         }
+    }
+
+    #[test]
+    fn lifecycle_never_starts_gated_studio_before_access_and_drops_it_on_expiry() {
+        assert_eq!(
+            studio_lifecycle_action(true, false, false),
+            StudioLifecycleAction::Keep
+        );
+        assert_eq!(
+            studio_lifecycle_action(true, true, false),
+            StudioLifecycleAction::Start
+        );
+        assert_eq!(
+            studio_lifecycle_action(true, false, true),
+            StudioLifecycleAction::Drop
+        );
+        assert_eq!(
+            studio_lifecycle_action(false, false, false),
+            StudioLifecycleAction::Start
+        );
+        assert_eq!(
+            studio_lifecycle_action(false, false, true),
+            StudioLifecycleAction::Keep
+        );
     }
 
     #[test]

@@ -236,11 +236,32 @@ struct CadCase {
     playback: HorizonPlayback,
 }
 
+fn has_complete_fea_load_field(case: &CadCase) -> bool {
+    let n = case.result_grid;
+    let Some(cube) = n.checked_mul(n).and_then(|square| square.checked_mul(n)) else {
+        return false;
+    };
+    !case.pending
+        && n >= 3
+        && case.active_run_id.is_some()
+        && case.workflow.result.is_some()
+        && case.workflow.source_revision_id.is_some()
+        && case.workflow.case_revision_id.is_some()
+        && case.workflow.model_sha256.is_some()
+        && case.mask.len() == cube
+        && case.cp.len() == cube
+        && case.traction.len() == 3 * cube
+}
+
 #[derive(Clone)]
 struct PendingCadRun {
     request_id: String,
+    run_id: String,
     workflow: engineering::ExternalFlowCase,
+    parent_run_id: Option<String>,
+    started_utc_unix: u64,
     started_at: std::time::Instant,
+    manifest: project::RunManifest,
 }
 
 struct PendingOrientation {
@@ -498,17 +519,15 @@ impl HorizonPlayback {
     }
 }
 
-/// What an arriving engine field is allowed to become. The engine is a blocking
-/// sidecar with no cancel channel, so this classification is the whole of the
-/// cancellation guarantee: a cancelled or stale request can never be recorded.
+/// What an arriving engine field is allowed to become. Cancellation terminates
+/// the blocking sidecar and starts a fresh engine; this classifier remains a
+/// second-line stale-generation guard for already queued UI messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CadResultDisposition {
     /// A horizon-playback fetch for this step: display-only.
     Preview(u32),
     /// The in-flight run: record it as an immutable run.
     Record,
-    /// The operator cancelled this request; dropping it is the expected outcome.
-    DiscardCancelled,
     /// Nothing is waiting for this request (superseded case edit, reimport…).
     DiscardStale,
 }
@@ -517,7 +536,6 @@ fn classify_cad_result(
     request_id: &str,
     preview_fetch: Option<(u32, &str)>,
     pending_run: Option<&str>,
-    cancelled: &[String],
 ) -> CadResultDisposition {
     if let Some((step, fetching)) = preview_fetch {
         if fetching == request_id {
@@ -526,9 +544,6 @@ fn classify_cad_result(
     }
     if pending_run == Some(request_id) {
         return CadResultDisposition::Record;
-    }
-    if cancelled.iter().any(|entry| entry == request_id) {
-        return CadResultDisposition::DiscardCancelled;
     }
     CadResultDisposition::DiscardStale
 }
@@ -821,9 +836,6 @@ pub struct ReynApp {
     /// Active numeric interaction, used to coalesce DragValue/slider repaints
     /// into one meaningful undo transaction.
     case_edit_transaction: Option<CaseEditTransaction>,
-    /// Requests the operator cancelled. Their results are discarded on arrival
-    /// so a cancelled run can never leave a partial result in the chain.
-    cancelled_requests: Vec<String>,
 }
 
 impl Default for ReynApp {
@@ -974,35 +986,59 @@ impl Default for ReynApp {
             orientation_pending: None,
             case_draft_history: engineering::CaseDraftHistory::default(),
             case_edit_transaction: None,
-            cancelled_requests: Vec::new(),
         }
     }
 }
 
+/// GPU/UI state that is safe to prepare before an official build authenticates.
+///
+/// Starting from this value is the boundary that loads settings and projects,
+/// scans models, and launches the Python sidecar. The access gate keeps the
+/// bootstrap but does not cross that boundary until a session is granted.
+#[derive(Clone)]
+pub struct AppBootstrap {
+    repaint_context: egui::Context,
+    gpu_ready: bool,
+}
+
+impl AppBootstrap {
+    pub fn prepare(cc: &eframe::CreationContext<'_>) -> Self {
+        let gpu_ready = cc.wgpu_render_state.as_ref().is_some_and(|render_state| {
+            gpu::install(render_state);
+            true
+        });
+        Self {
+            repaint_context: cc.egui_ctx.clone(),
+            gpu_ready,
+        }
+    }
+
+    pub fn start(&self) -> ReynApp {
+        ReynApp::new_from_bootstrap(self)
+    }
+}
+
 impl ReynApp {
-    /// Build the app and register the native wgpu bloom renderer (N2). Falls
-    /// back to the CPU glow if the wgpu backend is somehow unavailable.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new_from_bootstrap(bootstrap: &AppBootstrap) -> Self {
         let mut app = Self {
-            repaint_context: Some(cc.egui_ctx.clone()),
+            repaint_context: Some(bootstrap.repaint_context.clone()),
             ..Self::default()
         };
         app.attach_engine_repaint_wake();
         apply_with_contrast(
-            &cc.egui_ctx,
+            &bootstrap.repaint_context,
             app.settings.theme == settings::ThemeMode::HighContrast,
         );
-        set_reduced_motion(&cc.egui_ctx, app.settings.reduced_motion);
+        set_reduced_motion(&bootstrap.repaint_context, app.settings.reduced_motion);
         // Persisted display preferences take effect from the first frame.
-        cc.egui_ctx.set_zoom_factor(app.settings.ui_scale);
+        bootstrap
+            .repaint_context
+            .set_zoom_factor(app.settings.ui_scale);
         field2d::set_view_colormap(app.settings.colormap);
         app.section_axis = app.settings.default_section_axis;
         app.section_quantity = app.settings.default_section_quantity;
         app.input_units = app.settings.input_units;
-        if let Some(rs) = cc.wgpu_render_state.as_ref() {
-            gpu::install(rs);
-            app.gpu_ready = true;
-        }
+        app.gpu_ready = bootstrap.gpu_ready;
         // Native macOS menu bar replaces the deleted in-app menu row (§4.1).
         // If installation fails, keyboard shortcuts and in-screen actions
         // keep every command reachable.
@@ -1253,23 +1289,12 @@ impl eframe::App for ReynApp {
                             .as_ref()
                             .and_then(|case| case.pending_run.as_ref())
                             .map(|pending| pending.request_id.as_str()),
-                        &self.cancelled_requests,
                     );
                     match disposition {
                         // A horizon-playback fetch: display-only, so it lands in
                         // the preview cache and nothing else is touched.
                         CadResultDisposition::Preview(step) => {
                             self.install_horizon_frame(step, f);
-                            continue;
-                        }
-                        CadResultDisposition::DiscardCancelled => {
-                            self.project_notice = Some((
-                                format!(
-                                    "Discarded the cancelled run {}: no result, run, or evidence was recorded.",
-                                    short_id(&f.request_id)
-                                ),
-                                false,
-                            ));
                             continue;
                         }
                         CadResultDisposition::DiscardStale => {
@@ -1478,6 +1503,44 @@ impl eframe::App for ReynApp {
                     self.engine_ok = true;
                 }
                 engine::Msg::Error(e) => {
+                    if let Some(run_id) = self
+                        .cad
+                        .as_ref()
+                        .and_then(|case| case.pending_run.as_ref())
+                        .map(|pending| pending.run_id.clone())
+                    {
+                        let is_timeout = e.to_ascii_lowercase().contains("timed out")
+                            || e.to_ascii_lowercase().contains("timeout");
+                        let reason = if is_timeout {
+                            format!("timeout: {e}")
+                        } else {
+                            format!("sidecar_failure: {e}")
+                        };
+                        let persisted = self.finish_pending_external_flow_attempt(
+                            project::LifecycleState::Failed,
+                            &reason,
+                        );
+                        self.clear_pending_external_flow();
+                        self.interrupt_and_restart_engine();
+                        self.project_notice = Some(match persisted {
+                            Ok(_) => (
+                                format!(
+                                    "Attempt {} {} and was persisted. The blocking sidecar was terminated; a fresh engine is starting for retry.",
+                                    short_id(&run_id),
+                                    if is_timeout { "timed out" } else { "failed" }
+                                ),
+                                true,
+                            ),
+                            Err(error) => (
+                                format!(
+                                    "Attempt {} failed and the sidecar was terminated, but terminal persistence failed: {error}",
+                                    short_id(&run_id)
+                                ),
+                                true,
+                            ),
+                        });
+                        continue;
+                    }
                     let inspector_failed = self.bench_inspector_pending;
                     let suite_failed = self.bench_running;
                     let library_failed = self.library.busy;
@@ -1636,6 +1699,37 @@ fn diagnostics(ps: &[flow::Particle]) -> (f32, f32, f32, usize) {
         q += 0.5 * (p.speed * p.speed - p.vort * p.vort);
     }
     (hel / n * 0.1, ens / n, q / n, ps.len())
+}
+
+fn write_calculation_export<W: std::io::Write>(
+    writer: &mut W,
+    provenance: &serde_json::Value,
+    samples: usize,
+    helicity: f32,
+    enstrophy: f32,
+    q_criterion: f32,
+    density_lo: f32,
+    opacity: f32,
+) -> Result<(), String> {
+    let provenance_json = serde_json::to_string(provenance)
+        .map_err(|error| format!("Could not serialize calculation provenance: {error}"))?;
+    writeln!(
+        writer,
+        "# reyn_calculation_provenance_json={provenance_json}"
+    )
+    .and_then(|_| {
+        writeln!(
+            writer,
+            "metric,value,units,source_class\n\
+             samples,{samples},count,rendered_model_field\n\
+             helicity,{helicity:.6e},display_normalized,derived_from_rendered_model_field\n\
+             enstrophy,{enstrophy:.6e},display_normalized,derived_from_rendered_model_field\n\
+             q_criterion,{q_criterion:.6},display_normalized,derived_from_rendered_model_field\n\
+             density_lo,{density_lo:.3},display_fraction,viewport_setting\n\
+             opacity,{opacity:.3},display_fraction,viewport_setting"
+        )
+    })
+    .map_err(|error| format!("Calculation export write failed: {error}"))
 }
 
 fn now_utc_unix() -> u64 {
@@ -1860,38 +1954,113 @@ impl ReynApp {
         }
     }
 
-    /// Stop waiting for the in-flight run. The engine is a single blocking
-    /// sidecar, so the model pass it has already started cannot be interrupted;
-    /// what cancelling guarantees is that its result is discarded on arrival and
-    /// never becomes a run, a result, or evidence. The UI says exactly that.
-    fn cancel_external_flow(&mut self) {
-        let Some(case) = self.cad.as_mut() else {
-            return;
-        };
-        let Some(request_id) = case.pending_request_id.clone() else {
-            return;
-        };
-        case.pending = false;
-        case.pending_request_id = None;
-        case.pending_run = None;
-        case.workflow.stage = if case.workflow.ready() {
-            engineering::CaseStage::Ready
-        } else {
-            engineering::CaseStage::Setup
-        };
-        self.cancelled_requests.push(request_id.clone());
-        // One entry per cancelled run; a handful is all the notice text needs.
-        if self.cancelled_requests.len() > 16 {
-            self.cancelled_requests.remove(0);
+    fn finish_pending_external_flow_attempt(
+        &mut self,
+        state: project::LifecycleState,
+        reason: &str,
+    ) -> Result<String, String> {
+        if !matches!(
+            state,
+            project::LifecycleState::Failed | project::LifecycleState::Cancelled
+        ) {
+            return Err("external-flow interruption requires failed or cancelled state".into());
         }
-        self.engine_status = "○ Run cancelled".into();
-        self.project_notice = Some((
-            format!(
-                "Cancelled run {}. Its result will be discarded when the engine returns; no run, result, or evidence was recorded.",
-                short_id(&request_id)
+        self.project_write_access("Persisting the terminal run attempt")?;
+        let pending = self
+            .cad
+            .as_ref()
+            .and_then(|case| case.pending_run.clone())
+            .ok_or_else(|| "no external-flow attempt is pending".to_string())?;
+        let now = now_utc_unix();
+        let mut manifest = pending.manifest.clone();
+        manifest.runtime_ms = pending.started_at.elapsed().as_millis() as u64;
+        manifest.stop_reason = reason.replace(['\r', '\n'], " ");
+        if state == project::LifecycleState::Failed {
+            manifest.warnings.push(manifest.stop_reason.clone());
+        }
+        let run = project::RunRecord::new(
+            pending.run_id.clone(),
+            pending.parent_run_id,
+            pending
+                .workflow
+                .case_revision_id
+                .clone()
+                .ok_or_else(|| "pending run has no case revision".to_string())?,
+            pending.started_utc_unix,
+            now,
+            state,
+            manifest,
+            Vec::new(),
+        );
+        let case_id = pending.workflow.case_id;
+        let run_id = pending.run_id;
+        self.transact_project(
+            "Persisting the terminal run attempt",
+            now,
+            move |project_manifest| project_manifest.finish_run_attempt(&case_id, run, now),
+        )?;
+        self.project
+            .checkpoint_recovery(now)
+            .map_err(|error| error.to_string())?;
+        Ok(run_id)
+    }
+
+    fn clear_pending_external_flow(&mut self) {
+        if let Some(case) = self.cad.as_mut() {
+            case.pending = false;
+            case.pending_request_id = None;
+            case.pending_run = None;
+            case.workflow.stage = if case.workflow.ready() {
+                engineering::CaseStage::Ready
+            } else {
+                engineering::CaseStage::Setup
+            };
+        }
+    }
+
+    fn interrupt_and_restart_engine(&mut self) {
+        self.engine.terminate();
+        self.engine = engine::EngineHandle::spawn_with_config(self.settings.engine_config());
+        self.attach_engine_repaint_wake();
+        self.engine_status = "○ Restarting engine after interrupted computation…".into();
+        self.engine_ok = false;
+        self.dependencies_dirty = true;
+    }
+
+    /// Persist cancellation, interrupt the blocking sidecar request, terminate
+    /// the old process, and start a fresh engine so retry is immediately safe.
+    fn cancel_external_flow(&mut self) {
+        let Some((request_id, run_id)) = self.cad.as_ref().and_then(|case| {
+            Some((
+                case.pending_request_id.clone()?,
+                case.pending_run.as_ref()?.run_id.clone(),
+            ))
+        }) else {
+            return;
+        };
+        let persisted = self.finish_pending_external_flow_attempt(
+            project::LifecycleState::Cancelled,
+            "operator_cancelled",
+        );
+        self.clear_pending_external_flow();
+        self.interrupt_and_restart_engine();
+        self.project_notice = Some(match persisted {
+            Ok(_) => (
+                format!(
+                    "Cancelled attempt {} (request {}). The blocking sidecar was terminated and a fresh engine is starting; retry is available when it is ready.",
+                    short_id(&run_id),
+                    short_id(&request_id)
+                ),
+                false,
             ),
-            false,
-        ));
+            Err(error) => (
+                format!(
+                    "The sidecar was terminated, but cancelled attempt {} could not be checkpointed: {error}",
+                    short_id(&run_id)
+                ),
+                true,
+            ),
+        });
     }
 
     /// Ask the engine for one horizon step of the completed case, for playback.
@@ -2725,6 +2894,62 @@ impl ReynApp {
         Ok(())
     }
 
+    fn external_flow_attempt_manifest(
+        &self,
+        workflow: &engineering::ExternalFlowCase,
+        request_id: &str,
+    ) -> project::RunManifest {
+        project::RunManifest {
+            schema_version: project::PROJECT_SCHEMA_VERSION,
+            app: project::VersionedComponent {
+                name: "Reyn Studio".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                sha256: None,
+            },
+            engine: Some(project::VersionedComponent {
+                name: "reyn_engine.py".into(),
+                version: "engineering_result.v1".into(),
+                sha256: None,
+            }),
+            model: Some(project::VersionedComponent {
+                name: workflow.model_id.clone(),
+                version: "reynmodel-bundle-v1".into(),
+                sha256: workflow
+                    .model_sha256
+                    .clone()
+                    .filter(|digest| digest.len() == 64),
+            }),
+            solver: Some(project::VersionedComponent {
+                name: "ObstacleFlowSolver3D warmup".into(),
+                version: "fixed_body".into(),
+                sha256: None,
+            }),
+            converter: Some(project::VersionedComponent {
+                name: engineering::SURFACE_LOAD_METHOD.into(),
+                version: "1".into(),
+                sha256: None,
+            }),
+            exact_contract: workflow.exact_contract(),
+            exact_settings: serde_json::json!({
+                "submitted_request_id": request_id,
+                "preprocessing_transform": workflow.preflight.transform_4x4,
+                "grid": workflow.preflight.target_grid,
+                "flow_direction": workflow.operating.flow_direction,
+                "approved_waivers": workflow.preflight.waivers,
+            }),
+            seeds: vec![7],
+            device: self.settings.compute_device.engine_value().into(),
+            runtime_ms: 0,
+            stop_reason: "running".into(),
+            warnings: workflow.preflight.warnings.clone(),
+            waivers: workflow.preflight.waivers.clone(),
+            missing_dependencies: Vec::new(),
+            output_sha256: Vec::new(),
+            scalar_outputs: Vec::new(),
+            determinism: None,
+        }
+    }
+
     fn run_external_flow(&mut self) {
         if let Some(reason) = self.run_gate_reason() {
             self.project_notice = Some((reason, true));
@@ -2748,8 +2973,27 @@ impl ReynApp {
         // Once execution starts, the inputs are a persisted revision rather
         // than an editable history branch. A later edit starts a fresh stack.
         self.rebase_case_draft_history();
-        let Some(case) = &mut self.cad else {
+        let Some(case) = self.cad.as_ref() else {
             return;
+        };
+        let workflow = case.workflow.clone();
+        let mask = case.mask.clone();
+        let model = case.model.clone();
+        let case_name = case.name.clone();
+        let steps = workflow.operating.horizon_steps;
+        let parent_run_id = workflow
+            .parent_run_id
+            .clone()
+            .or_else(|| case.active_run_id.clone());
+        let case_revision_id = match workflow.case_revision_id.clone() {
+            Some(revision) => revision,
+            None => {
+                self.project_notice = Some((
+                    "Run blocked: the persisted case revision is missing.".into(),
+                    true,
+                ));
+                return;
+            }
         };
         let scale = case
             .workflow
@@ -2757,44 +3001,89 @@ impl ReynApp {
             .length_unit
             .meters_per_unit()
             .unwrap_or(1.0);
-        let reference_length_m = (case.workflow.operating.reference_length * scale) as f32;
-        let reynolds = case.workflow.operating.reynolds().unwrap_or_default() as f32;
+        let reference_length_m = (workflow.operating.reference_length * scale) as f32;
+        let reynolds = workflow.operating.reynolds().unwrap_or_default() as f32;
+        let request_id = format!("cad-request-{}", uuid::Uuid::new_v4());
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let started_utc_unix = now_utc_unix();
+        let manifest = self.external_flow_attempt_manifest(&workflow, &request_id);
+        let running_attempt = project::RunRecord::new(
+            run_id.clone(),
+            parent_run_id.clone(),
+            case_revision_id,
+            started_utc_unix,
+            0,
+            project::LifecycleState::Running,
+            manifest.clone(),
+            Vec::new(),
+        );
+        let case_id = workflow.case_id.clone();
+        if let Err(error) = self.transact_project(
+            "Persisting the immutable run attempt",
+            started_utc_unix,
+            move |project_manifest| {
+                project_manifest.append_run(&case_id, running_attempt, started_utc_unix)
+            },
+        ) {
+            self.project_notice = Some((
+                format!("Run did not start because its immutable attempt could not be recorded: {error}"),
+                true,
+            ));
+            return;
+        }
+        if let Err(error) = self.project.checkpoint_recovery(started_utc_unix) {
+            self.project_notice = Some((
+                format!("Run did not start because its recovery checkpoint could not be persisted: {error}"),
+                true,
+            ));
+            return;
+        }
+
+        let request = engine::Cmd::CadPredict {
+            request_id: request_id.clone(),
+            model,
+            steps,
+            mask,
+            reynolds,
+            characteristic_length_solver: workflow.preflight.solver_characteristic_length as f32,
+            reference_length_m,
+            velocity_mps: workflow.operating.velocity as f32,
+            density_kg_m3: workflow.operating.density as f32,
+            reference_pressure_pa: workflow.operating.reference_pressure as f32,
+        };
+        let Some(case) = self.cad.as_mut() else {
+            return;
+        };
         case.workflow.stage = engineering::CaseStage::Running;
         case.pending = true;
-        case.steps = case.workflow.operating.horizon_steps;
-        let request_id = format!("cad-request-{}", uuid::Uuid::new_v4());
+        case.steps = steps;
         case.pending_request_id = Some(request_id.clone());
         case.pending_run = Some(PendingCadRun {
             request_id: request_id.clone(),
-            workflow: case.workflow.clone(),
+            run_id: run_id.clone(),
+            workflow,
+            parent_run_id,
+            started_utc_unix,
             started_at: std::time::Instant::now(),
+            manifest,
         });
-        let request = engine::Cmd::CadPredict {
-            request_id,
-            model: case.model.clone(),
-            steps: case.steps,
-            mask: case.mask.clone(),
-            reynolds,
-            characteristic_length_solver: case.workflow.preflight.solver_characteristic_length
-                as f32,
-            reference_length_m,
-            velocity_mps: case.workflow.operating.velocity as f32,
-            density_kg_m3: case.workflow.operating.density as f32,
-            reference_pressure_pa: case.workflow.operating.reference_pressure as f32,
-        };
         if self.engine.tx.send(request).is_err() {
-            case.pending = false;
-            case.pending_request_id = None;
-            case.pending_run = None;
-            case.workflow.stage = engineering::CaseStage::Ready;
-            self.project_notice = Some(("Engine request channel is unavailable.".into(), true));
+            let error = "engine request channel unavailable";
+            let _ =
+                self.finish_pending_external_flow_attempt(project::LifecycleState::Failed, error);
+            self.clear_pending_external_flow();
+            self.interrupt_and_restart_engine();
+            self.project_notice = Some((
+                format!(
+                    "Run {} failed before dispatch and was persisted; the engine is restarting.",
+                    short_id(&run_id)
+                ),
+                true,
+            ));
             return;
         }
         self.nav = Nav::Case;
-        self.engine_status = format!(
-            "● Running {} · Re {:.0} · H{}",
-            case.name, reynolds, case.steps
-        );
+        self.engine_status = format!("● Running {} · Re {:.0} · H{}", case_name, reynolds, steps);
         self.project_notice = Some((
             "Immutable run started from the approved source, transform, operating point, and model revision."
                 .into(),
@@ -2810,7 +3099,7 @@ impl ReynApp {
             .ok_or_else(|| "CAD result arrived without an active case".to_string())?;
         let pending = case
             .pending_run
-            .as_ref()
+            .clone()
             .filter(|pending| pending.request_id == field.request_id)
             .ok_or_else(|| {
                 format!(
@@ -2825,7 +3114,7 @@ impl ReynApp {
             .case_revision_id
             .clone()
             .ok_or_else(|| "active case revision missing".to_string())?;
-        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let run_id = pending.run_id.clone();
         let field_bytes =
             engineering::encode_engineering_field(&engineering::EngineeringFieldBlob {
                 n: field.n,
@@ -2903,7 +3192,7 @@ impl ReynApp {
             scalar("wake_deficit_peak", field.wake_deficit_peak, "1"),
             scalar("wake_deficit_mean", field.wake_deficit_mean, "1"),
         ];
-        let parent_run_id = workflow.parent_run_id.clone().or(active_run_id);
+        let parent_run_id = pending.parent_run_id.clone().or(active_run_id);
         let parent_run = parent_run_id.as_deref().and_then(|parent_id| {
             self.project
                 .manifest()
@@ -2918,60 +3207,12 @@ impl ReynApp {
                         .cloned()
                 })
         });
-        let mut manifest = project::RunManifest {
-            schema_version: project::PROJECT_SCHEMA_VERSION,
-            app: project::VersionedComponent {
-                name: "Reyn Studio".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                sha256: None,
-            },
-            engine: Some(project::VersionedComponent {
-                name: "reyn_engine.py".into(),
-                version: "engineering_result.v1".into(),
-                sha256: None,
-            }),
-            model: Some(project::VersionedComponent {
-                name: workflow.model_id.clone(),
-                version: "reynmodel-bundle-v1".into(),
-                sha256: workflow
-                    .model_sha256
-                    .clone()
-                    .filter(|digest| digest.len() == 64),
-            }),
-            solver: Some(project::VersionedComponent {
-                name: "ObstacleFlowSolver3D warmup".into(),
-                version: "fixed_body".into(),
-                sha256: None,
-            }),
-            converter: Some(project::VersionedComponent {
-                name: engineering::SURFACE_LOAD_METHOD.into(),
-                version: "1".into(),
-                sha256: None,
-            }),
-            exact_contract: workflow.exact_contract(),
-            exact_settings: serde_json::json!({
-                "submitted_request_id": field.request_id,
-                "preprocessing_transform": workflow.preflight.transform_4x4,
-                "grid": workflow.preflight.target_grid,
-                "solver_characteristic_length": field.characteristic_length_solver,
-                "solver_dt": field.solver_dt,
-                "solver_stride": field.solver_stride,
-                "warmup_steps": field.warmup_steps,
-                "dt_frame": field.dt_frame,
-                "flow_direction": workflow.operating.flow_direction,
-                "approved_waivers": workflow.preflight.waivers,
-            }),
-            seeds: vec![7],
-            device: self.settings.compute_device.engine_value().into(),
-            runtime_ms,
-            stop_reason: "completed".into(),
-            warnings: field.warnings.clone(),
-            waivers: workflow.preflight.waivers.clone(),
-            missing_dependencies: Vec::new(),
-            output_sha256: vec![result_sha256.clone(), field_sha256],
-            scalar_outputs,
-            determinism: None,
-        };
+        let mut manifest = pending.manifest.clone();
+        manifest.runtime_ms = runtime_ms;
+        manifest.stop_reason = "succeeded".into();
+        manifest.warnings.extend(field.warnings.clone());
+        manifest.output_sha256 = vec![result_sha256.clone(), field_sha256];
+        manifest.scalar_outputs = scalar_outputs;
         if let Some(parent) = &parent_run {
             manifest.compare_scalars_against(parent);
         }
@@ -3001,9 +3242,9 @@ impl ReynApp {
             run_id.clone(),
             parent_run.as_ref().map(|parent| parent.run_id().to_owned()),
             case_revision_id,
+            pending.started_utc_unix,
             now_utc_unix(),
-            now_utc_unix(),
-            project::LifecycleState::Complete,
+            project::LifecycleState::Succeeded,
             manifest,
             calibrated_views.clone(),
         );
@@ -3028,7 +3269,7 @@ impl ReynApp {
             "Recording the completed immutable run",
             now_utc_unix(),
             |project_manifest| {
-                project_manifest.append_run(&case_id, run, now_utc_unix())?;
+                project_manifest.finish_run_attempt(&case_id, run, now_utc_unix())?;
                 project_manifest.append_evidence(evidence, now_utc_unix())?;
                 project_manifest.set_selection(
                     project::ProjectSelection {
@@ -3042,6 +3283,9 @@ impl ReynApp {
                 Ok(())
             },
         )?;
+        self.project
+            .checkpoint_recovery(now_utc_unix())
+            .map_err(|error| error.to_string())?;
         self.dependencies_dirty = true;
         Ok(run_id)
     }
@@ -4362,7 +4606,7 @@ impl ReynApp {
             return;
         }
         let result = case.workflow.result.as_ref().expect("checked above");
-        let can_export_fea = case.active_run_id.is_some();
+        let can_export_fea = has_complete_fea_load_field(case);
         let result_grid = case.result_grid;
         ui.label(title_text("Engineering Results"));
         ui.label(
@@ -4953,6 +5197,7 @@ impl ReynApp {
         self.engineering_notice(ui);
         if let Some(case) = &self.cad {
             let has_persisted_run = case.active_run_id.is_some();
+            let can_export_fea = has_complete_fea_load_field(case);
             card(ui, |ui| {
                 diag(
                     ui,
@@ -5001,7 +5246,16 @@ impl ReynApp {
                         export_report = true;
                         ui.close();
                     }
-                    if ui.button("Surface loads for FEA (CSV)…").clicked() {
+                    if ui
+                        .add_enabled(
+                            can_export_fea,
+                            egui::Button::new("Surface loads for FEA (CSV)…"),
+                        )
+                        .on_disabled_hover_text(
+                            "A succeeded run with a complete mapped load field is required.",
+                        )
+                        .clicked()
+                    {
                         export_fea = true;
                         ui.close();
                     }
@@ -5762,7 +6016,7 @@ impl ReynApp {
             })?;
         if !matches!(
             run.state(),
-            project::LifecycleState::Complete | project::LifecycleState::EvidenceLocked
+            project::LifecycleState::Succeeded | project::LifecycleState::EvidenceLocked
         ) {
             return Err(
                 "Neutral field evidence requires a completed persisted run; draft, running, stale, and failed runs are rejected."
@@ -5980,6 +6234,86 @@ impl ReynApp {
             self.project_notice = Some(("No case result is available to export.".into(), true));
             return;
         };
+        let Some(run_id) = case.active_run_id.as_deref() else {
+            self.project_notice = Some((
+                "FEA export requires a completed immutable run.".into(),
+                true,
+            ));
+            return;
+        };
+        let Some((case_record, run)) = self.project.manifest().cases().iter().find_map(|record| {
+            record
+                .runs()
+                .iter()
+                .find(|run| run.run_id() == run_id)
+                .map(|run| (record, run))
+        }) else {
+            self.project_notice = Some((
+                "The active FEA result is not present in the project run ledger.".into(),
+                true,
+            ));
+            return;
+        };
+        if run.state() != project::LifecycleState::Succeeded {
+            self.project_notice = Some((
+                "Only a succeeded immutable run can provide FEA loads.".into(),
+                true,
+            ));
+            return;
+        }
+        let contract = &run.manifest().exact_contract;
+        let source_revision_id = contract
+            .get("source_revision_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(source) = self
+            .project
+            .manifest()
+            .source_revisions()
+            .iter()
+            .find(|source| source.source_revision_id == source_revision_id)
+        else {
+            self.project_notice = Some((
+                "The run's immutable source revision is unavailable.".into(),
+                true,
+            ));
+            return;
+        };
+        let operating: engineering::OperatingPoint = match contract
+            .get("operating_point")
+            .cloned()
+            .ok_or_else(|| "Run contract omits the operating point.".to_owned())
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| format!("Run operating point is invalid: {error}"))
+            }) {
+            Ok(operating) => operating,
+            Err(error) => {
+                self.project_notice = Some((error, true));
+                return;
+            }
+        };
+        let preflight: engineering::GeometryPreflight = match contract
+            .get("preflight")
+            .cloned()
+            .ok_or_else(|| "Run contract omits geometry preflight.".to_owned())
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| format!("Run geometry preflight is invalid: {error}"))
+            }) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.project_notice = Some((error, true));
+                return;
+            }
+        };
+        let Some(result) = case.workflow.result.as_ref() else {
+            self.project_notice = Some((
+                "The active run has no complete engineering load result.".into(),
+                true,
+            ));
+            return;
+        };
         let n = case.result_grid;
         let cube = n.saturating_mul(n).saturating_mul(n);
         if n < 3
@@ -5993,16 +6327,24 @@ impl ReynApp {
             ));
             return;
         }
-        let scale = case
-            .workflow
-            .operating
-            .length_unit
-            .meters_per_unit()
-            .unwrap_or(1.0);
+        let Some(scale) = operating.length_unit.meters_per_unit() else {
+            self.project_notice = Some((
+                "The run contract has no approved source-unit conversion.".into(),
+                true,
+            ));
+            return;
+        };
+        let reference_length_m = operating.reference_length * scale;
+        let physical_area_scale =
+            (reference_length_m / preflight.solver_characteristic_length).powi(2);
+        let physical_arm_scale = reference_length_m / preflight.solver_characteristic_length;
         let dx_solver = std::f64::consts::TAU / n as f64;
         let index = |i: usize, j: usize, k: usize| i * n * n + j * n + k;
         let mut positions = Vec::new();
         let mut tractions = Vec::new();
+        let mut solver_positions = Vec::new();
+        let mut solver_tractions = Vec::new();
+        let mut area_weights_m2 = Vec::new();
         let mut coefficients = Vec::new();
         for i in 1..n - 1 {
             for j in 1..n - 1 {
@@ -6028,7 +6370,7 @@ impl ReynApp {
                     ];
                     let position = match engineering::solver_point_to_source_m(
                         solver_point,
-                        case.workflow.preflight.transform_4x4,
+                        preflight.transform_4x4,
                         scale,
                     ) {
                         Ok(position) => position,
@@ -6038,32 +6380,169 @@ impl ReynApp {
                             return;
                         }
                     };
-                    positions.push(position);
-                    tractions.push([
+                    let solver_traction = [
                         case.traction[cell] as f64,
                         case.traction[cube + cell] as f64,
                         case.traction[2 * cube + cell] as f64,
-                    ]);
+                    ];
+                    let source_traction = match engineering::solver_vector_to_source(
+                        solver_traction,
+                        preflight.transform_4x4,
+                    ) {
+                        Ok(traction) => traction,
+                        Err(error) => {
+                            self.project_notice =
+                                Some((format!("FEA traction mapping failed: {error}"), true));
+                            return;
+                        }
+                    };
+                    positions.push(position);
+                    tractions.push(source_traction);
+                    solver_positions.push(solver_point);
+                    solver_tractions.push(solver_traction);
+                    area_weights_m2
+                        .push(magnitude * dx_solver * dx_solver * 0.5 * physical_area_scale);
                     coefficients.push(case.cp[cell] as f64);
                 }
             }
         }
+        let exported_area_m2 = area_weights_m2.iter().sum::<f64>();
+        let mut exported_force = [0.0; 3];
+        let mut center = [0.0; 3];
+        for ((position, traction), area) in solver_positions
+            .iter()
+            .zip(&solver_tractions)
+            .zip(&area_weights_m2)
+        {
+            for axis in 0..3 {
+                exported_force[axis] += traction[axis] * area;
+                center[axis] += position[axis] * area;
+            }
+        }
+        if exported_area_m2 > 0.0 {
+            center
+                .iter_mut()
+                .for_each(|value| *value /= exported_area_m2);
+        }
+        let mut exported_moment = [0.0; 3];
+        for ((position, traction), area) in solver_positions
+            .iter()
+            .zip(&solver_tractions)
+            .zip(&area_weights_m2)
+        {
+            let arm = [
+                (position[0] - center[0]) * physical_arm_scale,
+                (position[1] - center[1]) * physical_arm_scale,
+                (position[2] - center[2]) * physical_arm_scale,
+            ];
+            let moment_density = [
+                arm[1] * traction[2] - arm[2] * traction[1],
+                arm[2] * traction[0] - arm[0] * traction[2],
+                arm[0] * traction[1] - arm[1] * traction[0],
+            ];
+            for axis in 0..3 {
+                exported_moment[axis] += moment_density[axis] * area;
+            }
+        }
+        let force_residual =
+            std::array::from_fn(|axis| exported_force[axis] - result.force_newtons[axis]);
+        let moment_residual =
+            std::array::from_fn(|axis| exported_moment[axis] - result.moment_newton_meters[axis]);
+        let model = contract.get("model").unwrap_or(&serde_json::Value::Null);
+        let solver = run
+            .manifest()
+            .solver
+            .as_ref()
+            .or(run.manifest().engine.as_ref());
+        let dynamic_pressure = operating.dynamic_pressure().unwrap_or(f64::NAN);
         let provenance = engineering::FeaLoadProvenance {
-            source_revision_id: case.workflow.source_revision_id.clone().unwrap_or_default(),
-            case_revision_id: case.workflow.case_revision_id.clone().unwrap_or_default(),
-            run_id: case.active_run_id.clone().unwrap_or_default(),
-            model_sha256: case.workflow.model_sha256.clone().unwrap_or_default(),
+            project_id: self.project.manifest().project_id().to_owned(),
+            case_id: case.workflow.case_id.clone(),
+            case_name: case_record.name().to_owned(),
+            source_revision_id: source_revision_id.to_owned(),
+            source_name: source
+                .uri_hint
+                .clone()
+                .unwrap_or_else(|| case.workflow.source_name.clone()),
+            source_sha256: source.content_sha256.clone(),
+            case_revision_id: run.case_revision_id().to_owned(),
+            run_id: run_id.to_owned(),
+            model_id: model
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            model_sha256: model
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            solver_name: solver
+                .map(|component| component.name.clone())
+                .unwrap_or_default(),
+            solver_version: solver
+                .map(|component| component.version.clone())
+                .unwrap_or_default(),
             contract_kind: engineering::EXTERNAL_FLOW_CONTRACT.into(),
-            coordinate_frame: "approved_stl_source_frame_si_meters".into(),
+            coordinate_frame:
+                "imported source axes; coordinates inverse-mapped from solver space into SI meters"
+                    .into(),
+            traction_frame:
+                "imported source axes; solver/wind traction rotated without scaling; Pa".into(),
+            body_frame_semantics:
+                "body axes are the imported source axes before case orientation is applied".into(),
+            wind_frame_semantics: engineering::COEFFICIENT_REFERENCE_FRAME.into(),
+            source_to_solver_transform_4x4_column_major: preflight.transform_4x4,
+            source_length_unit: operating.length_unit.symbol().into(),
+            meters_per_source_unit: scale,
+            position_units: "m".into(),
+            traction_units: "Pa".into(),
+            cp_units: "1".into(),
+            reference_length_m,
+            free_stream_velocity_mps: operating.velocity,
+            density_kg_m3: operating.density,
+            dynamic_viscosity_pa_s: operating.viscosity,
+            reference_pressure_pa: operating.reference_pressure,
+            dynamic_pressure_pa: dynamic_pressure,
+            declared_flow_direction: operating.flow_direction,
+            integration_method: format!(
+                "{}; central-difference |grad(mask)| diffuse-area quadrature; exported rows use |raw gradient| > 0.02",
+                engineering::SURFACE_LOAD_METHOD
+            ),
+            resultant_force_newtons_wind_axes: result.force_newtons,
+            resultant_moment_newton_meters_wind_axes: result.moment_newton_meters,
+            exported_sample_force_newtons_wind_axes: exported_force,
+            exported_sample_moment_newton_meters_wind_axes: exported_moment,
+            force_reconciliation_residual_newtons: force_residual,
+            moment_reconciliation_residual_newton_meters: moment_residual,
+            moment_reference: "diffuse-surface area centroid in solver/wind axes".into(),
+            integrated_surface_area_m2: result.surface_area_m2,
+            pressure_force_fraction: result.pressure_force_fraction,
+            reconciliation_method:
+                "exported thresholded sample quadrature minus full-field reported resultant".into(),
+            reconciliation_status: if force_residual
+                .iter()
+                .chain(moment_residual.iter())
+                .all(|value| value.abs() <= 1e-6)
+            {
+                "within_absolute_tolerance_1e-6".into()
+            } else {
+                "thresholded_export_differs_from_full_field; use reported residual metadata".into()
+            },
         };
-        let csv =
-            match engineering::fea_load_csv(&positions, &tractions, &coefficients, &provenance) {
-                Ok(csv) => csv,
-                Err(error) => {
-                    self.project_notice = Some((error, true));
-                    return;
-                }
-            };
+        let csv = match engineering::fea_load_csv(
+            &positions,
+            &tractions,
+            &area_weights_m2,
+            &coefficients,
+            &provenance,
+        ) {
+            Ok(csv) => csv,
+            Err(error) => {
+                self.project_notice = Some((error, true));
+                return;
+            }
+        };
         let Some(path) = rfd::FileDialog::new()
             .add_filter("CSV", &["csv"])
             .set_file_name(format!(
@@ -9213,6 +9692,7 @@ impl ReynApp {
     fn restart_engine_for_project_change(&mut self) {
         // Replacing the handle drops the prior receiver, so an in-flight result
         // from the previous project cannot repopulate a cleared viewport.
+        self.engine.terminate();
         self.engine = engine::EngineHandle::spawn_with_config(self.settings.engine_config());
         self.attach_engine_repaint_wake();
         self.engine_ok = false;
@@ -9567,7 +10047,7 @@ impl ReynApp {
             active_revision.case_revision_id,
             now,
             now,
-            project::LifecycleState::Complete,
+            project::LifecycleState::Succeeded,
             run_manifest,
             vec![suite_view.clone()],
         );
@@ -11166,22 +11646,83 @@ impl ReynApp {
     }
 
     fn export(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+        if let Some(path) = self
+            .export_dialog("reyn_diagnostics.csv")
             .add_filter("CSV", &["csv"])
-            .set_file_name("reyn_diagnostics.csv")
             .save_file()
         {
             let (hel, ens, q, count) = diagnostics(&self.particles);
-            let csv = format!(
-                "metric,value\nmodel,{}\nsamples,{}\nhelicity,{:.6e}\nenstrophy,{:.6e}\n\
-                 q_criterion,{:.6}\ndensity_lo,{:.3}\nopacity,{:.3}\n",
-                self.current_model, count, hel, ens, q, self.density_lo, self.opacity
-            );
-            let _ = std::fs::write(&path, csv);
-            self.engine_status = format!(
-                "● Exported {}",
-                path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
-            );
+            let active_run_id = self
+                .cad
+                .as_ref()
+                .and_then(|case| case.active_run_id.as_deref());
+            let active_run = active_run_id.and_then(|run_id| {
+                self.project
+                    .manifest()
+                    .cases()
+                    .iter()
+                    .flat_map(|case| case.runs())
+                    .find(|run| run.run_id() == run_id)
+            });
+            let solver = active_run.and_then(|run| {
+                run.manifest()
+                    .solver
+                    .as_ref()
+                    .or(run.manifest().engine.as_ref())
+            });
+            let provenance = serde_json::json!({
+                "schema": "reyn_calculation_export.v1",
+                "project_id": self.project.manifest().project_id(),
+                "case_id": self.cad.as_ref().map(|case| case.workflow.case_id.as_str()),
+                "case_revision_id": self.cad.as_ref().and_then(|case| case.workflow.case_revision_id.as_deref()),
+                "run_id": active_run_id,
+                "source_revision_id": self.cad.as_ref().and_then(|case| case.workflow.source_revision_id.as_deref()),
+                "source_sha256": self.cad.as_ref().map(|case| case.workflow.preflight.source_sha256.as_str()),
+                "model_id": self.current_model,
+                "model_sha256": self.cad.as_ref().and_then(|case| case.workflow.model_sha256.as_deref()),
+                "solver": solver.map(|component| serde_json::json!({
+                    "name": component.name,
+                    "version": component.version,
+                    "sha256": component.sha256,
+                })),
+                "field_source": "current rendered model field",
+                "limitations": "Viewport diagnostics are display-normalized derived quantities, not solver-reference validation metrics.",
+            });
+            let mut bytes = Vec::new();
+            if let Err(error) = write_calculation_export(
+                &mut bytes,
+                &provenance,
+                count,
+                hel,
+                ens,
+                q,
+                self.density_lo,
+                self.opacity,
+            ) {
+                self.project_notice = Some((error.clone(), true));
+                self.engine_status = format!("● Export failed: {error}");
+                return;
+            }
+            match std::fs::write(&path, bytes) {
+                Ok(()) => {
+                    self.engine_status = format!(
+                        "● Exported {}",
+                        path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
+                    );
+                    self.project_notice = Some((
+                        format!("Exported calculations to {}.", path.display()),
+                        false,
+                    ));
+                }
+                Err(error) => {
+                    let message = format!(
+                        "Calculations were not exported to {}: {error}",
+                        path.display()
+                    );
+                    self.engine_status = format!("● Export failed: {error}");
+                    self.project_notice = Some((message, true));
+                }
+            }
         }
     }
 
@@ -11337,6 +11878,10 @@ impl ReynApp {
                     revoked_signing_key_fingerprints: self
                         .settings
                         .revoked_signing_key_fingerprints
+                        .clone(),
+                    protected_malformed_settings_path: self
+                        .settings
+                        .protected_malformed_settings_path
                         .clone(),
                     operating_presets: self.settings.operating_presets.clone(),
                     case_templates: self.settings.case_templates.clone(),
@@ -11527,6 +12072,7 @@ impl ReynApp {
         // prevents fields, benchmark cells, or recovered surfaces from the old
         // runtime from presenting as revalidated output.
         self.invalidate_engine_results();
+        self.engine.terminate();
         self.engine = engine::EngineHandle::spawn_with_config(self.settings.engine_config());
         self.attach_engine_repaint_wake();
         self.engine_ok = false;
@@ -16826,9 +17372,11 @@ fn run_ledger_row(
 ) -> bool {
     use project::LifecycleState as LS;
     let (state_word, state_color) = match state {
-        LS::Complete => ("COMPLETE", OK),
+        LS::Succeeded => ("SUCCEEDED", OK),
         LS::Failed => ("FAILED", DANGER),
+        LS::Cancelled => ("CANCELLED", WARN),
         LS::Stale => ("STALE", WARN),
+        LS::Pending => ("PENDING", EMBER),
         LS::Running => ("RUNNING", EMBER),
         LS::EvidenceLocked => ("EVIDENCE-LOCKED", TEXT_DIM),
         LS::Ready => ("READY", TEXT_DIM),
@@ -17088,6 +17636,46 @@ mod tests {
     const FIXTURE_RUN_ID: &str = "61f596e7-8414-488e-b764-0a1dfe671d1a";
     const FIXTURE_MODEL_SHA256: &str =
         "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn calculation_export_embeds_provenance_and_propagates_write_failures() {
+        let provenance = serde_json::json!({
+            "project_id": "project-1",
+            "case_id": "case-1",
+            "run_id": "run-1",
+            "source_revision_id": "source-1",
+            "solver": {"name": "reyn-engine", "version": "0.1.1"},
+        });
+        let mut bytes = Vec::new();
+        write_calculation_export(&mut bytes, &provenance, 8, 1.0, 2.0, 3.0, 0.2, 0.8).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("reyn_calculation_provenance_json"));
+        assert!(text.contains("\"source_revision_id\":\"source-1\""));
+        assert!(text.contains("derived_from_rendered_model_field"));
+
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("simulated full disk"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(write_calculation_export(
+            &mut FailingWriter,
+            &provenance,
+            8,
+            1.0,
+            2.0,
+            3.0,
+            0.2,
+            0.8,
+        )
+        .unwrap_err()
+        .contains("simulated full disk"));
+    }
 
     fn benchmark_fixture() -> engine::BenchResult {
         engine::BenchResult {
@@ -17420,41 +18008,34 @@ mod tests {
         assert!(draft.contains("run\tdraft (no immutable run)\t–\tPROVENANCE"));
     }
 
-    /// Cancellation guarantee: once a request is cancelled its result can only
-    /// be discarded, never recorded, and a preview fetch never becomes a run.
+    /// A queued payload from a terminated generation is stale and can never be
+    /// recorded; a preview fetch also never becomes a run.
     #[test]
-    fn cancelled_and_stale_cad_results_are_never_recorded() {
-        let cancelled = vec!["run-a".to_string()];
+    fn terminated_and_stale_cad_results_are_never_recorded() {
         // The in-flight run is the only thing that may be recorded.
         assert_eq!(
-            classify_cad_result("run-b", None, Some("run-b"), &cancelled),
+            classify_cad_result("run-b", None, Some("run-b")),
             CadResultDisposition::Record
         );
-        // Cancelling clears `pending_run`, so the same result now only drops —
-        // and it drops as an expected outcome, not an error.
+        // Interrupting clears `pending_run`; a message already queued by the
+        // terminated generation is stale.
         assert_eq!(
-            classify_cad_result("run-a", None, None, &cancelled),
-            CadResultDisposition::DiscardCancelled
+            classify_cad_result("run-a", None, None),
+            CadResultDisposition::DiscardStale
         );
         // A superseded request nobody is waiting for is stale, not cancelled.
         assert_eq!(
-            classify_cad_result("run-c", None, Some("run-b"), &cancelled),
+            classify_cad_result("run-c", None, Some("run-b")),
             CadResultDisposition::DiscardStale
         );
-        // A playback fetch is display-only even while a run is pending, and
-        // even if a request with that id was cancelled earlier.
+        // A playback fetch is display-only even while a run is pending.
         assert_eq!(
-            classify_cad_result(
-                "preview-1",
-                Some((3, "preview-1")),
-                Some("run-b"),
-                &cancelled
-            ),
+            classify_cad_result("preview-1", Some((3, "preview-1")), Some("run-b")),
             CadResultDisposition::Preview(3)
         );
         assert_eq!(
-            classify_cad_result("run-a", Some((3, "preview-1")), None, &cancelled),
-            CadResultDisposition::DiscardCancelled
+            classify_cad_result("run-a", Some((3, "preview-1")), None),
+            CadResultDisposition::DiscardStale
         );
     }
 

@@ -23,6 +23,7 @@ jobs:
       - name: Require an actual Windows 11 host
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $caption = (Get-CimInstance Win32_OperatingSystem).Caption
           if ($caption -notmatch "Windows 11") {
             throw "Qualification requires Windows 11, found: $caption"
@@ -40,6 +41,7 @@ jobs:
       - name: Verify and extract artifact
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $zip = Get-ChildItem "qualification-input" -Filter "*.zip" | Select-Object -First 1
           $checksum = (Get-Content "qualification-input/SHA256SUMS").Split()[0]
           $actual = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -53,27 +55,33 @@ jobs:
           "QUALIFICATION_STAGE=$($stage.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
           "QUALIFICATION_SHA256=$actual" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Verify engine readiness and cleanup
+      - name: Verify gated startup and cleanup
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $exe = Join-Path $env:QUALIFICATION_STAGE "Reyn Studio.exe"
           $process = Start-Process $exe -PassThru
           $deadline = (Get-Date).AddSeconds(45)
-          $child = $null
           while ((Get-Date) -lt $deadline -and -not $process.HasExited) {
-            $child = Get-CimInstance Win32_Process |
-              Where-Object {
-                $_.ParentProcessId -eq $process.Id -and
-                $_.Name -eq "python.exe" -and
-                $_.CommandLine -match "reyn_engine.py"
-              } |
-              Select-Object -First 1
-            if ($child) { break }
+            $process.Refresh()
+            if ($process.MainWindowHandle -ne 0) { break }
             Start-Sleep -Milliseconds 500
           }
-          if ($process.HasExited -or -not $child) {
+          if ($process.HasExited -or $process.MainWindowHandle -eq 0) {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
-            throw "Clean-machine launch did not reach engine readiness."
+            throw "Clean-machine launch did not reach the YC access gate."
+          }
+          $preAuthenticationEngine = Get-CimInstance Win32_Process |
+            Where-Object {
+              $_.ParentProcessId -eq $process.Id -and
+              $_.Name -eq "python.exe" -and
+              $_.CommandLine -match "reyn_engine.py"
+            } |
+            Select-Object -First 1
+          if ($preAuthenticationEngine) {
+            Stop-Process -Id $preAuthenticationEngine.ProcessId -Force
+            Stop-Process -Id $process.Id -Force
+            throw "YC-gated clean-machine launch started Python before authentication."
           }
           $process.CloseMainWindow() | Out-Null
           if (-not $process.WaitForExit(15000)) {
@@ -81,13 +89,21 @@ jobs:
             throw "Clean-machine app did not close normally."
           }
           Start-Sleep -Seconds 2
-          if (Get-CimInstance Win32_Process -Filter "ProcessId = $($child.ProcessId)") {
-            throw "Clean-machine app left an orphaned Python engine."
+          $orphan = Get-CimInstance Win32_Process |
+            Where-Object {
+              $_.ParentProcessId -eq $process.Id -and
+              $_.Name -eq "python.exe" -and
+              $_.CommandLine -match "reyn_engine.py"
+            } |
+            Select-Object -First 1
+          if ($orphan) {
+            throw "Clean-machine gated app left an orphaned Python engine."
           }
 
       - name: Require manual acceptance record
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           if ("${{ inputs.manual_matrix_completed }}" -ne "true") {
             throw "Automated smoke passed, but the manual Windows 11 matrix is not attested."
           }

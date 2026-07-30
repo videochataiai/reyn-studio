@@ -611,6 +611,20 @@ impl ProjectLifecycle {
             return Ok(false);
         }
         self.last_autosave_attempt_utc_unix = now_utc_unix;
+        self.write_recovery_snapshot(now_utc_unix)
+    }
+
+    /// Force an atomic recovery checkpoint for a newly started or terminal run
+    /// attempt. Execution must not begin until this succeeds.
+    pub fn checkpoint_recovery(&mut self, now_utc_unix: u64) -> Result<bool, LifecycleError> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        self.last_autosave_attempt_utc_unix = now_utc_unix;
+        self.write_recovery_snapshot(now_utc_unix)
+    }
+
+    fn write_recovery_snapshot(&mut self, now_utc_unix: u64) -> Result<bool, LifecycleError> {
         let recovery_path =
             recovery_path(&self.state_directory, self.document.manifest().project_id());
         let project_document: serde_json::Value =
@@ -1196,7 +1210,7 @@ mod tests {
                     "revision-1",
                     4,
                     5,
-                    LifecycleState::Complete,
+                    LifecycleState::Succeeded,
                     RunManifest {
                         schema_version: PROJECT_SCHEMA_VERSION,
                         app: VersionedComponent {

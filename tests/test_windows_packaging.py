@@ -43,7 +43,7 @@ from windows_packaging import (  # noqa: E402
 
 class WindowsPackagingTests(unittest.TestCase):
     def make_stage(self, root: Path) -> Path:
-        stage = root / "Reyn-Studio-0.1.0-windows-x64"
+        stage = root / "Reyn-Studio-0.1.1-windows-x64"
         required = (
             "Reyn Studio.exe",
             "ReynStudio.ico",

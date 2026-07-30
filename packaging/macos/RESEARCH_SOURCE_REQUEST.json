@@ -1,0 +1,18 @@
+{
+  "schema": "com.reyn.studio.research-source-request.v1",
+  "consumer_release": "0.1.1",
+  "repository": "videochataiai/reyn",
+  "currently_accessible_revision": "3515cde4d0f5678437ad6ee6116774f1cd6a3c16",
+  "status": "blocked-awaiting-private-source-revision",
+  "required_modules_missing_from_current_revision": [
+    "reyn-research/pressure_channel_contract_3d.py",
+    "reyn-research/pressure_model_contract_3d.py"
+  ],
+  "required_uv_lock_packages_missing_from_current_revision": [
+    "cryptography",
+    "safetensors",
+    "securesystemslib",
+    "tuf"
+  ],
+  "acceptance": "Publish an exact accessible commit containing every current RESEARCH_RESOURCES module and a uv.lock with all required packages, then update release-pins.json to that commit. Packaging must continue to fail closed until then."
+}

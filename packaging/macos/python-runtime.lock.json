@@ -1,0 +1,15 @@
+{
+  "schema": "com.reyn.studio.macos-python-runtime-lock.v1",
+  "platform": "macos",
+  "architecture": "arm64",
+  "minimum_macos": "14.0",
+  "distributions": {
+    "Python": "3.14.6",
+    "PyTorch": "2.13.0",
+    "NumPy": "2.5.1",
+    "cryptography": "49.0.0",
+    "safetensors": "0.8.0",
+    "securesystemslib": "1.4.0",
+    "python-tuf": "7.0.0"
+  }
+}
