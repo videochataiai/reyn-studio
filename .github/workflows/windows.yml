@@ -65,6 +65,7 @@ jobs:
           Copy-Item $source $runtime -Recurse
           uv pip install --python (Join-Path $runtime "python.exe") `
             --system `
+            --break-system-packages `
             --require-hashes `
             --index-url https://download.pytorch.org/whl/cpu `
             --extra-index-url https://pypi.org/simple `
