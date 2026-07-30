@@ -58,6 +58,15 @@ jobs:
           $ErrorActionPreference = "Stop"
           uv sync --project $env:REYN_RESEARCH_SOURCE_DIR --frozen
           if ($LASTEXITCODE -ne 0) { throw "research environment sync failed with exit code $LASTEXITCODE" }
+          $testPython = Join-Path $env:REYN_RESEARCH_SOURCE_DIR ".venv/Scripts/python.exe"
+          uv pip install --python $testPython `
+            --require-hashes `
+            --index-url https://download.pytorch.org/whl/cpu `
+            --extra-index-url https://pypi.org/simple `
+            --index-strategy unsafe-best-match `
+            --requirements "packaging/windows/python-runtime.lock"
+          if ($LASTEXITCODE -ne 0) { throw "pinned test runtime installation failed with exit code $LASTEXITCODE" }
+          $env:REYN_PYTHON = $testPython
           cargo test --locked --all-targets
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
           cargo check --locked --target x86_64-pc-windows-msvc

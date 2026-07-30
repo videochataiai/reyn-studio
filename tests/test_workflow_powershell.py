@@ -85,6 +85,20 @@ steps:
 """
         self.assertEqual(len(native_failure_guard_issues(unsafe)), 1)
 
+    def test_windows_rust_tests_install_the_pinned_production_dependencies(self) -> None:
+        workflow = (WORKFLOWS / "windows.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            '$testPython = Join-Path $env:REYN_RESEARCH_SOURCE_DIR '
+            '".venv/Scripts/python.exe"',
+            workflow,
+        )
+        self.assertIn("uv pip install --python $testPython `", workflow)
+        self.assertIn(
+            '--requirements "packaging/windows/python-runtime.lock"',
+            workflow,
+        )
+        self.assertIn("$env:REYN_PYTHON = $testPython", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
