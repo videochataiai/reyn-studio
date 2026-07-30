@@ -2264,7 +2264,7 @@ mod tests {
         ) -> RuntimeManifest {
             let payloads = [
                 ("THIRD_PARTY_NOTICES.html", b"notices".as_slice()),
-                ("bin/python3.14", python_payload),
+                (target_platform_spec().python_relative_path, python_payload),
                 ("lib/runtime.bin", b"native runtime".as_slice()),
                 ("runtime-sbom.cdx.json", br#"{"bomFormat":"CycloneDX"}"#),
             ];
@@ -2311,7 +2311,7 @@ mod tests {
                 runtime_id: String::new(),
                 platform: TARGET_PLATFORM.into(),
                 architecture: architecture.into(),
-                minimum_macos: Some(MINIMUM_MACOS.into()),
+                minimum_macos: target_platform_spec().minimum_os.map(str::to_owned),
                 python: python.into(),
                 torch: TORCH_VERSION.into(),
                 numpy: NUMPY_VERSION.into(),
@@ -2633,8 +2633,13 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
 
     #[test]
     fn wrong_architecture_and_dependency_version_fall_back() {
+        let wrong_architecture = if TARGET_ARCHITECTURE == "arm64" {
+            "x86_64"
+        } else {
+            "arm64"
+        };
         for (architecture, python, expected_code) in [
-            ("x86_64", PYTHON_VERSION, "runtime.platform"),
+            (wrong_architecture, PYTHON_VERSION, "runtime.platform"),
             (TARGET_ARCHITECTURE, "3.13.9", "runtime.dependencies"),
         ] {
             let fixture = Fixture::new(expected_code);

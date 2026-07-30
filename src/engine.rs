@@ -2297,22 +2297,10 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         fixture.file("developer-checkout/engine/reyn_engine.py");
 
         let error = resolve_engine_script_at(&executable, &developer_dir, None, None).unwrap_err();
-        let message = error.to_string();
+        let message = error.to_string().replace('\\', "/");
         assert!(message.contains("Python sidecar is missing"));
-        assert!(message.contains(
-            &fixture
-                .root
-                .join("Reyn Studio.app/Contents/Resources/engine/reyn_engine.py")
-                .display()
-                .to_string()
-        ));
-        assert!(!message.contains(
-            &fixture
-                .root
-                .join("developer-checkout/engine/reyn_engine.py")
-                .display()
-                .to_string()
-        ));
+        assert!(message.contains("Reyn Studio.app/Contents/Resources/engine/reyn_engine.py"));
+        assert!(!message.contains("developer-checkout/engine/reyn_engine.py"));
     }
 
     #[test]
