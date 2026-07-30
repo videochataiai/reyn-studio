@@ -2,6 +2,10 @@
 .idea/
 .cursor/
 .venv/
+.wrangler/
+node_modules/
+.dev.vars
+.dev.vars.*
 .tmp_reyn_main/
 .tmp_reyn_main_push/
 graphify-out/

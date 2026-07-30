@@ -14,8 +14,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const RUNTIME_MANIFEST_SCHEMA: &str = "com.reyn.runtime-manifest/1";
 pub(crate) const RUNTIME_STATE_SCHEMA: &str = "com.reyn.runtime-state/1";
+#[cfg(not(target_os = "windows"))]
 pub(crate) const TARGET_PLATFORM: &str = "macos";
+#[cfg(target_os = "windows")]
+pub(crate) const TARGET_PLATFORM: &str = "windows";
+#[cfg(not(target_os = "windows"))]
 pub(crate) const TARGET_ARCHITECTURE: &str = "arm64";
+#[cfg(target_os = "windows")]
+pub(crate) const TARGET_ARCHITECTURE: &str = "x86_64";
 pub(crate) const MINIMUM_MACOS: &str = "14.0";
 pub(crate) const PYTHON_VERSION: &str = "3.14.6";
 pub(crate) const TORCH_VERSION: &str = "2.13.0";
@@ -60,7 +66,8 @@ pub(crate) struct RuntimeManifest {
     pub runtime_id: String,
     pub platform: String,
     pub architecture: String,
-    pub minimum_macos: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_macos: Option<String>,
     pub python: String,
     pub torch: String,
     pub numpy: String,
@@ -78,7 +85,8 @@ struct RuntimeManifestIdentity<'a> {
     schema: &'a str,
     platform: &'a str,
     architecture: &'a str,
-    minimum_macos: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum_macos: Option<&'a str>,
     python: &'a str,
     torch: &'a str,
     numpy: &'a str,
@@ -89,6 +97,52 @@ struct RuntimeManifestIdentity<'a> {
     files: &'a [RuntimeFile],
     sbom_sha256: &'a str,
     notices_sha256: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimePlatformSpec {
+    pub platform: &'static str,
+    pub architecture: &'static str,
+    pub minimum_os: Option<&'static str>,
+    pub python_relative_path: &'static str,
+}
+
+const MACOS_ARM64_SPEC: RuntimePlatformSpec = RuntimePlatformSpec {
+    platform: if cfg!(target_os = "windows") {
+        "macos"
+    } else {
+        TARGET_PLATFORM
+    },
+    architecture: if cfg!(target_os = "windows") {
+        "arm64"
+    } else {
+        TARGET_ARCHITECTURE
+    },
+    minimum_os: Some(MINIMUM_MACOS),
+    python_relative_path: "bin/python3.14",
+};
+
+const WINDOWS_X64_SPEC: RuntimePlatformSpec = RuntimePlatformSpec {
+    platform: if cfg!(target_os = "windows") {
+        TARGET_PLATFORM
+    } else {
+        "windows"
+    },
+    architecture: if cfg!(target_os = "windows") {
+        TARGET_ARCHITECTURE
+    } else {
+        "x86_64"
+    },
+    minimum_os: None,
+    python_relative_path: "python.exe",
+};
+
+fn target_platform_spec() -> &'static RuntimePlatformSpec {
+    if cfg!(target_os = "windows") {
+        &WINDOWS_X64_SPEC
+    } else {
+        &MACOS_ARM64_SPEC
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -339,20 +393,29 @@ pub(crate) struct HostCompatibility {
 
 impl HostCompatibility {
     pub(crate) fn current() -> Self {
-        let platform = if cfg!(target_os = "macos") {
-            "macos"
-        } else {
-            std::env::consts::OS
-        };
-        let architecture = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            other => other,
-        };
+        let platform = normalize_platform(std::env::consts::OS);
+        let architecture = normalize_architecture(std::env::consts::ARCH);
         Self {
-            platform: platform.into(),
-            architecture: architecture.into(),
+            platform,
+            architecture,
             macos_version: current_macos_version(),
         }
+    }
+}
+
+fn normalize_platform(platform: &str) -> String {
+    match platform.to_ascii_lowercase().as_str() {
+        "darwin" | "macos" => "macos".into(),
+        "win32" | "win64" | "windows" => "windows".into(),
+        other => other.into(),
+    }
+}
+
+fn normalize_architecture(architecture: &str) -> String {
+    match architecture.to_ascii_lowercase().as_str() {
+        "aarch64" | "arm64" => "arm64".into(),
+        "amd64" | "x64" | "x86_64" => "x86_64".into(),
+        other => other.into(),
     }
 }
 
@@ -416,6 +479,15 @@ pub(crate) struct RuntimeDiscoveryRequest<'a> {
 }
 
 pub(crate) fn factory_runtime_root(current_exe: &Path) -> Option<PathBuf> {
+    factory_runtime_root_for(current_exe, TARGET_PLATFORM)
+}
+
+fn factory_runtime_root_for(current_exe: &Path, platform: &str) -> Option<PathBuf> {
+    if normalize_platform(platform) == "windows" {
+        return current_exe
+            .parent()
+            .map(|directory| directory.join("ReynPython"));
+    }
     let macos = current_exe.parent()?;
     let contents = macos.parent()?;
     (macos.file_name()?.to_str()? == "MacOS" && contents.file_name()?.to_str()? == "Contents")
@@ -423,8 +495,12 @@ pub(crate) fn factory_runtime_root(current_exe: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn default_managed_runtime_root() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support/Reyn Studio/Runtime"))
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("Reyn Studio/Runtime"))
+    } else {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join("Library/Application Support/Reyn Studio/Runtime"))
+    }
 }
 
 pub(crate) fn discover_runtime(request: RuntimeDiscoveryRequest<'_>) -> RuntimeDiscovery {
@@ -604,7 +680,7 @@ fn validate_runtime_root(
         expected_runtime_id,
     )?;
     validate_manifest_files(root, &manifest)?;
-    let python = root.join(python_relative_path(&manifest.python)?);
+    let python = root.join(python_relative_path(&manifest.python, &manifest.platform)?);
     if !python.is_file() {
         return Err(RuntimeValidationError::integrity(format!(
             "validated runtime has no interpreter at {}",
@@ -622,6 +698,22 @@ fn validate_runtime_root(
 fn validate_manifest_metadata(
     manifest: &RuntimeManifest,
     host: &HostCompatibility,
+    expected_research_closure_sha256: &str,
+    expected_slot_id: Option<&str>,
+) -> Result<(), RuntimeValidationError> {
+    validate_manifest_metadata_for_spec(
+        manifest,
+        host,
+        target_platform_spec(),
+        expected_research_closure_sha256,
+        expected_slot_id,
+    )
+}
+
+fn validate_manifest_metadata_for_spec(
+    manifest: &RuntimeManifest,
+    host: &HostCompatibility,
+    spec: &RuntimePlatformSpec,
     expected_research_closure_sha256: &str,
     expected_slot_id: Option<&str>,
 ) -> Result<(), RuntimeValidationError> {
@@ -648,21 +740,21 @@ fn validate_manifest_metadata(
             )));
         }
     }
-    if manifest.platform != TARGET_PLATFORM
-        || manifest.architecture != TARGET_ARCHITECTURE
-        || manifest.minimum_macos != MINIMUM_MACOS
+    if normalize_platform(&manifest.platform) != spec.platform
+        || normalize_architecture(&manifest.architecture) != spec.architecture
+        || manifest.minimum_macos.as_deref() != spec.minimum_os
     {
         return Err(RuntimeValidationError::platform(format!(
-            "runtime targets {} {} macOS {}, expected {} {} macOS {}",
+            "runtime targets {} {} with minimum OS {:?}, expected {} {} with minimum OS {:?}",
             manifest.platform,
             manifest.architecture,
             manifest.minimum_macos,
-            TARGET_PLATFORM,
-            TARGET_ARCHITECTURE,
-            MINIMUM_MACOS
+            spec.platform,
+            spec.architecture,
+            spec.minimum_os
         )));
     }
-    validate_host(host)?;
+    validate_host_for_spec(host, spec)?;
     if manifest.python != PYTHON_VERSION
         || manifest.torch != TORCH_VERSION
         || manifest.numpy != NUMPY_VERSION
@@ -699,16 +791,28 @@ fn validate_manifest_metadata(
 }
 
 fn validate_host(host: &HostCompatibility) -> Result<(), RuntimeValidationError> {
-    if host.platform != TARGET_PLATFORM || host.architecture != TARGET_ARCHITECTURE {
+    validate_host_for_spec(host, target_platform_spec())
+}
+
+fn validate_host_for_spec(
+    host: &HostCompatibility,
+    spec: &RuntimePlatformSpec,
+) -> Result<(), RuntimeValidationError> {
+    if normalize_platform(&host.platform) != spec.platform
+        || normalize_architecture(&host.architecture) != spec.architecture
+    {
         return Err(RuntimeValidationError::platform(format!(
-            "compute runtime requires {TARGET_PLATFORM} {TARGET_ARCHITECTURE}; host is {} {}",
-            host.platform, host.architecture
+            "compute runtime requires {} {}; host is {} {}",
+            spec.platform, spec.architecture, host.platform, host.architecture
         )));
     }
+    let Some(minimum_os) = spec.minimum_os else {
+        return Ok(());
+    };
     let version = host.macos_version.as_deref().ok_or_else(|| {
         RuntimeValidationError::platform("could not determine the host macOS version")
     })?;
-    if compare_numeric_versions(version, MINIMUM_MACOS)
+    if compare_numeric_versions(version, minimum_os)
         .ok_or_else(|| {
             RuntimeValidationError::platform(format!(
                 "could not parse host macOS version '{version}'"
@@ -717,7 +821,7 @@ fn validate_host(host: &HostCompatibility) -> Result<(), RuntimeValidationError>
         .is_lt()
     {
         return Err(RuntimeValidationError::platform(format!(
-            "compute runtime requires macOS {MINIMUM_MACOS} or later; host is {version}"
+            "compute runtime requires macOS {minimum_os} or later; host is {version}"
         )));
     }
     Ok(())
@@ -839,7 +943,7 @@ fn validate_manifest_files(
             "{NOTICES_NAME} hash does not match notices_sha256"
         )));
     }
-    let python = python_relative_path(&manifest.python)?;
+    let python = python_relative_path(&manifest.python, &manifest.platform)?;
     if !declared.contains_key(python.to_str().unwrap_or_default()) {
         return Err(RuntimeValidationError::integrity(format!(
             "runtime interpreter {} is absent from the file manifest",
@@ -999,7 +1103,7 @@ fn validate_sha256(field: &str, digest: &str) -> Result<(), RuntimeValidationErr
     }
 }
 
-fn python_relative_path(version: &str) -> Result<PathBuf, RuntimeValidationError> {
+fn python_relative_path(version: &str, platform: &str) -> Result<PathBuf, RuntimeValidationError> {
     let mut parts = version.split('.');
     let major = parts.next().unwrap_or_default();
     let minor = parts.next().unwrap_or_default();
@@ -1012,7 +1116,11 @@ fn python_relative_path(version: &str) -> Result<PathBuf, RuntimeValidationError
             "invalid Python version '{version}'"
         )));
     }
-    Ok(PathBuf::from(format!("bin/python{major}.{minor}")))
+    if normalize_platform(platform) == "windows" {
+        Ok(PathBuf::from(WINDOWS_X64_SPEC.python_relative_path))
+    } else {
+        Ok(PathBuf::from(format!("bin/python{major}.{minor}")))
+    }
 }
 
 fn canonical_manifest_bytes(manifest: &RuntimeManifest) -> Result<Vec<u8>, RuntimeValidationError> {
@@ -1024,7 +1132,7 @@ fn manifest_runtime_id(manifest: &RuntimeManifest) -> Result<String, RuntimeVali
         schema: &manifest.schema,
         platform: &manifest.platform,
         architecture: &manifest.architecture,
-        minimum_macos: &manifest.minimum_macos,
+        minimum_macos: manifest.minimum_macos.as_deref(),
         python: &manifest.python,
         torch: &manifest.torch,
         numpy: &manifest.numpy,
@@ -1293,7 +1401,7 @@ pub(crate) fn smoke_verified_runtime(
     let probe = format!(
         r#"import json, platform, sys
 import numpy, torch
-print("REYN_RUNTIME_SMOKE " + json.dumps({{"schema":"{SMOKE_SCHEMA}","python":platform.python_version(),"torch":torch.__version__,"numpy":numpy.__version__,"machine":platform.machine(),"platform":sys.platform,"executable":sys.executable,"torch_file":torch.__file__,"numpy_file":numpy.__file__}}, sort_keys=True, separators=(",", ":")))"#
+print("REYN_RUNTIME_SMOKE " + json.dumps({{"schema":"{SMOKE_SCHEMA}","python":platform.python_version(),"torch":torch.__version__.split("+",1)[0],"numpy":numpy.__version__.split("+",1)[0],"machine":platform.machine(),"platform":sys.platform,"executable":sys.executable,"torch_file":torch.__file__,"numpy_file":numpy.__file__}}, sort_keys=True, separators=(",", ":")))"#
     );
     let output = run_bounded_subprocess(
         Command::new(&runtime.python).args(["-B", "-I", "-c", &probe]),
@@ -1359,20 +1467,7 @@ fn validate_smoke_protocol(
     runtime: &VerifiedRuntime,
     protocol: &RuntimeSmokeProtocol,
 ) -> Result<(), RuntimeValidationError> {
-    for (field, found, expected) in [
-        ("schema", protocol.schema.as_str(), SMOKE_SCHEMA),
-        ("python", protocol.python.as_str(), PYTHON_VERSION),
-        ("torch", protocol.torch.as_str(), TORCH_VERSION),
-        ("numpy", protocol.numpy.as_str(), NUMPY_VERSION),
-        ("machine", protocol.machine.as_str(), TARGET_ARCHITECTURE),
-        ("platform", protocol.platform.as_str(), "darwin"),
-    ] {
-        if found != expected {
-            return Err(RuntimeValidationError::smoke_failed(format!(
-                "runtime smoke reported {field}={found}, expected {expected}"
-            )));
-        }
-    }
+    validate_smoke_protocol_metadata(&runtime.manifest.platform, protocol)?;
     let canonical_root = fs::canonicalize(&runtime.root).map_err(|error| {
         RuntimeValidationError::integrity(format!(
             "could not canonicalize runtime {}: {error}",
@@ -1394,6 +1489,56 @@ fn validate_smoke_protocol(
                 "runtime smoke resolved {field} outside the verified slot"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_smoke_protocol_metadata(
+    manifest_platform: &str,
+    protocol: &RuntimeSmokeProtocol,
+) -> Result<(), RuntimeValidationError> {
+    let spec = if normalize_platform(manifest_platform) == "windows" {
+        &WINDOWS_X64_SPEC
+    } else {
+        &MACOS_ARM64_SPEC
+    };
+    for (field, found, expected) in [
+        ("schema", protocol.schema.as_str(), SMOKE_SCHEMA),
+        ("python", protocol.python.as_str(), PYTHON_VERSION),
+        ("torch", protocol.torch.as_str(), TORCH_VERSION),
+        ("numpy", protocol.numpy.as_str(), NUMPY_VERSION),
+    ] {
+        if found != expected {
+            return Err(RuntimeValidationError::smoke_failed(format!(
+                "runtime smoke reported {field}={found}, expected {expected}"
+            )));
+        }
+    }
+    let architecture = normalize_architecture(&protocol.machine);
+    if architecture != "arm64" && architecture != "x86_64" {
+        return Err(RuntimeValidationError::smoke_failed(format!(
+            "runtime smoke reported unknown machine={}",
+            protocol.machine
+        )));
+    }
+    if architecture != spec.architecture {
+        return Err(RuntimeValidationError::smoke_failed(format!(
+            "runtime smoke reported machine={}, normalized to {architecture}, expected {}",
+            protocol.machine, spec.architecture
+        )));
+    }
+    let platform = normalize_platform(&protocol.platform);
+    if platform != "macos" && platform != "windows" {
+        return Err(RuntimeValidationError::smoke_failed(format!(
+            "runtime smoke reported unknown platform={}",
+            protocol.platform
+        )));
+    }
+    if platform != spec.platform {
+        return Err(RuntimeValidationError::smoke_failed(format!(
+            "runtime smoke reported platform={}, normalized to {platform}, expected {}",
+            protocol.platform, spec.platform
+        )));
     }
     Ok(())
 }
@@ -2100,7 +2245,7 @@ mod tests {
                 runtime_id: String::new(),
                 platform: TARGET_PLATFORM.into(),
                 architecture: architecture.into(),
-                minimum_macos: MINIMUM_MACOS.into(),
+                minimum_macos: Some(MINIMUM_MACOS.into()),
                 python: python.into(),
                 torch: TORCH_VERSION.into(),
                 numpy: NUMPY_VERSION.into(),
@@ -2265,6 +2410,70 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
         assert!(canonical
             .starts_with(br#"{"architecture":"arm64","build_epoch":0,"engine_protocol":1"#));
         assert!(!canonical.contains(&b'\n'));
+    }
+
+    #[test]
+    fn windows_names_and_paths_normalize_without_a_windows_host() {
+        assert_eq!(normalize_platform("win32"), "windows");
+        assert_eq!(normalize_platform("Windows"), "windows");
+        assert_eq!(normalize_architecture("AMD64"), "x86_64");
+        assert_eq!(normalize_architecture("x64"), "x86_64");
+        assert_eq!(
+            python_relative_path(PYTHON_VERSION, "win32").unwrap(),
+            PathBuf::from("python.exe")
+        );
+        assert_eq!(
+            factory_runtime_root_for(Path::new("/portable/Reyn Studio.exe"), "windows"),
+            Some(PathBuf::from("/portable/ReynPython"))
+        );
+    }
+
+    #[test]
+    fn windows_smoke_protocol_accepts_x86_64_aliases_and_rejects_unknown_machine() {
+        let mut protocol = RuntimeSmokeProtocol {
+            schema: SMOKE_SCHEMA.into(),
+            python: PYTHON_VERSION.into(),
+            torch: TORCH_VERSION.into(),
+            numpy: NUMPY_VERSION.into(),
+            machine: "x86_64".into(),
+            platform: "win32".into(),
+            executable: "unused".into(),
+            torch_file: "unused".into(),
+            numpy_file: "unused".into(),
+        };
+        for machine in ["x86_64", "AMD64", "x64"] {
+            protocol.machine = machine.into();
+            validate_smoke_protocol_metadata("windows", &protocol).unwrap();
+        }
+        protocol.machine = "i686".into();
+        let error = validate_smoke_protocol_metadata("windows", &protocol).unwrap_err();
+        assert!(error.detail.contains("unknown machine=i686"));
+    }
+
+    #[test]
+    fn windows_manifest_omits_macos_floor_and_accepts_amd64_host() {
+        let fixture = Fixture::new("windows-manifest");
+        let mut manifest = fixture.create_runtime(
+            &fixture.root.join("mac-fixture"),
+            TARGET_ARCHITECTURE,
+            PYTHON_VERSION,
+            &digest(7),
+        );
+        manifest.platform = "windows".into();
+        manifest.architecture = "AMD64".into();
+        manifest.minimum_macos = None;
+        manifest.runtime_id = manifest_runtime_id(&manifest).unwrap();
+        let host = HostCompatibility {
+            platform: "win32".into(),
+            architecture: "AMD64".into(),
+            macos_version: None,
+        };
+        validate_manifest_metadata_for_spec(&manifest, &host, &WINDOWS_X64_SPEC, &digest(7), None)
+            .unwrap();
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        assert!(!String::from_utf8(canonical)
+            .unwrap()
+            .contains("minimum_macos"));
     }
 
     #[test]

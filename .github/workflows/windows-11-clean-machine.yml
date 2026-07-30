@@ -1,0 +1,106 @@
+name: Windows 11 clean-machine qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Run ID from the Windows packaging workflow
+        required: true
+        type: string
+      manual_matrix_completed:
+        description: Attest that the manual matrix in docs/WINDOWS_RELEASE.md was completed
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  windows-11-clean-machine:
+    runs-on: [self-hosted, Windows, X64, windows-11, reyn-clean-machine]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Require an actual Windows 11 host
+        shell: pwsh
+        run: |
+          $caption = (Get-CimInstance Win32_OperatingSystem).Caption
+          if ($caption -notmatch "Windows 11") {
+            throw "Qualification requires Windows 11, found: $caption"
+          }
+          "QUALIFICATION_OS=$caption" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download exact unverified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: reyn-studio-windows-x64-unverified
+          path: qualification-input
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and extract artifact
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem "qualification-input" -Filter "*.zip" | Select-Object -First 1
+          $checksum = (Get-Content "qualification-input/SHA256SUMS").Split()[0]
+          $actual = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $checksum) {
+            throw "Artifact checksum mismatch: expected $checksum, found $actual"
+          }
+          $destination = Join-Path $env:RUNNER_TEMP "Reyn qualification Résultats"
+          if (Test-Path $destination) { Remove-Item $destination -Recurse -Force }
+          Expand-Archive $zip.FullName -DestinationPath $destination
+          $stage = Get-ChildItem $destination -Directory | Select-Object -First 1
+          "QUALIFICATION_STAGE=$($stage.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "QUALIFICATION_SHA256=$actual" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Verify engine readiness and cleanup
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:QUALIFICATION_STAGE "Reyn Studio.exe"
+          $process = Start-Process $exe -PassThru
+          $deadline = (Get-Date).AddSeconds(45)
+          $child = $null
+          while ((Get-Date) -lt $deadline -and -not $process.HasExited) {
+            $child = Get-CimInstance Win32_Process |
+              Where-Object {
+                $_.ParentProcessId -eq $process.Id -and
+                $_.Name -eq "python.exe" -and
+                $_.CommandLine -match "reyn_engine.py"
+              } |
+              Select-Object -First 1
+            if ($child) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($process.HasExited -or -not $child) {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            throw "Clean-machine launch did not reach engine readiness."
+          }
+          $process.CloseMainWindow() | Out-Null
+          if (-not $process.WaitForExit(15000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Clean-machine app did not close normally."
+          }
+          Start-Sleep -Seconds 2
+          if (Get-CimInstance Win32_Process -Filter "ProcessId = $($child.ProcessId)") {
+            throw "Clean-machine app left an orphaned Python engine."
+          }
+
+      - name: Require manual acceptance record
+        shell: pwsh
+        run: |
+          if ("${{ inputs.manual_matrix_completed }}" -ne "true") {
+            throw "Automated smoke passed, but the manual Windows 11 matrix is not attested."
+          }
+          @"
+          Windows 11 clean-machine qualification
+          OS: $env:QUALIFICATION_OS
+          Artifact SHA-256: $env:QUALIFICATION_SHA256
+          Packaging run: ${{ inputs.artifact_run_id }}
+          Manual matrix attested: true
+          "@ | Out-File "windows-11-qualification.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-11-qualification-${{ inputs.artifact_run_id }}
+          path: windows-11-qualification.txt
+          if-no-files-found: error

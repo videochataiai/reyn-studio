@@ -6797,11 +6797,13 @@ impl ReynApp {
                 }
                 ui.horizontal_centered(|ui| {
                     let fullscreen = ui.input(|input| input.viewport().fullscreen.unwrap_or(false));
-                    // Native traffic lights sit inside the fullsize content
-                    // view; inset our content past them when they're visible.
-                    // 78px inset per §4.1 so the brand never crowds the
-                    // traffic lights (QA C10).
-                    ui.add_space(if fullscreen { 4.0 } else { 78.0 });
+                    // macOS traffic lights sit inside the full-size content
+                    // view. Windows uses a standard title bar above this panel.
+                    ui.add_space(if cfg!(target_os = "macos") && !fullscreen {
+                        78.0
+                    } else {
+                        4.0
+                    });
                     ui.label(
                         RichText::new("Reyn Studio")
                             .text_style(body_strong())

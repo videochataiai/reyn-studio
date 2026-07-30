@@ -2,6 +2,7 @@
 //! Python inference engine. Entry point: sets up the window and theme.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod access;
 mod app;
 mod benchmark_evidence;
 mod benchmark_export;
@@ -29,6 +30,11 @@ mod viewport;
 mod vtk_export;
 
 fn main() -> eframe::Result<()> {
+    if access::print_build_contract_requested(std::env::args()) {
+        println!("{}", access::build_contract_json());
+        return Ok(());
+    }
+
     if let Some(request) = signing::parse_verify_cli(std::env::args()) {
         let exit_code = match request.and_then(run_signature_verification) {
             Ok(outcome) => {
@@ -64,6 +70,16 @@ fn main() -> eframe::Result<()> {
     });
     let inner_size = forced_size.unwrap_or([1440.0, 900.0]);
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size(inner_size)
+        .with_min_inner_size([1100.0, 700.0])
+        .with_title("Reyn Studio");
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false);
+
     let options = eframe::NativeOptions {
         // A forced QA size must win over persisted window geometry. eframe
         // restores the stored "window" entry regardless of `persist_window`
@@ -73,21 +89,10 @@ fn main() -> eframe::Result<()> {
         persistence_path: forced_size
             .is_some()
             .then(|| std::env::temp_dir().join("reyn-studio-qa-storage.ron")),
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(inner_size)
-            .with_min_inner_size([1100.0, 700.0])
-            // Title text stays for Mission Control / the Dock; the native
-            // titlebar keeps only its traffic lights (single chrome, §4.1) —
-            // the in-app 44px top bar owns window identity.
-            //
-            // egui-winit maps `with_titlebar_shown(false)` to winit's
-            // `with_titlebar_transparent(true)`: the titlebar (and its traffic
-            // lights) stays, but macOS stops painting its default material as
-            // an opaque strip *over* the fullsize content view.
-            .with_title("Reyn Studio")
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false),
+        // macOS keeps the incumbent full-size content treatment. Windows uses
+        // standard system decorations so move, resize, minimize, and close
+        // behavior remain native and reachable.
+        viewport,
         // wgpu backend = native Metal on macOS, Vulkan on Linux, DX12 on Windows.
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
@@ -99,7 +104,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(app::ReynApp::new(cc)))
+            Ok(Box::new(access::RootApp::new(cc)))
         }),
     )
 }

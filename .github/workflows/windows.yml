@@ -1,0 +1,123 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      SOURCE_DATE_EPOCH: "315532800"
+      REYN_RESEARCH_SOURCE_DIR: ${{ github.workspace }}/reyn-research
+      REYN_ACCESS_REQUIRED: "1"
+      REYN_ACCESS_ENDPOINT: https://reynflow.com/api/yc-access/v1/session
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check out research runtime source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: videochataiai/reyn-research
+          ref: 0333b13bd117e6129d989aa41dd7e3057c11d116
+          path: reyn-research
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $pins = Get-Content "packaging/windows/release-pins.json" | ConvertFrom-Json
+          rustup toolchain install $pins.rust_toolchain `
+            --profile minimal `
+            --component rustfmt `
+            --target $pins.target
+          rustup default $pins.rust_toolchain
+
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests and checks
+        run: |
+          cargo test --locked --all-targets
+          cargo check --locked --target x86_64-pc-windows-msvc
+          cargo build --locked --release
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Assemble pinned CPU runtime
+        shell: pwsh
+        run: |
+          $pins = Get-Content "packaging/windows/release-pins.json" | ConvertFrom-Json
+          uv python install $pins.python
+          $python = (uv python find $pins.python).Trim()
+          $source = Split-Path $python
+          $runtime = Join-Path $env:RUNNER_TEMP "ReynPython"
+          Copy-Item $source $runtime -Recurse
+          uv pip install --python (Join-Path $runtime "python.exe") `
+            --system `
+            --require-hashes `
+            --index-url https://download.pytorch.org/whl/cpu `
+            --extra-index-url https://pypi.org/simple `
+            --index-strategy unsafe-best-match `
+            --requirements "packaging/windows/python-runtime.lock"
+          "REYN_WINDOWS_RUNTIME_DIR=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build and validate portable ZIP
+        shell: pwsh
+        run: |
+          python scripts/package_windows.py `
+            --runtime-dir "$env:REYN_WINDOWS_RUNTIME_DIR" `
+            --research-source-dir "reyn-research" `
+            --binary "target/release/reyn-studio.exe" `
+            --runtime-smoke
+          $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
+          python scripts/validate_windows_package.py "$($stage.FullName)" --runtime-smoke
+
+      - name: Engine readiness and launch cleanup smoke
+        shell: pwsh
+        run: |
+          $stage = Get-ChildItem "dist/windows" -Directory | Select-Object -First 1
+          python scripts/windows_engine_smoke.py "$($stage.FullName)"
+          $exe = Join-Path $stage.FullName "Reyn Studio.exe"
+          $process = Start-Process $exe -PassThru
+          $deadline = (Get-Date).AddSeconds(30)
+          $child = $null
+          while ((Get-Date) -lt $deadline -and -not $process.HasExited) {
+            $child = Get-CimInstance Win32_Process |
+              Where-Object {
+                $_.ParentProcessId -eq $process.Id -and
+                $_.Name -eq "python.exe" -and
+                $_.CommandLine -match "reyn_engine.py"
+              } |
+              Select-Object -First 1
+            if ($child) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($process.HasExited -or -not $child) {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            throw "Reyn Studio did not reach a running bundled-engine state."
+          }
+          $process.CloseMainWindow() | Out-Null
+          if (-not $process.WaitForExit(15000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Reyn Studio did not exit after a normal window close."
+          }
+          Start-Sleep -Seconds 2
+          $orphan = Get-CimInstance Win32_Process -Filter "ProcessId = $($child.ProcessId)"
+          if ($orphan) {
+            Stop-Process -Id $orphan.ProcessId -Force
+            throw "Bundled Python engine remained after Reyn Studio exited."
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reyn-studio-windows-x64-unverified
+          path: |
+            dist/windows/*.zip
+            dist/windows/SHA256SUMS
+          if-no-files-found: error

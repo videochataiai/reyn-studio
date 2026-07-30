@@ -1,0 +1,26 @@
+{
+  "name": "reyn-yc-access-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "tsc --noEmit && tsc --noEmit --project tsconfig.test.json",
+    "deploy": "npm run secrets:preflight && wrangler deploy",
+    "dev": "wrangler dev",
+    "secrets:configure": "node scripts/generate-secret-bundle.mjs | wrangler secret bulk",
+    "secrets:preflight": "node scripts/preflight-secrets.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "test:integration": "node scripts/smoke-local.mjs",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.115.0"
+  }
+}

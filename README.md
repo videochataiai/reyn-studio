@@ -1,75 +1,75 @@
 # Reyn Studio
 
-Fully-native neural-CFD workbench. **Rust + egui + `wgpu`** (native Metal/Vulkan/DX12 —
-*not* browser WebGPU), linked to the PyTorch models through a Python engine sidecar.
+Reyn Studio is a native desktop app for setting up fluid-flow cases, inspecting
+model results, comparing them with reference evidence, and keeping the evidence
+with the project.
 
-## Why this stack
-- **Native `wgpu`** renders the 3D volumetric view directly on the GPU (Metal on macOS).
-- **egui** is the fully-native immediate-mode UI (panels, sliders, metrics).
-- **Python engine** keeps the PyTorch models where they belong; the native app talks to it
-  over framed loopback TCP. Shared-memory field transport remains a planned optimization.
-  The protocol can later sit in front of a native ONNX/ExecuTorch backend without changing
-  the scientific UI.
+The interface is Rust, egui, and native `wgpu`. A local Python sidecar runs the
+PyTorch model code over a framed loopback connection. Projects, geometry,
+results, settings, and recovery data stay on the user's computer.
 
-## Run
+## Current status
+
+- The app is an early research preview, not production-qualified CFD software.
+- macOS development and packaging paths are implemented.
+- Windows 11 x64 portable packaging is implemented but remains labeled
+  **preview pending clean-machine verification**.
+- Windows CUDA, an installer, and automatic updates are not available.
+- No model weights are included. No available 2D or 3D model has completed the
+  full release-qualification gate.
+- A run requires a compatible, verified `.reynmodel` bundle and its detached
+  signature.
+
+See [the Windows release guide](docs/WINDOWS_RELEASE.md) and
+[the macOS release guide](docs/MACOS_RELEASE.md) for exact support boundaries.
+
+## Build from source
+
+Install the pinned Rust toolchain and provide a compatible Reyn research
+checkout and Python environment:
+
 ```bash
-cargo run            # debug
-cargo run --release  # smooth 3D
+export REYN_RESEARCH_DIR=/path/to/reyn-research
+export REYN_PYTHON=/path/to/python
+cargo run
 ```
 
-The engine uses `REYN_RESEARCH_DIR` for the local research checkout. Python resolution is:
-`REYN_PYTHON`, then `<research>/.venv/bin/python`, then `python3` on `PATH`.
+Python resolution falls back to `<research>/.venv/bin/python` and then
+`python3` on `PATH` for local development. Packaged builds use their verified,
+bundled runtime and do not fall back to a developer checkout.
 
-## Status
-- [x] N1–N4 — Python sidecar, native `wgpu` volume/particle rendering, 2D pressure recovery,
-  solver-reference and self-consistency evidence, Flow Painter, and recovered-pressure CAD
-  surface analysis
-- [x] N5.1 — benchmark seed×horizon suite, persistence baseline, CSV, and canonical
-  SHA-256 report-card integrity
-- [x] N5.2 coherent slice — exact training/mixed-fork/validation/fresh-test stream
-  classification; legacy provenance findings; mouse/keyboard cell selection; on-demand
-  model/solver-reference velocity, vorticity, recovered-pressure, error, and
-  spatial-divergence maps with explicit methods, units, source classes, and shared scales;
-  plus energy spectra. Benchmark inference honors legacy, mask-conditioned, and fixed-body-v2
-  physics contracts, including checkpoint-declared viscosity normalization.
-- [x] N5.3 export slice — deterministic PNG/PDF report cards generated from the canonical
-  JSON payload with visible run/protocol/model/checkpoint and payload hashes, selected-cell
-  methodology, units, shared scales, warnings, limitations, and verification instructions.
-  Visual exports include the matching JSON sidecar and remain explicitly `UNSIGNED`.
-- [ ] Remaining N5 — integrate the tested field-space nearest-training-IC/trajectory-overlap
-  analysis into benchmark evidence. The Ed25519 signing core, detached sidecars, portable
-  verification, revocation handling, signed JSON/PNG/PDF bundle path, and native Keychain
-  provider are implemented; `N5X-SIGN-01` remains open until the production macOS
-  Keychain/user-presence path is exercised safely on a supported app build.
-- [ ] N6 — validated model import/library plus `N6-PROJ-01`–`N6-PROJ-07` now pass.
-  Schema-v2 projects reopen Benchmark Lab cases, model/source hashes, immutable parented runs,
-  selected calibrated evidence, warnings, and deterministic scalar comparisons; shipped v1
-  evidence migrates without loss. Self-contained SHA-256-addressed sources/artifacts, dynamic
-  engine/model reconciliation, read-only evidence mode, integrity diagnostics, deduplication,
-  and safe relinking are implemented. Compare/IA, signing-key integration, packaging, and
-  clean-machine gates remain open.
-
-Benchmark seeds are exact RNG seeds and default to `70000+`. The app never presents the
-`train seed + 50000` validation/checkpoint-selection stream as independent testing.
+Public source builds do not require the invitation service. Official YC
+artifacts are compiled with a login gate. The username, password digest, and
+hashing keys are encrypted Cloudflare Worker secrets and are not present in
+this repository or the binary. The service implementation is in
+[`services/yc-access-worker`](services/yc-access-worker/).
 
 ## Test
+
 ```bash
 cargo fmt --check
 cargo test
 cargo check --release
-python3 -m unittest engine/test_reyn_engine.py engine/test_n5_inspector.py engine/test_n5_overlap.py
+REYN_RESEARCH_SOURCE_DIR=/path/to/reyn-research \
+  python3 -m unittest discover -s tests -p "test_*.py"
+
+cd services/yc-access-worker
+npm install
+npm run types
+npm run check
 ```
 
-Current verification: 85 Rust tests passed (one explicit performance benchmark ignored) and
-27 Python engine tests passed, including generated physics-conditioned checkpoint, inspector
-protocol, recovered-pressure, and bounded overlap-analysis coverage.
+The repository also includes engine, project-recovery, packaging, supply-chain,
+geometry, export, rendering, signature, and access-contract tests. Tests marked
+`ignored` require a real platform, GPU, network credential, or explicit
+performance run.
 
 ## Offline signature verification
 
-The canonical report remains immutable and explicitly `UNSIGNED`. Signing creates a separate
-`*.sig.json` evidence artifact with Ed25519 algorithm, key ID, public key, SHA-256 public-key
-fingerprint, signature bytes, signed canonical-payload hash, and source run/report lineage.
-PNG and PDF presentations embed that sidecar's SHA-256 and the same payload hash.
+Signing creates a detached `*.sig.json` evidence artifact. It records the
+Ed25519 signature, key ID, public key fingerprint, canonical payload hash, and
+source run lineage. A signature proves byte integrity and signer possession; it
+does not prove that a simulation is scientifically valid.
 
 ```bash
 reyn-studio verify-signature \
@@ -78,11 +78,21 @@ reyn-studio verify-signature \
   --trusted-fingerprint <organization-key-sha256>
 ```
 
-Pass each current revoked fingerprint with `--revoked-fingerprint <sha256>`. Without a trusted
-fingerprint, Reyn can report a valid Ed25519 signature but must keep organization identity
-`VALID_UNTRUSTED_KEY`. Compare fingerprints through an independent channel.
+Pass each revoked fingerprint with `--revoked-fingerprint <sha256>`. Without a
+trusted fingerprint, Reyn reports a cryptographically valid signature as
+`VALID_UNTRUSTED_KEY`. Compare trusted fingerprints through an independent
+channel.
 
-On macOS, newly created private seeds are stored as non-synchronizing, this-device-only Keychain
-items requiring user presence. Settings, projects, reports, logs, and sidecars contain only the
-key reference and public verification material. The provider boundary keeps deterministic tests
-non-secret and prevents application code from reading private bytes.
+On macOS, private signing seeds use non-synchronizing, device-only Keychain
+items that require user presence. Windows evidence signing remains unavailable
+until an equivalent native key-storage path is implemented and verified.
+
+## License and safety
+
+Source code in this repository is licensed under the
+[Apache License 2.0](LICENSE). The `NOTICE` file applies. The Reyn name, logo,
+and visual identity are not granted under the source license.
+
+Reyn Studio produces numerical and machine-learning approximations. Do not use
+it as the sole basis for engineering, safety, regulatory, or operational
+decisions. Independently validate every material result.

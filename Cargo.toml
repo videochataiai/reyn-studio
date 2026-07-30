@@ -2,7 +2,7 @@
 name = "reyn-studio"
 version = "0.1.0"
 edition = "2021"
-description = "Reyn Studio — fully-native (egui + wgpu) neural-CFD workbench, linked to a Python inference engine"
+description = "Native desktop studio for fluid-flow cases, model results, and evidence"
 
 [package.metadata.reyn-macos]
 bundle-identifier = "com.reyn.studio"
@@ -27,10 +27,17 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 zeroize = "1"
 egui-phosphor = "0.13.0"
+ureq = { version = "3.3.0", default-features = false, features = ["json", "native-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.19.3"
 security-framework = { version = "3.7", features = ["OSX_10_15"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+
+[build-dependencies]
+winres = "0.1.12"
 
 [dev-dependencies]
 pollster = "0.4"

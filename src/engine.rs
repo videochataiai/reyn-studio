@@ -15,11 +15,13 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const ENGINE_ENTRYPOINT: &str = "engine/reyn_engine.py";
 const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(test)]
 const DEVELOPMENT_UNSIGNED_FIXTURE_MARKER: &str = ".development-unsigned-model-fixture";
 pub const MODEL_BUNDLE_EXTENSION: &str = "reynmodel";
@@ -31,7 +33,12 @@ pub const TRUSTED_MODEL_CONVERSION_GUIDANCE: &str =
      .reynmodel.sig publisher signature. Legacy .pth files are never opened; convert a \
      checkpoint you trust offline with convert_model_bundle.py, have an authorized publisher \
      sign it, and copy or relink both files together.";
-const REQUIRED_ENGINE_RESOURCES: &[&str] = &["n5_inspector.py", "n5_overlap.py", "reyn_engine.py"];
+const REQUIRED_ENGINE_RESOURCES: &[&str] = &[
+    "model_bundle.py",
+    "n5_inspector.py",
+    "n5_overlap.py",
+    "reyn_engine.py",
+];
 const REQUIRED_RESEARCH_MODULES: &[&str] = &[
     "dataset.py",
     "dataset_3d.py",
@@ -51,15 +58,23 @@ pub struct EngineConfig {
     pub research_dir: String,
     pub python_path: String,
     pub device: String,
+    #[cfg(test)]
+    pub engine_script: Option<String>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         let research_dir = research_dir();
-        let local_python = Path::new(&research_dir).join(".venv/bin/python");
+        let local_python = if cfg!(target_os = "windows") {
+            Path::new(&research_dir).join(".venv/Scripts/python.exe")
+        } else {
+            Path::new(&research_dir).join(".venv/bin/python")
+        };
         let python_path = std::env::var("REYN_PYTHON").unwrap_or_else(|_| {
             if local_python.is_file() {
                 local_python.to_string_lossy().into_owned()
+            } else if cfg!(target_os = "windows") {
+                "python".into()
             } else {
                 "python3".into()
             }
@@ -68,6 +83,8 @@ impl Default for EngineConfig {
             research_dir,
             python_path,
             device: std::env::var("REYN_DEVICE").unwrap_or_else(|_| "auto".into()),
+            #[cfg(test)]
+            engine_script: None,
         }
     }
 }
@@ -446,9 +463,35 @@ fn guard_model_format(
     }
 }
 
+fn configure_request_timeouts(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
+fn cancel_engine_stream(stream: &Arc<Mutex<Option<TcpStream>>>) {
+    if let Ok(mut slot) = stream.lock() {
+        if let Some(stream) = slot.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 pub struct EngineHandle {
     pub tx: Sender<Cmd>,
     pub rx: Receiver<Msg>,
+    worker: Option<thread::JoinHandle<()>>,
+    shutdown_stream: Arc<Mutex<Option<TcpStream>>>,
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        cancel_engine_stream(&self.shutdown_stream);
+        let (replacement, _) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.tx, replacement));
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub fn research_dir() -> String {
@@ -478,6 +521,19 @@ fn absolute_from(path: &Path, current_dir: &Path) -> PathBuf {
 }
 
 fn bundle_resources(current_exe: &Path) -> Option<PathBuf> {
+    bundle_resources_for(current_exe, std::env::consts::OS)
+}
+
+fn bundle_resources_for(current_exe: &Path, platform: &str) -> Option<PathBuf> {
+    if matches!(
+        platform.to_ascii_lowercase().as_str(),
+        "windows" | "win32" | "win64"
+    ) {
+        let directory = current_exe.parent()?;
+        let resources = directory.join("resources");
+        return (resources.is_dir() || directory.join("release-manifest.json").is_file())
+            .then_some(resources);
+    }
     let macos = current_exe.parent()?;
     let contents = macos.parent()?;
     if macos.file_name() == Some(OsStr::new("MacOS"))
@@ -710,12 +766,17 @@ fn resolve_runtime(config: &EngineConfig) -> std::io::Result<RuntimePaths> {
     let current_exe = std::env::current_exe()?;
     let current_dir = std::env::current_dir()?;
     let resources_override = nonempty_env("REYN_RESOURCES_DIR");
-    let engine_override = nonempty_env("REYN_ENGINE_SCRIPT");
+    let environment_engine_override = nonempty_env("REYN_ENGINE_SCRIPT");
+    #[cfg(test)]
+    let configured_engine_override = config.engine_script.as_deref().map(Path::new);
+    #[cfg(not(test))]
+    let configured_engine_override: Option<&Path> = None;
+    let engine_override = configured_engine_override.or(environment_engine_override.as_deref());
     let script = resolve_engine_script_at(
         &current_exe,
         &current_dir,
         resources_override.as_deref(),
-        engine_override.as_deref(),
+        engine_override,
     )?;
 
     let research_override = nonempty_env("REYN_RESEARCH_DIR");
@@ -874,10 +935,14 @@ impl EngineHandle {
     pub fn spawn_with_config(config: EngineConfig) -> EngineHandle {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
         let (msg_tx, msg_rx) = std::sync::mpsc::channel::<Msg>();
-        thread::spawn(move || worker(cmd_rx, msg_tx, config));
+        let shutdown_stream = Arc::new(Mutex::new(None));
+        let worker_shutdown_stream = Arc::clone(&shutdown_stream);
+        let worker = thread::spawn(move || worker(cmd_rx, msg_tx, config, worker_shutdown_stream));
         EngineHandle {
             tx: cmd_tx,
             rx: msg_rx,
+            worker: Some(worker),
+            shutdown_stream,
         }
     }
 }
@@ -892,9 +957,19 @@ fn device_label(device: &str) -> String {
     }
 }
 
-fn worker(cmd_rx: Receiver<Cmd>, msg_tx: Sender<Msg>, config: EngineConfig) {
+fn worker(
+    cmd_rx: Receiver<Cmd>,
+    msg_tx: Sender<Msg>,
+    config: EngineConfig,
+    shutdown_stream: Arc<Mutex<Option<TcpStream>>>,
+) {
     let mut conn = match start(&config) {
-        Ok((stream, _child, device, model_bundles, runtime_status, health)) => {
+        Ok((stream, child, device, model_bundles, runtime_status, health)) => {
+            if let Ok(cancel_stream) = stream.try_clone() {
+                if let Ok(mut slot) = shutdown_stream.lock() {
+                    *slot = Some(cancel_stream);
+                }
+            }
             let model_status = if model_bundles == 0 {
                 " · [runtime.models_missing] no .reynmodel + .sig pairs found"
             } else {
@@ -906,19 +981,17 @@ fn worker(cmd_rx: Receiver<Cmd>, msg_tx: Sender<Msg>, config: EngineConfig) {
                 runtime_status,
                 model_status,
             )));
-            // keep the child alive for the life of the thread
-            std::mem::forget(_child);
             if let Some(health) = health.as_ref() {
                 let _ = runtime::record_runtime_startup_success(health, runtime::current_epoch());
             }
-            (stream, health)
+            (stream, health, child)
         }
         Err(e) => {
             let _ = msg_tx.send(Msg::Error(format!("engine unavailable: {e}")));
             return;
         }
     };
-    let (ref mut conn, ref health) = conn;
+    let (ref mut conn, ref health, ref mut child) = conn;
     let mut recorded_runtime_success = false;
     while let Ok(cmd) = cmd_rx.recv() {
         let res = match cmd {
@@ -1181,6 +1254,16 @@ fn worker(cmd_rx: Receiver<Cmd>, msg_tx: Sender<Msg>, config: EngineConfig) {
             break;
         }
     }
+    let _ = conn.shutdown(std::net::Shutdown::Both);
+    cancel_engine_stream(&shutdown_stream);
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn parse_model_card(value: &serde_json::Value) -> Option<ModelCard> {
@@ -1699,6 +1782,13 @@ fn start_resolved(runtime: &RuntimePaths, config: &EngineConfig) -> std::io::Res
             format!("failed to connect to Python sidecar on loopback port {port}: {error}"),
         )
     })?;
+    if let Err(error) = configure_request_timeouts(&stream, ENGINE_REQUEST_TIMEOUT) {
+        return Err(terminate_startup(
+            &mut child,
+            &mut stderr,
+            format!("failed to bound Python sidecar request timeouts: {error}"),
+        ));
+    }
     thread::spawn(move || {
         let _ = std::io::copy(&mut stderr, &mut std::io::sink());
     });
@@ -1797,8 +1887,15 @@ mod tests {
             let temp = TempFixture::new(&format!("verified-{dimension}d"));
             let defaults = EngineConfig::default();
             let source_research = PathBuf::from(&defaults.research_dir);
+            let source_engine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("engine");
             let research = temp.root.join("research");
+            let engine = temp.root.join("engine");
             fs::create_dir_all(&research).expect("create verified research fixture");
+            fs::create_dir_all(&engine).expect("create verified engine fixture");
+            for module in REQUIRED_ENGINE_RESOURCES {
+                fs::copy(source_engine.join(module), engine.join(module))
+                    .expect("copy engine module");
+            }
             for entry in fs::read_dir(&source_research).expect("read research checkout") {
                 let entry = entry.expect("research entry");
                 let source = entry.path();
@@ -1818,7 +1915,9 @@ mod tests {
             let grid = 16usize;
             let script = r#"
 import os
+import sys
 import torch
+sys.path.insert(0, os.environ["REYN_FIXTURE_ENGINE_DIR"])
 from model_bundle import load_model_bundle, write_model_bundle
 
 dimension = int(os.environ["REYN_FIXTURE_DIMENSION"])
@@ -1902,9 +2001,10 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
                 .current_dir(&source_research)
                 .env("REYN_FIXTURE_DIMENSION", dimension.to_string())
                 .env("REYN_FIXTURE_DESTINATION", &destination)
+                .env("REYN_FIXTURE_ENGINE_DIR", &engine)
                 .env(
                     "REYN_FIXTURE_MODEL_BUNDLE_MODULE",
-                    research.join("model_bundle.py"),
+                    engine.join("model_bundle.py"),
                 )
                 .output()
                 .expect("launch verified bundle builder");
@@ -1925,6 +2025,9 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
                     research_dir: research.to_string_lossy().into_owned(),
                     python_path: defaults.python_path,
                     device: "cpu".into(),
+                    engine_script: Some(
+                        engine.join("reyn_engine.py").to_string_lossy().into_owned(),
+                    ),
                 },
                 model_id,
                 grid,
@@ -1967,6 +2070,63 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
     }
 
     #[test]
+    fn sidecar_request_read_is_bounded() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        configure_request_timeouts(&stream, Duration::from_millis(30)).unwrap();
+        let started = Instant::now();
+        let error = request(&mut stream, r#"{"op":"stall"}"#.into(), &[]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_handle_drop_cancels_an_inflight_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let _ = stream.read_to_end(&mut bytes);
+        });
+        let stream = TcpStream::connect(address).unwrap();
+        configure_request_timeouts(&stream, Duration::from_secs(5)).unwrap();
+        let shutdown_stream = Arc::new(Mutex::new(Some(stream.try_clone().unwrap())));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut stream = stream;
+            let result = request(&mut stream, r#"{"op":"stall"}"#.into(), &[]);
+            let _ = result_tx.send(result);
+        });
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let (_msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let handle = EngineHandle {
+            tx: cmd_tx,
+            rx: msg_rx,
+            worker: Some(worker),
+            shutdown_stream,
+        };
+        thread::sleep(Duration::from_millis(25));
+        let started = Instant::now();
+        drop(handle);
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled request returns");
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn packaged_runtime_resolves_contents_resources() {
         let fixture = TempFixture::new("packaged");
         let executable = fixture.file("Reyn Studio.app/Contents/MacOS/reyn-studio");
@@ -1982,6 +2142,29 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
         assert_eq!(
             default_research_dir_at(&executable, &current_dir, None),
             research
+        );
+    }
+
+    #[test]
+    fn windows_portable_resources_resolve_beside_executable() {
+        let fixture = TempFixture::new("windows-portable");
+        let executable = fixture.file("portable/Reyn Studio.exe");
+        let script = fixture.file("portable/resources/engine/reyn_engine.py");
+        let research = fixture.research("portable/resources/research");
+        let resources = bundle_resources_for(&executable, "win32").unwrap();
+        assert_eq!(resources, fixture.root.join("portable/resources"));
+        assert_eq!(resources.join(ENGINE_ENTRYPOINT), script);
+        assert_eq!(resources.join("research"), research);
+    }
+
+    #[test]
+    fn windows_release_marker_prevents_developer_fallback_when_resources_are_missing() {
+        let fixture = TempFixture::new("windows-incomplete");
+        let executable = fixture.file("portable/Reyn Studio.exe");
+        fixture.file("portable/release-manifest.json");
+        assert_eq!(
+            bundle_resources_for(&executable, "windows"),
+            Some(fixture.root.join("portable/resources"))
         );
     }
 

@@ -1,0 +1,7 @@
+{
+  "python": "3.14.6",
+  "research_revision": "0333b13bd117e6129d989aa41dd7e3057c11d116",
+  "rust_toolchain": "1.97.0",
+  "source_date_epoch": 315532800,
+  "target": "x86_64-pc-windows-msvc"
+}
