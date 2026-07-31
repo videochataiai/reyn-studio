@@ -13,7 +13,7 @@
     "payload_schema": "com.reyn.inference-model-signature-payload/1",
     "required_adjacent_suffix": ".sig"
   },
-  "model_assets_bundled": false,
+  "model_assets_bundled": true,
   "production_root": {
     "pinned": true,
     "sha256": "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1",

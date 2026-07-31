@@ -802,6 +802,7 @@ fn model_bundle_count(research_dir: &Path) -> usize {
 fn validate_python_dependencies(python: &Path) -> std::io::Result<()> {
     let result = Command::new(python)
         .args([
+            "-B",
             "-c",
             "import numpy, torch; print(numpy.__version__); print(torch.__version__)",
         ])
@@ -1806,9 +1807,11 @@ fn start_resolved(runtime: &RuntimePaths, config: &EngineConfig) -> std::io::Res
         .arg("--research-dir")
         .arg(&runtime.research_dir)
         .arg("--device")
-        .arg(&device)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg(&device);
+    if let Some(directory) = managed_model_directory() {
+        command.arg("--managed-model-dir").arg(directory);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1895,6 +1898,25 @@ fn start_resolved(runtime: &RuntimePaths, config: &EngineConfig) -> std::io::Res
         runtime.runtime_status.clone(),
         runtime.health.clone(),
     ))
+}
+
+fn managed_model_directory() -> Option<PathBuf> {
+    if let Some(directory) = std::env::var_os("REYN_MANAGED_MODEL_DIR") {
+        return Some(PathBuf::from(directory));
+    }
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(|root| PathBuf::from(root).join("Reyn Studio/Models"));
+    }
+    if cfg!(target_os = "macos") {
+        return std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home).join("Library/Application Support/Reyn Studio/Models")
+        });
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .map(|root| root.join("reyn-studio/models"))
 }
 
 fn request(

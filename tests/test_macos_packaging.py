@@ -66,8 +66,10 @@ from macos_packaging import (  # noqa: E402
     write_json,
 )
 from package_macos import (  # noqa: E402
+    EXPECTED_ACCESS_ENDPOINT,
     build_binary,
     package_input_fingerprint,
+    preview_access_contract,
     release_build_environment,
     release_input_fingerprint,
 )
@@ -113,7 +115,7 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertTrue(contract["python"]["bundled"])
         self.assertEqual(contract["python"]["architecture"], "arm64")
         self.assertEqual(contract["python"]["compute_unsupported_on"], ["x86_64"])
-        self.assertFalse(contract["checkpoints"]["bundled"])
+        self.assertTrue(contract["checkpoints"]["bundled"])
         self.assertFalse(
             contract["apple_distribution"]["developer_id_signing_performed"]
         )
@@ -127,7 +129,7 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertFalse(contract["documentation"]["network_required"])
         self.assertEqual(contract["documentation"]["entrypoint"], "docs/PRD.md")
         self.assertTrue(contract["model_trust"]["production_root_pinned"])
-        self.assertFalse(contract["model_trust"]["model_assets_bundled"])
+        self.assertTrue(contract["model_trust"]["model_assets_bundled"])
         self.assertEqual(contract["model_trust"]["failure_mode"], "fail-closed")
         self.assertEqual(
             contract["python"]["required_distributions"],
@@ -388,6 +390,10 @@ class MacOSPackagingTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(first["CARGO_INCREMENTAL"], "0")
+            self.assertEqual(first["REYN_ACCESS_REQUIRED"], "1")
+            self.assertEqual(
+                first["REYN_ACCESS_ENDPOINT"], EXPECTED_ACCESS_ENDPOINT
+            )
             self.assertNotIn("RUSTFLAGS", first)
             wrapper = Path(first["RUSTC_WORKSPACE_WRAPPER"])
             self.assertTrue(wrapper.is_file())
@@ -395,6 +401,22 @@ class MacOSPackagingTests(unittest.TestCase):
                 "export CARGO_MANIFEST_DIR=.",
                 wrapper.read_text(encoding="utf-8"),
             )
+
+    def test_preview_access_contract_rejects_ungated_binary(self):
+        with patch("package_macos.subprocess.run") as run:
+            run.return_value = SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "schema": "com.reyn.studio.preview-access/1",
+                        "required": False,
+                        "endpoint": None,
+                        "terms_version": "1.0",
+                        "privacy_version": "1.0",
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "access contract"):
+                preview_access_contract(Path("/tmp/reyn-studio"))
 
     def test_architecture_metadata_rejects_incomplete_universal_claim(self):
         manifest = {
@@ -435,7 +457,7 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertNotIn("developer-specific absolute path", blockers)
         self.assertNotIn("Python, NumPy, and PyTorch are not bundled", blockers)
         self.assertNotIn("production TUF root is intentionally unset", blockers)
-        self.assertIn("No authenticated .reynmodel/.sig/.tuf triplet", blockers)
+        self.assertNotIn("No authenticated .reynmodel/.sig/.tuf triplet", blockers)
         self.assertIn("Developer ID signing and Apple notarization", blockers)
         self.assertIn("document associations are intentionally not claimed", blockers)
 
@@ -584,20 +606,14 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertEqual(cyclonedx_inventory, expected)
         self.assertEqual(len(spdx_inventory), len(lock["distributions"]))
 
-    def test_research_lock_requires_the_full_security_runtime_closure(self):
+    def test_research_lock_requires_only_the_scientific_source_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             research_source = Path(directory)
             (research_source / "pyproject.toml").write_text(
                 '[project]\nrequires-python = ">=3.14"\n',
                 encoding="utf-8",
             )
-            packages = (
-                "cryptography",
-                "numpy",
-                "safetensors",
-                "securesystemslib",
-                "torch",
-            )
+            packages = ("numpy",)
             (research_source / "uv.lock").write_text(
                 "".join(
                     f'[[package]]\nname = "{name}"\nversion = "1.0.0"\n'
@@ -606,7 +622,7 @@ class MacOSPackagingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertIn(
-                "research uv.lock omits tuf",
+                "research uv.lock omits torch",
                 validate_research_dependency_lock(research_source),
             )
 
@@ -941,7 +957,7 @@ class MacOSPackagingTests(unittest.TestCase):
             runtime_python.parent.mkdir(parents=True)
             runtime_python.write_text("#!/bin/sh\n", encoding="utf-8")
             runtime_python.chmod(0o755)
-            runtime_destination = contents / "Frameworks/ReynPython"
+            runtime_destination = contents / "Resources/ReynPython"
             observed = {
                 "architecture": "arm64",
                 "Python": RUNTIME_DEPENDENCIES["Python"][0],
@@ -1092,6 +1108,9 @@ class MacOSPackagingTests(unittest.TestCase):
             executable.parent.mkdir(parents=True)
             executable.write_bytes(b"fixture-binary")
             executable.chmod(0o755)
+            interpreter_link = app / "Contents/Resources/ReynPython/bin/python3"
+            interpreter_link.parent.mkdir(parents=True)
+            interpreter_link.symlink_to("python3.14")
             (app / "Contents/Info.plist").write_bytes(b"fixture-plist")
 
             first = root / "first.zip"
@@ -1108,6 +1127,11 @@ class MacOSPackagingTests(unittest.TestCase):
                 )
                 mode = info.external_attr >> 16
                 self.assertTrue(mode & stat.S_IXUSR)
+                link = archive.getinfo(
+                    "Reyn Studio.app/Contents/Resources/ReynPython/bin/python3"
+                )
+                self.assertTrue(stat.S_ISLNK(link.external_attr >> 16))
+                self.assertEqual(archive.read(link), b"python3.14")
 
 
 if __name__ == "__main__":

@@ -491,7 +491,7 @@ fn factory_runtime_root_for(current_exe: &Path, platform: &str) -> Option<PathBu
     let macos = current_exe.parent()?;
     let contents = macos.parent()?;
     (macos.file_name()?.to_str()? == "MacOS" && contents.file_name()?.to_str()? == "Contents")
-        .then(|| contents.join("Frameworks/ReynPython"))
+        .then(|| contents.join("Resources/ReynPython"))
 }
 
 pub(crate) fn default_managed_runtime_root() -> Option<PathBuf> {
@@ -2235,7 +2235,7 @@ mod tests {
 
         fn factory_root(&self) -> PathBuf {
             self.root
-                .join("Reyn Studio.app/Contents/Frameworks/ReynPython")
+                .join("Reyn Studio.app/Contents/Resources/ReynPython")
         }
 
         fn create_runtime(

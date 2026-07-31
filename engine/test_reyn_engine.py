@@ -275,6 +275,7 @@ class ModelLibraryTests(unittest.TestCase):
         self.tuf_signers = bundle_test_support.tuf_signers()
         self.engine = Engine.__new__(Engine)
         self.engine.research_dir = str(self.root)
+        self.engine._managed_model_dir = self.root / "reyn_models"
         self.engine.torch = torch
         self.engine.device = torch.device("cpu")
         self.engine.cache = {}
@@ -597,6 +598,7 @@ class ModelContractTests(unittest.TestCase):
 
         engine = Engine.__new__(Engine)
         engine.research_dir = str(research_dir)
+        engine._managed_model_dir = research_dir / "reyn_models"
         engine.torch = torch
         engine.device = torch.device("cpu")
         engine.cache = {}
@@ -605,6 +607,7 @@ class ModelContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             engine.research_dir = directory
+            engine._managed_model_dir = Path(directory) / "reyn_models"
             path = str(Path(directory) / "physics.reynmodel")
             private_key, signature_entry = signing_context(Path(directory))
             write_model_bundle(
