@@ -58,6 +58,8 @@ from tuf.ngclient import Updater
 from tuf.ngclient.config import UpdaterConfig
 from tuf.ngclient.fetcher import FetcherInterface
 
+from pinned_model_trust import PINNED_TUF_ROOT_JSON
+
 BUNDLE_SCHEMA = "com.reyn.inference-model-bundle/1"
 BUNDLE_EXTENSION = ".reynmodel"
 MANIFEST_NAME = "manifest.json"
@@ -96,12 +98,6 @@ MAX_TUF_METADATA_FILES = 64
 MAX_TUF_REPOSITORY_BYTES = 16 * 1024**2
 TUF_MIN_ROOT_THRESHOLD = 2
 TUF_MIN_TARGETS_THRESHOLD = 2
-
-# A real production root must be generated in a human-controlled offline key
-# ceremony and reviewed before its public metadata bytes are pinned here. Keeping
-# this unset is deliberate: it makes every production load fail closed instead of
-# blessing test keys or pretending that production key custody exists.
-PINNED_TUF_ROOT_JSON: bytes | None = None
 
 _ARCHITECTURE_KEYS = frozenset(("id", "config"))
 _TOP_LEVEL_KEYS = frozenset(

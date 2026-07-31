@@ -1,0 +1,26 @@
+{
+  "bundle_sha256": "1282395279cbbe8dea50524bb5844938edb5df44e4f15c6a8b4cb1bf5fd0e022",
+  "evidence": [
+    {
+      "name": "h64_v3_tail_brinkman_combined_replication_summary.json",
+      "sha256": "6bbb6d227b018f31b3d9aa89d6372ff4a0c2b67c0e0242000ae7b3d660395413"
+    },
+    {
+      "name": "h64_v3_tail_brinkman_factorial_summary.json",
+      "sha256": "47e6a8a021fff5e5cf2865c2fbf7ed0c1ab0d600f1d255a767b486eb91ef4da9"
+    }
+  ],
+  "model": {
+    "id": "reyn-h64-tail-brinkman-seed0",
+    "version": "1.0.0-yc-preview"
+  },
+  "qualification_boundary": "Three-seed research replication passed; production scientific/runtime/distribution qualification remains incomplete.",
+  "schema": "com.reyn.yc-preview-model-release/1",
+  "signature_key_id": "reyn-yc-model-2026-01",
+  "source_checkpoint": {
+    "name": "obstacle_physics_h64_v3_tail_brinkman_factorial_combined_seed0_epoch40.pth",
+    "sha256": "422246ea4c9593ad3ffc87fa137d8ba32717aaf729eea225f7e6adf89de57f3b"
+  },
+  "tuf_root_sha256": "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1",
+  "weights_sha256": "4075376a87b91943056f6b98cd7a7660e41a996a4f9d0b896f39801bbd4d22a9"
+}

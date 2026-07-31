@@ -19,10 +19,12 @@ results, settings, and recovery data stay on the user's computer.
 - Windows 11 x64 portable packaging is implemented but remains labeled
   **preview pending clean-machine verification**.
 - Windows CUDA, an installer, and automatic updates are not available.
-- No model weights are included. No available 2D or 3D model has completed the
-  full release-qualification gate.
-- A run requires a compatible, verified `.reynmodel` bundle and its detached
-  signature.
+- The YC Windows package includes one authenticated H64 2D model whose
+  preregistered improvement replicated across training seeds 0, 1, and 2.
+  Its bundle, detached Ed25519 signature, TUF metadata, and evidence summaries
+  ship together.
+- The bundled model remains a research preview. It has not completed the full
+  production scientific, runtime, and distribution qualification gate.
 
 See [the Windows release guide](docs/WINDOWS_RELEASE.md) and
 [the macOS release guide](docs/MACOS_RELEASE.md) for exact support boundaries.
