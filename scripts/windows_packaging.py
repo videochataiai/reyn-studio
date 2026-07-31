@@ -304,6 +304,7 @@ def loader_probe(stage: Path) -> dict[str, object]:
     script = r"""
 import json
 import pathlib
+import shutil
 import sys
 import tempfile
 
@@ -330,7 +331,7 @@ with tempfile.TemporaryDirectory(prefix="reyn-loader-probe-") as temporary:
     else:
         raise RuntimeError("production loader accepted a malformed unsigned bundle")
 
-    runtime = Engine(str(research_dir), requested_device="cpu")
+    runtime = Engine(temporary, requested_device="cpu")
     card = runtime.checkpoint_card(candidate)
     imported = runtime.import_model(candidate)
     if card.get("status") != "invalid":
@@ -338,19 +339,29 @@ with tempfile.TemporaryDirectory(prefix="reyn-loader-probe-") as temporary:
     if imported.get("ok") is not False:
         raise RuntimeError(f"model import accepted malformed bundle: {imported!r}")
 
-runtime = Engine(str(research_dir), requested_device="cpu")
-models = runtime.list_model_cards()
-if len(models) != 1:
-    raise RuntimeError(f"expected exactly one bundled model, found {models!r}")
-preview = models[0]
-if preview.get("name") != "reyn-h64-tail-brinkman-seed0-v1.reynmodel":
-    raise RuntimeError(f"unexpected bundled model: {preview!r}")
-if preview.get("status") != "clean":
-    raise RuntimeError(f"bundled model did not validate cleanly: {preview!r}")
-if preview.get("authenticity_status") != "verified":
-    raise RuntimeError(f"bundled model authenticity was not verified: {preview!r}")
-if preview.get("dimension") != 2 or preview.get("max_steps") != 64:
-    raise RuntimeError(f"bundled model support envelope is wrong: {preview!r}")
+with tempfile.TemporaryDirectory(prefix="reyn-preview-model-probe-") as temporary:
+    probe_research = pathlib.Path(temporary)
+    model_name = "reyn-h64-tail-brinkman-seed0-v1.reynmodel"
+    shutil.copy2(research_dir / model_name, probe_research / model_name)
+    shutil.copy2(research_dir / f"{model_name}.sig", probe_research / f"{model_name}.sig")
+    shutil.copytree(
+        research_dir / f"{model_name}.tuf",
+        probe_research / f"{model_name}.tuf",
+    )
+    sys.path.insert(0, str(research_dir))
+    runtime = Engine(str(probe_research), requested_device="cpu")
+    models = runtime.list_model_cards()
+    if len(models) != 1:
+        raise RuntimeError(f"expected exactly one bundled model, found {models!r}")
+    preview = models[0]
+    if preview.get("name") != model_name:
+        raise RuntimeError(f"unexpected bundled model: {preview!r}")
+    if preview.get("status") != "clean":
+        raise RuntimeError(f"bundled model did not validate cleanly: {preview!r}")
+    if preview.get("authenticity_status") != "verified":
+        raise RuntimeError(f"bundled model authenticity was not verified: {preview!r}")
+    if preview.get("dimension") != 2 or preview.get("max_steps") != 64:
+        raise RuntimeError(f"bundled model support envelope is wrong: {preview!r}")
 
 print(json.dumps({
     "bundle_schema": model_bundle.BUNDLE_SCHEMA,
