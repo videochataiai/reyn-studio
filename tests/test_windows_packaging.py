@@ -482,6 +482,7 @@ class WindowsPackagingTests(unittest.TestCase):
             self.assertIn("model_bundle.load_model_bundle", command[3])
             self.assertIn("runtime.checkpoint_card", command[3])
             self.assertIn("runtime.import_model", command[3])
+            self.assertIn("os.chdir(original_cwd)", command[3])
 
     def test_authenticode_request_fails_closed_without_password(self):
         with tempfile.TemporaryDirectory() as directory:
