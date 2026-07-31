@@ -378,13 +378,17 @@ print(json.dumps({
     "production_tuf_root_pinned": model_bundle.PINNED_TUF_ROOT_JSON is not None,
 }, sort_keys=True))
 """
-    completed = subprocess.run(
-        [str(python), "-I", "-c", script, str(engine), str(research)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        completed = subprocess.run(
+            [str(python), "-I", "-c", script, str(engine), str(research)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or "").strip()
+        raise RuntimeError(f"staged model-loader probe failed: {details}") from error
     result = json.loads(completed.stdout.strip().splitlines()[-1])
     expected = {
         "bundle_schema": "com.reyn.inference-model-bundle/1",

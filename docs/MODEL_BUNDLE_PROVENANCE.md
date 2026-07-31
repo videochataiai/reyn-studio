@@ -12,9 +12,10 @@ checkout to verify a model.
   `0333b13bd117e6129d989aa41dd7e3057c11d116` does not contain the loader.
 
 The vendored source preserves the upstream fail-closed bundle, Safetensors,
-detached Ed25519, and TUF verification contract. The only portability change is
-the trusted-state lock: Unix uses `fcntl.flock`; Windows uses a bounded
-`msvcrt.locking` loop over the same lock file.
+detached Ed25519, and TUF verification contract. Portability changes are limited
+to trusted state: Unix uses `fcntl.flock`; Windows uses a bounded
+`msvcrt.locking` loop, and Windows stores TUF's current `root.json` pointer as an
+atomic regular-file copy because unprivileged processes cannot create symlinks.
 
 `engine/pinned_model_trust.py` embeds the public threshold-signed TUF root for
 the YC 0.1.1 preview model. The root expires on 2027-01-31 and is bound to the

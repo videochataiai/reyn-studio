@@ -464,6 +464,23 @@ class _OfflineMetadataFetcher(FetcherInterface):
         return iter((candidate.read_bytes(),))
 
 
+class _PortableOfflineUpdater(Updater):
+    """Use a regular root pointer on Windows, where symlinks need extra privilege."""
+
+    def _update_root_symlink(self):
+        if os.name != "nt":
+            return super()._update_root_symlink()
+        self._update_root_file()
+
+    def _update_root_file(self):
+        version = self._trusted_set.root.version
+        root_history = Path(self._dir) / "root_history" / f"{version}.root.json"
+        self._persist_file(
+            str(Path(self._dir) / "root.json"),
+            root_history.read_bytes(),
+        )
+
+
 def _tuf_repository_path(path: Path) -> Path:
     return path.with_name(path.name + TUF_REPOSITORY_SUFFIX)
 
@@ -1052,7 +1069,7 @@ def _prepare_tuf_authentication(
             pinned_root_sha256,
         )
         bootstrap = None if has_current else pinned_root
-        updater = Updater(
+        updater = _PortableOfflineUpdater(
             str(working_metadata),
             "https://offline.reyn.invalid/metadata/",
             fetcher=_OfflineMetadataFetcher(metadata_source),

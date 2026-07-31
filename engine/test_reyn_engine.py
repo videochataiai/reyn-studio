@@ -286,6 +286,27 @@ class ModelLibraryTests(unittest.TestCase):
         self.model_bundle.PINNED_TUF_ROOT_JSON = self.original_tuf_root
         self.directory.cleanup()
 
+    def test_windows_tuf_root_pointer_is_a_regular_file(self):
+        metadata = self.root / "portable-tuf"
+        history = metadata / "root_history"
+        history.mkdir(parents=True)
+        expected = b'{"signed":{"version":1}}'
+        (history / "1.root.json").write_bytes(expected)
+        updater = object.__new__(self.model_bundle._PortableOfflineUpdater)
+        updater._dir = str(metadata)
+        updater._trusted_set = type(
+            "TrustedSet",
+            (),
+            {"root": type("Root", (), {"version": 1})()},
+        )()
+
+        updater._update_root_file()
+
+        pointer = metadata / "root.json"
+        self.assertTrue(pointer.is_file())
+        self.assertFalse(pointer.is_symlink())
+        self.assertEqual(pointer.read_bytes(), expected)
+
     def checkpoint(
         self,
         path,
