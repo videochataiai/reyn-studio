@@ -307,6 +307,17 @@ class ModelLibraryTests(unittest.TestCase):
         self.assertFalse(pointer.is_symlink())
         self.assertEqual(pointer.read_bytes(), expected)
 
+    def test_windows_trusted_state_does_not_fsync_directories(self):
+        with patch.object(
+            self.model_bundle.os,
+            "open",
+            side_effect=AssertionError("Windows must not open directories for fsync"),
+        ):
+            self.model_bundle._fsync_directory(
+                self.root,
+                platform_name="nt",
+            )
+
     def checkpoint(
         self,
         path,

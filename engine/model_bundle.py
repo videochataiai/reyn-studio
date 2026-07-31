@@ -906,7 +906,9 @@ def _trusted_state_publish_hook():
     """Test seam immediately before the atomic current-pointer update."""
 
 
-def _fsync_directory(path: Path):
+def _fsync_directory(path: Path, *, platform_name: str | None = None):
+    if (os.name if platform_name is None else platform_name) == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
