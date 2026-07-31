@@ -525,8 +525,13 @@ def benchmark_cell_evidence(prediction, truth, initial):
 
 
 class Engine:
-    def __init__(self, research_dir, requested_device="auto"):
+    def __init__(self, research_dir, requested_device="auto", managed_model_dir=None):
         self.research_dir = str(Path(research_dir).expanduser().resolve())
+        self._managed_model_dir = (
+            Path(managed_model_dir).expanduser().resolve()
+            if managed_model_dir
+            else Path(self.research_dir) / "reyn_models"
+        )
         engine_dir = str(Path(__file__).resolve().parent)
         sys.path[:] = [
             engine_dir,
@@ -565,7 +570,7 @@ class Engine:
 
     @property
     def managed_model_dir(self):
-        return Path(self.research_dir) / "reyn_models"
+        return self._managed_model_dir
 
     @property
     def model_trust_state_dir(self):
@@ -576,7 +581,13 @@ class Engine:
         try:
             return path.relative_to(Path(self.research_dir).resolve()).as_posix()
         except ValueError:
-            return str(path)
+            try:
+                return (
+                    Path("reyn_models")
+                    / path.relative_to(self.managed_model_dir.resolve())
+                ).as_posix()
+            except ValueError:
+                return str(path)
 
     @staticmethod
     def _checkpoint_sha256(path):
@@ -1212,8 +1223,13 @@ class Engine:
         }
 
     def delete_model(self, model_id):
-        target = (Path(self.research_dir) / model_id).resolve()
         managed = self.managed_model_dir.resolve()
+        requested = Path(model_id)
+        target = (
+            managed / requested.name
+            if requested.parts[:1] == ("reyn_models",)
+            else Path(self.research_dir) / requested
+        ).resolve()
         if target.parent != managed or target.suffix.lower() != ".reynmodel":
             raise ValueError("only model bundles imported into Reyn Studio can be deleted")
         if not target.is_file():
@@ -1860,14 +1876,14 @@ class Engine:
         return ai, meta
 
 
-def serve(research_dir, device="auto"):
+def serve(research_dir, device="auto", managed_model_dir=None):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     port = srv.getsockname()[1]
     try:
-        engine = Engine(research_dir, device)
+        engine = Engine(research_dir, device, managed_model_dir)
     except Exception as exc:
         print("READY " + json.dumps({"error": str(exc)}), flush=True)
         return
@@ -1926,6 +1942,7 @@ def serve(research_dir, device="auto"):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--research-dir", required=True)
+    p.add_argument("--managed-model-dir")
     p.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     args = p.parse_args()
-    serve(args.research_dir, args.device)
+    serve(args.research_dir, args.device, args.managed_model_dir)

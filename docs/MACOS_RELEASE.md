@@ -121,22 +121,23 @@ The strict command is expected to exit `2` while the blockers below remain.
   executable ancestors for `PRD.md`, without embedding `CARGO_MANIFEST_DIR` or a developer path.
 - The bundle includes the sidecar's complete local Python import closure under
   `Contents/Resources/research`: model definitions, datasets, flow contracts/quantities, and the 2D
-  and 3D solvers they import, including `model_bundle.py` and `physics_losses.py`. Tests,
-  training/evaluation programs, candidate datasets, and checkpoints are intentionally excluded.
-- The package requires `Contents/Frameworks/ReynPython`, a relocatable **arm64-only** factory
+  and 3D solvers they import, including `model_bundle.py` and `physics_losses.py`. Tests and
+  training/evaluation programs are intentionally excluded.
+- The package requires `Contents/Resources/ReynPython`, a relocatable **arm64-only** factory
   runtime. Its canonical manifest inventories every payload file and binds Python `3.14.6`,
   cryptography `49.0.0`, safetensors `0.8.0`, python-tuf `7.0.0`,
   securesystemslib `1.4.0`, NumPy `2.5.1`, and PyTorch `2.13.0` to the exact app research closure.
   Missing, non-arm64, externally prefixed, or version-drifted runtimes fail packaging.
-- Model assets are not bundled. Production loading accepts only an adjacent
+- The YC package bundles exactly one default 2D model,
+  `reyn-h64-tail-brinkman-seed0-v1.reynmodel`. Production loading accepts only an adjacent
   `<name>.reynmodel`, `<name>.reynmodel.sig`, and `<name>.reynmodel.tuf/metadata/` set. Metadata is
   offline-only and contains versioned root, targets, delegated `models`, and snapshot roles plus
   `timestamp.json`; bundle and signature target lengths/hashes and model/release identities must
   agree. Pickle-backed `.pth`, `.pt`, and `.ckpt` files are forbidden from the app.
 - `engine/pinned_model_trust.py` carries the public, threshold-signed YC 0.1.1 preview TUF root.
   The packaged `security/MODEL_TRUST_CONTRACT.json` binds its reviewed SHA-256. Private signing
-  keys are not bundled. This allows the exact authenticated preview model to be imported on macOS,
-  although the model asset itself is currently bundled only in the Windows YC package.
+  keys are not bundled. The Mac and Windows YC packages carry the same authenticated H64 model,
+  release manifest, and three-seed replication summaries.
 - `security/SBOM.spdx.json`, the runtime CycloneDX SBOM, package/runtime notices, upstream license
   files, `LICENSE`, and `NOTICE` record the redistributed dependency inventory.
 - Bundle metadata declares Reyn project/template UTIs for `.reyn`, the currently implemented
@@ -157,7 +158,7 @@ resources—contains the current workspace, the current user home, `/Users/...`,
 developer-home paths, any `file://.../PRD.md`, Cargo/Rustup stores, common CI build roots,
 mounted-volume roots, or build-temporary paths. Required runtime paths such as
 `/System/Library/...` and `/usr/lib/...` are not classified as developer paths. These checks
-establish path portability; they do not establish a standalone inference runtime.
+establish path portability alongside the separately validated embedded inference runtime.
 
 Validation also fails on private-key markers, key/container files, test or ephemeral key names,
 unversioned/test TUF roots, symlinks, pickle-backed model files, orphan signatures/repositories,

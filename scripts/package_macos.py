@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import plistlib
 import shlex
@@ -23,6 +24,7 @@ from macos_packaging import (
     TARGET_ARCHITECTURES,
     copy_documentation_resources,
     copy_engine_resources,
+    copy_preview_model_resources,
     copy_research_resources,
     copy_security_resources,
     deterministic_zip,
@@ -50,6 +52,8 @@ from macos_packaging import (
     write_sha256sums,
     write_json,
 )
+
+EXPECTED_ACCESS_ENDPOINT = "https://reynflow.com/api/yc-access/v1/session"
 
 
 def release_input_fingerprint(root: Path) -> str:
@@ -94,6 +98,7 @@ def package_input_fingerprint(root: Path, research_source: Path) -> str:
             *sorted((root / "src").rglob("*")),
             *sorted((root / "assets").rglob("*")),
             *(root / "engine" / name for name in ENGINE_RESOURCES),
+            *sorted((root / "packaging/models/yc-preview-h64").rglob("*")),
             *sorted((root / "packaging/macos").glob("*")),
             root / "scripts/macos_packaging.py",
             root / "scripts/package_macos.py",
@@ -179,7 +184,35 @@ def release_build_environment(config, target_dir: Path) -> dict[str, str]:
     env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flags)
     env["RUSTC_WORKSPACE_WRAPPER"] = str(wrapper)
     env["MACOSX_DEPLOYMENT_TARGET"] = config.minimum_system_version
+    env["REYN_ACCESS_REQUIRED"] = "1"
+    env["REYN_ACCESS_ENDPOINT"] = EXPECTED_ACCESS_ENDPOINT
     return env
+
+
+def preview_access_contract(binary: Path) -> dict[str, object]:
+    completed = subprocess.run(
+        [str(binary), "--print-access-contract"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    try:
+        contract = json.loads(completed.stdout.strip())
+    except json.JSONDecodeError as error:
+        raise ValueError("macOS binary returned a malformed access contract") from error
+    expected = {
+        "schema": "com.reyn.studio.preview-access/1",
+        "required": True,
+        "endpoint": EXPECTED_ACCESS_ENDPOINT,
+        "terms_version": "1.0",
+        "privacy_version": "1.0",
+    }
+    if contract != expected:
+        raise ValueError(
+            f"macOS binary access contract is {contract!r}, expected {expected!r}"
+        )
+    return contract
 
 
 def build_binary(
@@ -289,10 +322,8 @@ def package(args: argparse.Namespace) -> int:
         contents = bundle / "Contents"
         macos = contents / "MacOS"
         resources = contents / "Resources"
-        frameworks = contents / "Frameworks"
         macos.mkdir(parents=True)
         resources.mkdir(parents=True)
-        frameworks.mkdir(parents=True)
 
         binary, architecture_slices, source_fingerprint = build_binary(
             config, target, target_dir, stage_root
@@ -305,6 +336,7 @@ def package(args: argparse.Namespace) -> int:
             TARGET_ARCHITECTURES[target],
             context="staged app executable",
         )
+        access_contract = preview_access_contract(bundled_binary)
 
         with (contents / "Info.plist").open("wb") as stream:
             plistlib.dump(
@@ -319,11 +351,12 @@ def package(args: argparse.Namespace) -> int:
         copy_documentation_resources(root, resources / "docs")
         copy_engine_resources(root, resources / "engine")
         copy_research_resources(research_source, resources / "research")
+        copy_preview_model_resources(root, resources)
         copy_security_resources(root, resources / "security")
         write_json(resources / "runtime-requirements.json", runtime_requirements())
         runtime_manifest = stage_factory_runtime(
             args.runtime_dir.resolve(),
-            frameworks / "ReynPython",
+            resources / "ReynPython",
             resources=resources,
             source_revision=str(pins["research_revision"]),
             build_epoch=args.source_date_epoch,
@@ -356,9 +389,17 @@ def package(args: argparse.Namespace) -> int:
             "architecture_slices": architecture_slices,
             "factory_runtime_id": runtime_manifest["runtime_id"],
             "factory_runtime_manifest_sha256": sha256_file(
-                frameworks / "ReynPython/runtime-manifest.cjson"
+                resources / "ReynPython/runtime-manifest.cjson"
             ),
+            "bundled_models": [
+                json.loads(
+                    (resources / "docs/models/model-release-manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            ],
             "resource_set": resource_metadata(resources),
+            "preview_access": access_contract,
             "apple_credentials_used": False,
             "developer_id_signed": False,
             "notarized": False,

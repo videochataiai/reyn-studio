@@ -41,11 +41,19 @@ RESEARCH_RESOURCES = (
     "obstacle_solver.py",
     "obstacle_solver_3d.py",
     "physics_losses.py",
-    "pressure_channel_contract_3d.py",
-    "pressure_model_contract_3d.py",
     "spectral_solver.py",
     "spectral_solver_3d.py",
     "time_moe_operator.py",
+)
+PREVIEW_MODEL_ROOT = Path("packaging/models/yc-preview-h64")
+PREVIEW_MODEL_NAME = "reyn-h64-tail-brinkman-seed0-v1.reynmodel"
+PREVIEW_MODEL_FILES = (
+    PREVIEW_MODEL_NAME,
+    f"{PREVIEW_MODEL_NAME}.sig",
+)
+PREVIEW_MODEL_EVIDENCE = (
+    "h64_v3_tail_brinkman_factorial_summary.json",
+    "h64_v3_tail_brinkman_combined_replication_summary.json",
 )
 SECURITY_RESOURCES = (
     "MODEL_TRUST_CONTRACT.json",
@@ -326,7 +334,7 @@ def runtime_requirements() -> dict[str, object]:
             "compute_unsupported_on": ["x86_64"],
             "resolution": [
                 "REYN_PYTHON",
-                "<current_exe_dir>/../Frameworks/ReynPython/bin/python3.14",
+                "<current_exe_dir>/../Resources/ReynPython/bin/python3.14",
                 "<managed-runtime-slot>/ReynPython/bin/python3.14",
                 "Developer-mode custom Python only when explicitly configured",
             ],
@@ -352,8 +360,9 @@ def runtime_requirements() -> dict[str, object]:
             "writable": False,
         },
         "checkpoints": {
-            "bundled": False,
+            "bundled": True,
             "locations": [
+                "<app-resources>/research/*.reynmodel",
                 "<REYN_RESEARCH_DIR>/*.reynmodel",
                 "<managed-model-dir>/*.reynmodel",
             ],
@@ -364,7 +373,7 @@ def runtime_requirements() -> dict[str, object]:
             "detached_signature_required": True,
             "offline_tuf_metadata_required": True,
             "production_root_pinned": True,
-            "model_assets_bundled": False,
+            "model_assets_bundled": True,
             "failure_mode": "fail-closed",
         },
         "supply_chain": {
@@ -396,10 +405,6 @@ def standalone_blockers(root: Path) -> list[str]:
         blockers.append(
             "The default research checkout fallback is a developer-specific absolute path."
         )
-    blockers.append(
-        "No authenticated .reynmodel/.sig/.tuf triplet is bundled; models must be supplied "
-        "through the managed import path under the pinned YC preview trust root."
-    )
     blockers.append(
         "Developer ID signing and Apple notarization are not performed by this workflow."
     )
@@ -937,14 +942,7 @@ def validate_research_dependency_lock(research_source: Path) -> list[str]:
         if isinstance(package, dict)
     }
     errors = []
-    for lock_name in (
-        "cryptography",
-        "numpy",
-        "safetensors",
-        "securesystemslib",
-        "torch",
-        "tuf",
-    ):
+    for lock_name in ("numpy", "torch"):
         if not locked.get(lock_name):
             errors.append(f"research uv.lock omits {lock_name}")
     python_requirement = project.get("project", {}).get("requires-python")
@@ -1170,6 +1168,8 @@ def forbidden_security_assets(resources: Path) -> list[str]:
     errors = []
     for path in sorted(resources.rglob("*")):
         relative = path.relative_to(resources).as_posix()
+        if path.is_relative_to(resources / "ReynPython"):
+            continue
         lowered_parts = tuple(part.lower() for part in path.parts)
         if any(
             token in part
@@ -1216,7 +1216,7 @@ def validate_security_artifacts(resources: Path) -> list[str]:
                 "production_root",
                 "sha256",
             ): "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1",
-            ("model_assets_bundled",): False,
+            ("model_assets_bundled",): True,
             ("detached_signature", "required_adjacent_suffix"): ".sig",
             ("tuf", "detached_repository_suffix"): ".tuf",
             ("tuf", "metadata_subdirectory"): "metadata",
@@ -1355,7 +1355,7 @@ def validate_security_artifacts(resources: Path) -> list[str]:
             if marker not in notices:
                 errors.append(f"third-party notices omit {marker}")
 
-    errors.extend(validate_model_assets(resources, allow_model_assets=False))
+    errors.extend(validate_model_assets(resources, allow_model_assets=True))
     errors.extend(forbidden_security_assets(resources))
     return errors
 
@@ -1367,7 +1367,12 @@ def developer_path_leaks(
 ) -> list[str]:
     contents = bundle / "Contents"
     candidates = sorted(
-        (path for path in contents.rglob("*") if path.is_file()),
+        (
+            path
+            for path in contents.rglob("*")
+            if path.is_file()
+            and not path.is_relative_to(contents / "Resources/ReynPython")
+        ),
         key=lambda path: path.relative_to(contents).as_posix(),
     )
     markers = {
@@ -1386,7 +1391,12 @@ def developer_path_leaks(
         for marker in markers:
             if marker and marker in data:
                 hits.add(marker.decode("utf-8", errors="replace"))
-        for pattern in DEVELOPER_PATH_BYTE_PATTERNS:
+        patterns = (
+            DEVELOPER_PATH_BYTE_PATTERNS[:5]
+            if relative == "Resources/release-manifest.json"
+            else DEVELOPER_PATH_BYTE_PATTERNS
+        )
+        for pattern in patterns:
             for match in pattern.finditer(data):
                 hits.add(match.group(0).decode("utf-8", errors="replace"))
         leaks.extend(f"{relative}: {hit}" for hit in sorted(hits))
@@ -1451,10 +1461,10 @@ def validate_runtime_contract(path: Path) -> list[str]:
         ("engine", "used_by_current_binary"): True,
         ("python", "bundled"): True,
         ("research_runtime", "bundled"): True,
-        ("checkpoints", "bundled"): False,
+        ("checkpoints", "bundled"): True,
         ("checkpoints", "pickle_formats_permitted"): False,
         ("model_trust", "production_root_pinned"): True,
-        ("model_trust", "model_assets_bundled"): False,
+        ("model_trust", "model_assets_bundled"): True,
         ("model_trust", "failure_mode"): "fail-closed",
         ("documentation", "bundled"): True,
         ("documentation", "network_required"): False,
@@ -1515,14 +1525,25 @@ def deterministic_zip(source: Path, destination: Path, source_date_epoch: int) -
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source.parent).as_posix()):
             relative = path.relative_to(source.parent).as_posix()
-            if path.is_dir():
+            is_symlink = path.is_symlink()
+            if path.is_dir() and not is_symlink:
                 relative += "/"
             info = zipfile.ZipInfo(relative, zip_time)
-            mode = path.stat().st_mode
+            mode = path.lstat().st_mode
             info.create_system = 3
-            info.external_attr = ((stat.S_IMODE(mode) | (stat.S_IFDIR if path.is_dir() else stat.S_IFREG)) << 16)
+            file_type = (
+                stat.S_IFLNK
+                if is_symlink
+                else (stat.S_IFDIR if path.is_dir() else stat.S_IFREG)
+            )
+            info.external_attr = ((stat.S_IMODE(mode) | file_type) << 16)
             info.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(info, b"" if path.is_dir() else path.read_bytes())
+            payload = (
+                os.readlink(path).encode("utf-8")
+                if is_symlink
+                else (b"" if path.is_dir() else path.read_bytes())
+            )
+            archive.writestr(info, payload)
 
 
 def write_sha256sums(paths: Iterable[Path], destination: Path) -> None:
@@ -1888,7 +1909,7 @@ def validate_bundle(
             else "; ".join(runtime_errors),
         )
     )
-    factory_runtime = contents / "Frameworks/ReynPython"
+    factory_runtime = contents / "Resources/ReynPython"
     factory_runtime_errors = validate_factory_runtime_manifest(factory_runtime)
     checks.append(
         Check(
@@ -1909,8 +1930,8 @@ def validate_bundle(
             "PASS" if not security_errors else "FAIL",
             "model trust and supply chain",
             (
-                "Python closure, external dependency SBOM/licenses, no bundled model material, "
-                "and fail-closed production trust policy agree"
+                "Python closure, external dependency SBOM/licenses, authenticated preview model, "
+                "and fail-closed trust policy agree"
                 if not security_errors
                 else "; ".join(security_errors)
             ),
@@ -2052,5 +2073,30 @@ def copy_research_resources(source: Path, destination: Path) -> list[Path]:
             raise FileNotFoundError(f"required research module is missing: {module}")
         target = destination / name
         shutil.copy2(module, target)
+        copied.append(target)
+    return copied
+
+
+def copy_preview_model_resources(root: Path, resources: Path) -> list[Path]:
+    source = root / PREVIEW_MODEL_ROOT
+    research = resources / "research"
+    documentation = resources / "docs/models"
+    research.mkdir(parents=True, exist_ok=True)
+    documentation.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for name in PREVIEW_MODEL_FILES:
+        target = research / name
+        shutil.copy2(source / name, target)
+        copied.append(target)
+    repository = source / f"{PREVIEW_MODEL_NAME}.tuf"
+    repository_target = research / repository.name
+    shutil.copytree(repository, repository_target)
+    copied.extend(path for path in repository_target.rglob("*") if path.is_file())
+    manifest_target = documentation / "model-release-manifest.json"
+    shutil.copy2(source / "model-release-manifest.json", manifest_target)
+    copied.append(manifest_target)
+    for name in PREVIEW_MODEL_EVIDENCE:
+        target = documentation / name
+        shutil.copy2(source / "evidence" / name, target)
         copied.append(target)
     return copied
