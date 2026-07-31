@@ -27,6 +27,8 @@ __pycache__/
 *.safetensors
 *.reynmodel
 *.reynmodel.sig
+!packaging/models/yc-preview-h64/*.reynmodel
+!packaging/models/yc-preview-h64/*.reynmodel.sig
 *.app
 *.zip
 *.profraw
