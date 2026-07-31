@@ -916,6 +916,13 @@ def _fsync_directory(path: Path, *, platform_name: str | None = None):
         os.close(descriptor)
 
 
+def _fsync_regular_file(path: Path, *, platform_name: str | None = None):
+    platform_name = os.name if platform_name is None else platform_name
+    mode = "r+b" if platform_name == "nt" else "rb"
+    with path.open(mode) as stream:
+        os.fsync(stream.fileno())
+
+
 def _atomic_write(path: Path, raw: bytes):
     temporary_path = None
     try:
@@ -944,8 +951,7 @@ def _publish_trusted_state(state_root: Path, working_root: Path, state: dict):
     os.chmod(working_root / "state.json", 0o600)
     for candidate in sorted(working_root.rglob("*")):
         if candidate.is_file():
-            with candidate.open("rb") as stream:
-                os.fsync(stream.fileno())
+            _fsync_regular_file(candidate)
     _fsync_directory(working_root / "metadata")
     _fsync_directory(working_root)
 

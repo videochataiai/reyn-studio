@@ -17,7 +17,8 @@ to trusted state: Unix uses `fcntl.flock`; Windows uses a bounded
 `msvcrt.locking` loop, and Windows stores TUF's current `root.json` pointer as an
 atomic regular-file copy because unprivileged processes cannot create symlinks.
 Windows also skips directory `fsync`, which its file-descriptor API does not
-support; individual files are still flushed before atomic replacement.
+support; individual files are flushed through writable handles before atomic
+replacement because Windows rejects `fsync` on read-only descriptors.
 
 `engine/pinned_model_trust.py` embeds the public threshold-signed TUF root for
 the YC 0.1.1 preview model. The root expires on 2027-01-31 and is bound to the

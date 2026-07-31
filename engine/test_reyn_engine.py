@@ -318,6 +318,18 @@ class ModelLibraryTests(unittest.TestCase):
                 platform_name="nt",
             )
 
+    def test_windows_trusted_state_fsyncs_files_with_a_writable_handle(self):
+        candidate = self.root / "trusted-metadata.json"
+        expected = b'{"version":1}'
+        candidate.write_bytes(expected)
+
+        self.model_bundle._fsync_regular_file(
+            candidate,
+            platform_name="nt",
+        )
+
+        self.assertEqual(candidate.read_bytes(), expected)
+
     def checkpoint(
         self,
         path,
