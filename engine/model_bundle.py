@@ -58,6 +58,8 @@ from tuf.ngclient import Updater
 from tuf.ngclient.config import UpdaterConfig
 from tuf.ngclient.fetcher import FetcherInterface
 
+from pinned_model_trust import PINNED_TUF_ROOT_JSON
+
 BUNDLE_SCHEMA = "com.reyn.inference-model-bundle/1"
 BUNDLE_EXTENSION = ".reynmodel"
 MANIFEST_NAME = "manifest.json"
@@ -96,12 +98,6 @@ MAX_TUF_METADATA_FILES = 64
 MAX_TUF_REPOSITORY_BYTES = 16 * 1024**2
 TUF_MIN_ROOT_THRESHOLD = 2
 TUF_MIN_TARGETS_THRESHOLD = 2
-
-# A real production root must be generated in a human-controlled offline key
-# ceremony and reviewed before its public metadata bytes are pinned here. Keeping
-# this unset is deliberate: it makes every production load fail closed instead of
-# blessing test keys or pretending that production key custody exists.
-PINNED_TUF_ROOT_JSON: bytes | None = None
 
 _ARCHITECTURE_KEYS = frozenset(("id", "config"))
 _TOP_LEVEL_KEYS = frozenset(
@@ -466,6 +462,23 @@ class _OfflineMetadataFetcher(FetcherInterface):
                 f"offline metadata {name} has invalid size {size}"
             )
         return iter((candidate.read_bytes(),))
+
+
+class _PortableOfflineUpdater(Updater):
+    """Use a regular root pointer on Windows, where symlinks need extra privilege."""
+
+    def _update_root_symlink(self):
+        if os.name != "nt":
+            return super()._update_root_symlink()
+        self._update_root_file()
+
+    def _update_root_file(self):
+        version = self._trusted_set.root.version
+        root_history = Path(self._dir) / "root_history" / f"{version}.root.json"
+        self._persist_file(
+            str(Path(self._dir) / "root.json"),
+            root_history.read_bytes(),
+        )
 
 
 def _tuf_repository_path(path: Path) -> Path:
@@ -893,12 +906,21 @@ def _trusted_state_publish_hook():
     """Test seam immediately before the atomic current-pointer update."""
 
 
-def _fsync_directory(path: Path):
+def _fsync_directory(path: Path, *, platform_name: str | None = None):
+    if (os.name if platform_name is None else platform_name) == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_regular_file(path: Path, *, platform_name: str | None = None):
+    platform_name = os.name if platform_name is None else platform_name
+    mode = "r+b" if platform_name == "nt" else "rb"
+    with path.open(mode) as stream:
+        os.fsync(stream.fileno())
 
 
 def _atomic_write(path: Path, raw: bytes):
@@ -929,8 +951,7 @@ def _publish_trusted_state(state_root: Path, working_root: Path, state: dict):
     os.chmod(working_root / "state.json", 0o600)
     for candidate in sorted(working_root.rglob("*")):
         if candidate.is_file():
-            with candidate.open("rb") as stream:
-                os.fsync(stream.fileno())
+            _fsync_regular_file(candidate)
     _fsync_directory(working_root / "metadata")
     _fsync_directory(working_root)
 
@@ -1056,7 +1077,7 @@ def _prepare_tuf_authentication(
             pinned_root_sha256,
         )
         bootstrap = None if has_current else pinned_root
-        updater = Updater(
+        updater = _PortableOfflineUpdater(
             str(working_metadata),
             "https://offline.reyn.invalid/metadata/",
             fetcher=_OfflineMetadataFetcher(metadata_source),

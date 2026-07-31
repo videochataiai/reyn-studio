@@ -27,7 +27,7 @@ const DEVELOPMENT_UNSIGNED_FIXTURE_MARKER: &str = ".development-unsigned-model-f
 pub const MODEL_BUNDLE_EXTENSION: &str = "reynmodel";
 pub const MODEL_SIGNATURE_SUFFIX: &str = ".sig";
 pub const DEFAULT_3D_MODEL_ID: &str = "flow3d_obs_v1.reynmodel";
-pub const DEFAULT_2D_MODEL_ID: &str = "obstacle_v2_shapes.reynmodel";
+pub const DEFAULT_2D_MODEL_ID: &str = "reyn-h64-tail-brinkman-seed0-v1.reynmodel";
 pub const TRUSTED_MODEL_CONVERSION_GUIDANCE: &str =
     "Production inference requires a verified .reynmodel bundle and its adjacent \
      .reynmodel.sig publisher signature. Legacy .pth files are never opened; convert a \
@@ -37,6 +37,7 @@ const REQUIRED_ENGINE_RESOURCES: &[&str] = &[
     "model_bundle.py",
     "n5_inspector.py",
     "n5_overlap.py",
+    "pinned_model_trust.py",
     "reyn_engine.py",
 ];
 const REQUIRED_RESEARCH_MODULES: &[&str] = &[

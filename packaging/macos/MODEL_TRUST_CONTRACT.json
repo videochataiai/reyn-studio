@@ -15,8 +15,9 @@
   },
   "model_assets_bundled": false,
   "production_root": {
-    "pinned": false,
-    "status": "intentionally-unset"
+    "pinned": true,
+    "sha256": "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1",
+    "status": "yc-0.1.1-preview"
   },
   "schema": "com.reyn.studio.model-trust-contract.v1",
   "tuf": {

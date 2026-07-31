@@ -17,6 +17,7 @@ ENGINE_RESOURCES = (
     "model_bundle.py",
     "n5_inspector.py",
     "n5_overlap.py",
+    "pinned_model_trust.py",
     "reyn_engine.py",
 )
 RESEARCH_RESOURCES = (
@@ -35,6 +36,16 @@ RESEARCH_RESOURCES = (
 DOCUMENTATION_RESOURCES = (
     ("PRD.md", "PRD.md"),
     ("docs/MODEL_BUNDLE_PROVENANCE.md", "MODEL_BUNDLE_PROVENANCE.md"),
+)
+PREVIEW_MODEL_ROOT = Path("packaging/models/yc-preview-h64")
+PREVIEW_MODEL_NAME = "reyn-h64-tail-brinkman-seed0-v1.reynmodel"
+PREVIEW_MODEL_FILES = (
+    PREVIEW_MODEL_NAME,
+    f"{PREVIEW_MODEL_NAME}.sig",
+)
+PREVIEW_MODEL_EVIDENCE = (
+    "h64_v3_tail_brinkman_factorial_summary.json",
+    "h64_v3_tail_brinkman_combined_replication_summary.json",
 )
 WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
@@ -182,6 +193,28 @@ def copy_resources(root: Path, research_source: Path, stage: Path) -> None:
         safe_copy_file(research_source / name, research_source, destination)
     for source, destination in DOCUMENTATION_RESOURCES:
         safe_copy_file(root / source, root, resources / "docs" / destination)
+    model_source = root / PREVIEW_MODEL_ROOT
+    for name in PREVIEW_MODEL_FILES:
+        safe_copy_file(
+            model_source / name,
+            root,
+            resources / "research" / name,
+        )
+    safe_copy_tree(
+        model_source / f"{PREVIEW_MODEL_NAME}.tuf",
+        resources / "research" / f"{PREVIEW_MODEL_NAME}.tuf",
+    )
+    safe_copy_file(
+        model_source / "model-release-manifest.json",
+        root,
+        resources / "docs/models/model-release-manifest.json",
+    )
+    for name in PREVIEW_MODEL_EVIDENCE:
+        safe_copy_file(
+            model_source / "evidence" / name,
+            root,
+            resources / "docs/models" / name,
+        )
 
 
 def inventory(
@@ -270,7 +303,9 @@ def loader_probe(stage: Path) -> dict[str, object]:
     research = stage / "resources/research"
     script = r"""
 import json
+import os
 import pathlib
+import shutil
 import sys
 import tempfile
 
@@ -281,8 +316,8 @@ from reyn_engine import Engine
 
 if pathlib.Path(model_bundle.__file__).resolve().parent != engine_dir.resolve():
     raise RuntimeError("model_bundle resolved outside the staged engine directory")
-if model_bundle.PINNED_TUF_ROOT_JSON is not None:
-    raise RuntimeError("packaging probe expected the reviewed production TUF root to remain unset")
+if model_bundle.PINNED_TUF_ROOT_JSON is None:
+    raise RuntimeError("packaging probe expected the YC preview TUF root to be pinned")
 
 with tempfile.TemporaryDirectory(prefix="reyn-loader-probe-") as temporary:
     candidate = pathlib.Path(temporary) / "malformed.reynmodel"
@@ -297,16 +332,54 @@ with tempfile.TemporaryDirectory(prefix="reyn-loader-probe-") as temporary:
     else:
         raise RuntimeError("production loader accepted a malformed unsigned bundle")
 
-    runtime = Engine(str(research_dir), requested_device="cpu")
-    card = runtime.checkpoint_card(candidate)
-    imported = runtime.import_model(candidate)
-    if card.get("status") != "invalid":
-        raise RuntimeError(f"model card accepted malformed bundle: {card!r}")
-    if imported.get("ok") is not False:
-        raise RuntimeError(f"model import accepted malformed bundle: {imported!r}")
+    original_cwd = os.getcwd()
+    try:
+        runtime = Engine(temporary, requested_device="cpu")
+        card = runtime.checkpoint_card(candidate)
+        imported = runtime.import_model(candidate)
+        if card.get("status") != "invalid":
+            raise RuntimeError(f"model card accepted malformed bundle: {card!r}")
+        if imported.get("ok") is not False:
+            raise RuntimeError(f"model import accepted malformed bundle: {imported!r}")
+    finally:
+        os.chdir(original_cwd)
+
+with tempfile.TemporaryDirectory(prefix="reyn-preview-model-probe-") as temporary:
+    probe_research = pathlib.Path(temporary)
+    model_name = "reyn-h64-tail-brinkman-seed0-v1.reynmodel"
+    shutil.copy2(research_dir / model_name, probe_research / model_name)
+    shutil.copy2(research_dir / f"{model_name}.sig", probe_research / f"{model_name}.sig")
+    shutil.copytree(
+        research_dir / f"{model_name}.tuf",
+        probe_research / f"{model_name}.tuf",
+    )
+    sys.path.insert(0, str(research_dir))
+    original_cwd = os.getcwd()
+    try:
+        runtime = Engine(str(probe_research), requested_device="cpu")
+        models = runtime.list_model_cards()
+        if len(models) != 1:
+            raise RuntimeError(f"expected exactly one bundled model, found {models!r}")
+        preview = models[0]
+        if preview.get("name") != model_name:
+            raise RuntimeError(f"unexpected bundled model: {preview!r}")
+        if preview.get("status") != "clean":
+            raise RuntimeError(f"bundled model did not validate cleanly: {preview!r}")
+        if preview.get("authenticity_status") != "verified":
+            raise RuntimeError(f"bundled model authenticity was not verified: {preview!r}")
+        if preview.get("dimension") != 2 or preview.get("max_steps") != 64:
+            raise RuntimeError(f"bundled model support envelope is wrong: {preview!r}")
+    finally:
+        os.chdir(original_cwd)
 
 print(json.dumps({
     "bundle_schema": model_bundle.BUNDLE_SCHEMA,
+    "bundled_model_authenticity": preview["authenticity_status"],
+    "bundled_model_dimension": preview["dimension"],
+    "bundled_model_id": preview["id"],
+    "bundled_model_max_steps": preview["max_steps"],
+    "bundled_model_sha256": preview["checkpoint_sha256"],
+    "bundled_model_status": preview["status"],
     "loader_error": loader_error,
     "model_card_status": card["status"],
     "import_ok": imported["ok"],
@@ -314,20 +387,30 @@ print(json.dumps({
     "production_tuf_root_pinned": model_bundle.PINNED_TUF_ROOT_JSON is not None,
 }, sort_keys=True))
 """
-    completed = subprocess.run(
-        [str(python), "-I", "-c", script, str(engine), str(research)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        completed = subprocess.run(
+            [str(python), "-I", "-c", script, str(engine), str(research)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or "").strip()
+        raise RuntimeError(f"staged model-loader probe failed: {details}") from error
     result = json.loads(completed.stdout.strip().splitlines()[-1])
     expected = {
         "bundle_schema": "com.reyn.inference-model-bundle/1",
+        "bundled_model_authenticity": "verified",
+        "bundled_model_dimension": 2,
+        "bundled_model_id": "reyn-h64-tail-brinkman-seed0-v1.reynmodel",
+        "bundled_model_max_steps": 64,
+        "bundled_model_sha256": "1282395279cbbe8dea50524bb5844938edb5df44e4f15c6a8b4cb1bf5fd0e022",
+        "bundled_model_status": "clean",
         "import_ok": False,
         "loader_origin": "engine",
         "model_card_status": "invalid",
-        "production_tuf_root_pinned": False,
+        "production_tuf_root_pinned": True,
     }
     for key, value in expected.items():
         if result.get(key) != value:
@@ -774,10 +857,16 @@ def validate_stage(
         errors.append("release manifest must record the exact YC preview access contract")
     expected_loader_probe = {
         "bundle_schema": "com.reyn.inference-model-bundle/1",
+        "bundled_model_authenticity": "verified",
+        "bundled_model_dimension": 2,
+        "bundled_model_id": PREVIEW_MODEL_NAME,
+        "bundled_model_max_steps": 64,
+        "bundled_model_sha256": "1282395279cbbe8dea50524bb5844938edb5df44e4f15c6a8b4cb1bf5fd0e022",
+        "bundled_model_status": "clean",
         "import_ok": False,
         "loader_origin": "engine",
         "model_card_status": "invalid",
-        "production_tuf_root_pinned": False,
+        "production_tuf_root_pinned": True,
     }
     recorded_loader_probe = manifest.get("model_loader_probe")
     if not isinstance(recorded_loader_probe, dict):
@@ -790,6 +879,22 @@ def validate_stage(
                 )
         if not str(recorded_loader_probe.get("loader_error", "")).strip():
             errors.append("release manifest model-loader probe must record rejection code")
+    bundled_models = manifest.get("bundled_models")
+    if not isinstance(bundled_models, list) or len(bundled_models) != 1:
+        errors.append("release manifest must record exactly one bundled YC preview model")
+    else:
+        bundled_model = bundled_models[0]
+        if bundled_model.get("bundle_sha256") != expected_loader_probe[
+            "bundled_model_sha256"
+        ]:
+            errors.append("bundled model manifest SHA-256 does not match loader probe")
+        if bundled_model.get("schema") != "com.reyn.yc-preview-model-release/1":
+            errors.append("bundled model release manifest schema is invalid")
+        if (
+            bundled_model.get("qualification_boundary")
+            != "Three-seed research replication passed; production scientific/runtime/distribution qualification remains incomplete."
+        ):
+            errors.append("bundled model qualification boundary is missing or altered")
 
     closure = json.loads(
         (stage / "dependency-closure.json").read_text(encoding="utf-8")

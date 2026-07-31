@@ -55,6 +55,7 @@ class WindowsPackagingTests(unittest.TestCase):
             "ReynPython/THIRD_PARTY_NOTICES.html",
             "resources/engine/reyn_engine.py",
             "resources/engine/model_bundle.py",
+            "resources/engine/pinned_model_trust.py",
             "resources/docs/PRD.md",
             "resources/docs/MODEL_BUNDLE_PROVENANCE.md",
             "THIRD_PARTY_NOTICES.md",
@@ -129,12 +130,25 @@ class WindowsPackagingTests(unittest.TestCase):
                 "python_lock_sha256": "b" * 64,
                 "model_loader_probe": {
                     "bundle_schema": "com.reyn.inference-model-bundle/1",
+                    "bundled_model_authenticity": "verified",
+                    "bundled_model_dimension": 2,
+                    "bundled_model_id": "reyn-h64-tail-brinkman-seed0-v1.reynmodel",
+                    "bundled_model_max_steps": 64,
+                    "bundled_model_sha256": "1282395279cbbe8dea50524bb5844938edb5df44e4f15c6a8b4cb1bf5fd0e022",
+                    "bundled_model_status": "clean",
                     "loader_error": "signature.missing",
                     "loader_origin": "engine",
                     "model_card_status": "invalid",
                     "import_ok": False,
-                    "production_tuf_root_pinned": False,
+                    "production_tuf_root_pinned": True,
                 },
+                "bundled_models": [
+                    {
+                        "schema": "com.reyn.yc-preview-model-release/1",
+                        "bundle_sha256": "1282395279cbbe8dea50524bb5844938edb5df44e4f15c6a8b4cb1bf5fd0e022",
+                        "qualification_boundary": "Three-seed research replication passed; production scientific/runtime/distribution qualification remains incomplete.",
+                    }
+                ],
             },
         )
         write_json(
@@ -443,11 +457,17 @@ class WindowsPackagingTests(unittest.TestCase):
                     "stdout": json.dumps(
                         {
                             "bundle_schema": "com.reyn.inference-model-bundle/1",
+                            "bundled_model_authenticity": "verified",
+                            "bundled_model_dimension": 2,
+                            "bundled_model_id": "reyn-h64-tail-brinkman-seed0-v1.reynmodel",
+                            "bundled_model_max_steps": 64,
+                            "bundled_model_sha256": "1282395279cbbe8dea50524bb5844938edb5df44e4f15c6a8b4cb1bf5fd0e022",
+                            "bundled_model_status": "clean",
                             "loader_error": "signature.missing",
                             "loader_origin": "engine",
                             "model_card_status": "invalid",
                             "import_ok": False,
-                            "production_tuf_root_pinned": False,
+                            "production_tuf_root_pinned": True,
                         }
                     )
                     + "\n"
@@ -462,6 +482,7 @@ class WindowsPackagingTests(unittest.TestCase):
             self.assertIn("model_bundle.load_model_bundle", command[3])
             self.assertIn("runtime.checkpoint_card", command[3])
             self.assertIn("runtime.import_model", command[3])
+            self.assertIn("os.chdir(original_cwd)", command[3])
 
     def test_authenticode_request_fails_closed_without_password(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -27,6 +27,7 @@ ENGINE_RESOURCES = (
     "model_bundle.py",
     "n5_inspector.py",
     "n5_overlap.py",
+    "pinned_model_trust.py",
     "reyn_engine.py",
 )
 DOCUMENTATION_RESOURCES = ("PRD.md",)
@@ -362,7 +363,7 @@ def runtime_requirements() -> dict[str, object]:
             "contract": "security/MODEL_TRUST_CONTRACT.json",
             "detached_signature_required": True,
             "offline_tuf_metadata_required": True,
-            "production_root_pinned": False,
+            "production_root_pinned": True,
             "model_assets_bundled": False,
             "failure_mode": "fail-closed",
         },
@@ -396,12 +397,8 @@ def standalone_blockers(root: Path) -> list[str]:
             "The default research checkout fallback is a developer-specific absolute path."
         )
     blockers.append(
-        "The production TUF root is intentionally unset, so authenticated model loading "
-        "fails closed until an offline root-key ceremony and source review are complete."
-    )
-    blockers.append(
         "No authenticated .reynmodel/.sig/.tuf triplet is bundled; models must be supplied "
-        "through the managed import path after the production TUF root is pinned."
+        "through the managed import path under the pinned YC preview trust root."
     )
     blockers.append(
         "Developer ID signing and Apple notarization are not performed by this workflow."
@@ -1213,8 +1210,12 @@ def validate_security_artifacts(resources: Path) -> list[str]:
     if isinstance(contract, dict):
         expected = {
             ("schema",): "com.reyn.studio.model-trust-contract.v1",
-            ("production_root", "pinned"): False,
-            ("production_root", "status"): "intentionally-unset",
+            ("production_root", "pinned"): True,
+            ("production_root", "status"): "yc-0.1.1-preview",
+            (
+                "production_root",
+                "sha256",
+            ): "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1",
             ("model_assets_bundled",): False,
             ("detached_signature", "required_adjacent_suffix"): ".sig",
             ("tuf", "detached_repository_suffix"): ".tuf",
@@ -1240,8 +1241,13 @@ def validate_security_artifacts(resources: Path) -> list[str]:
     except (OSError, UnicodeDecodeError, SyntaxError) as error:
         errors.append(f"cannot inspect staged model_bundle.py trust constants: {error}")
     else:
+        if "from pinned_model_trust import PINNED_TUF_ROOT_JSON" not in (
+            model_bundle_path.read_text(encoding="utf-8")
+        ):
+            errors.append(
+                "staged model_bundle.py does not import the pinned preview trust root"
+            )
         names = {
-            "PINNED_TUF_ROOT_JSON",
             "BUNDLE_SCHEMA",
             "SIGNATURE_DOCUMENT_SCHEMA",
             "SIGNATURE_PAYLOAD_SCHEMA",
@@ -1269,7 +1275,6 @@ def validate_security_artifacts(resources: Path) -> list[str]:
                 except (ValueError, TypeError):
                     constants[target] = object()
         expected_constants = {
-            "PINNED_TUF_ROOT_JSON": None,
             "BUNDLE_SCHEMA": "com.reyn.inference-model-bundle/1",
             "SIGNATURE_DOCUMENT_SCHEMA": "com.reyn.inference-model-signature/1",
             "SIGNATURE_PAYLOAD_SCHEMA": "com.reyn.inference-model-signature-payload/1",
@@ -1284,6 +1289,31 @@ def validate_security_artifacts(resources: Path) -> list[str]:
                 errors.append(
                     f"staged model_bundle.py {name} does not match the fail-closed trust contract"
                 )
+
+    pinned_root_path = resources / "engine/pinned_model_trust.py"
+    try:
+        pinned_tree = ast.parse(pinned_root_path.read_text(encoding="utf-8"))
+        pinned_constants = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in pinned_tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id
+            in {"PINNED_TUF_ROOT_JSON", "PINNED_TUF_ROOT_SHA256"}
+        }
+        pinned_bytes = pinned_constants.get("PINNED_TUF_ROOT_JSON")
+        pinned_sha256 = pinned_constants.get("PINNED_TUF_ROOT_SHA256")
+        if not isinstance(pinned_bytes, bytes):
+            errors.append("pinned preview TUF root must be literal public metadata bytes")
+        elif hashlib.sha256(pinned_bytes).hexdigest() != pinned_sha256:
+            errors.append("pinned preview TUF root SHA-256 does not match its bytes")
+        if pinned_sha256 != (
+            "a713d759f4f3549dad76a20dc6342275f3f07c2fe455cf7352dce66ddd5381f1"
+        ):
+            errors.append("pinned preview TUF root SHA-256 is not the reviewed release root")
+    except (OSError, UnicodeDecodeError, SyntaxError, ValueError, TypeError) as error:
+        errors.append(f"cannot inspect staged pinned preview TUF root: {error}")
 
     sbom, sbom_errors = _json_file(security / "SBOM.spdx.json", "SBOM")
     errors.extend(sbom_errors)
@@ -1423,7 +1453,7 @@ def validate_runtime_contract(path: Path) -> list[str]:
         ("research_runtime", "bundled"): True,
         ("checkpoints", "bundled"): False,
         ("checkpoints", "pickle_formats_permitted"): False,
-        ("model_trust", "production_root_pinned"): False,
+        ("model_trust", "production_root_pinned"): True,
         ("model_trust", "model_assets_bundled"): False,
         ("model_trust", "failure_mode"): "fail-closed",
         ("documentation", "bundled"): True,

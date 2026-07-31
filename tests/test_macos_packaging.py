@@ -126,7 +126,7 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertTrue(contract["documentation"]["bundled"])
         self.assertFalse(contract["documentation"]["network_required"])
         self.assertEqual(contract["documentation"]["entrypoint"], "docs/PRD.md")
-        self.assertFalse(contract["model_trust"]["production_root_pinned"])
+        self.assertTrue(contract["model_trust"]["production_root_pinned"])
         self.assertFalse(contract["model_trust"]["model_assets_bundled"])
         self.assertEqual(contract["model_trust"]["failure_mode"], "fail-closed")
         self.assertEqual(
@@ -434,7 +434,7 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertNotIn("CARGO_MANIFEST_DIR", blockers)
         self.assertNotIn("developer-specific absolute path", blockers)
         self.assertNotIn("Python, NumPy, and PyTorch are not bundled", blockers)
-        self.assertIn("production TUF root is intentionally unset", blockers)
+        self.assertNotIn("production TUF root is intentionally unset", blockers)
         self.assertIn("No authenticated .reynmodel/.sig/.tuf triplet", blockers)
         self.assertIn("Developer ID signing and Apple notarization", blockers)
         self.assertIn("document associations are intentionally not claimed", blockers)

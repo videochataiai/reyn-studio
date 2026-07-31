@@ -133,11 +133,10 @@ The strict command is expected to exit `2` while the blockers below remain.
   offline-only and contains versioned root, targets, delegated `models`, and snapshot roles plus
   `timestamp.json`; bundle and signature target lengths/hashes and model/release identities must
   agree. Pickle-backed `.pth`, `.pt`, and `.ckpt` files are forbidden from the app.
-- `PINNED_TUF_ROOT_JSON` is intentionally unset in `model_bundle.py`. The packaged
-  `security/MODEL_TRUST_CONTRACT.json` records that fact, and strict packaging rejects all model
-  triplets while it remains unset. Runtime model authentication therefore fails closed. No test
-  root, ephemeral key, private key, detached signature, or TUF repository is presented as a
-  production trust anchor.
+- `engine/pinned_model_trust.py` carries the public, threshold-signed YC 0.1.1 preview TUF root.
+  The packaged `security/MODEL_TRUST_CONTRACT.json` binds its reviewed SHA-256. Private signing
+  keys are not bundled. This allows the exact authenticated preview model to be imported on macOS,
+  although the model asset itself is currently bundled only in the Windows YC package.
 - `security/SBOM.spdx.json`, the runtime CycloneDX SBOM, package/runtime notices, upstream license
   files, `LICENSE`, and `NOTICE` record the redistributed dependency inventory.
 - Bundle metadata declares Reyn project/template UTIs for `.reyn`, the currently implemented

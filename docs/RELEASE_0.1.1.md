@@ -17,6 +17,12 @@ qualify Reyn Studio as production CFD software.
   a recovery file before defaults can be saved.
 - PowerShell CI commands have immediate `$LASTEXITCODE` guards, enforced by a
   regression test.
+- The YC Windows preview bundles the authenticated
+  `reyn-h64-tail-brinkman-seed0-v1.reynmodel` model. Its preregistered
+  tail-plus-Brinkman gate passed and the improvement replicated across training
+  seeds 0, 1, and 2. The exact bundle, detached Ed25519 signature, threshold-
+  signed TUF metadata, checkpoint digest, and replication summaries ship
+  together.
 - macOS compute is arm64/macOS 14+ only. A universal2 shell may support Intel
   review, but Intel compute is unsupported. Package assembly requires an exact
   arm64 factory runtime, runtime lock, SBOM/notices, and pinned private research
@@ -24,5 +30,7 @@ qualify Reyn Studio as production CFD software.
 
 External release gates remain: the private research repository must publish the
 module/lock closure in `packaging/macos/RESEARCH_SOURCE_REQUEST.json`; Developer
-ID signing, notarization/stapling, clean-machine qualification, a production TUF
-root ceremony, and a separately qualified signed model are not bypassed.
+ID signing, notarization/stapling, and clean-machine qualification are not
+bypassed. The bundled H64 model is a replicated research-preview model, not
+production-qualified CFD; consequential results still require independent
+solver or experimental validation.

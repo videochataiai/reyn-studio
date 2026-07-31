@@ -1,0 +1,306 @@
+{
+  "across_seed_full_band": {
+    "divergence_error_mse": {
+      "mean_delta": -0.0022604381587617204,
+      "mean_relative_change_percent": -7.43228821716789
+    },
+    "divergence_rms": {
+      "mean_delta": -0.0023040808287078107,
+      "mean_relative_change_percent": -1.6650740719096302
+    },
+    "solid_compliance": {
+      "mean_delta": -0.00012825210695173914,
+      "mean_relative_change_percent": -17.661383273369143
+    },
+    "vorticity_rel_l2": {
+      "mean_delta": -0.008695068806749381,
+      "mean_relative_change_percent": -3.467159828507436
+    },
+    "wake_energy_rel_error": {
+      "mean_delta": -0.004263131303183121,
+      "mean_relative_change_percent": -11.474341865004574
+    },
+    "wake_rel_l2": {
+      "mean_delta": -0.009555624140716645,
+      "mean_relative_change_percent": -7.241449862567925
+    },
+    "whole_rel_l2": {
+      "mean_delta": -0.004999878615137732,
+      "mean_relative_change_percent": -7.04859475321463
+    }
+  },
+  "across_seed_long_band": {
+    "wake_rel_l2": {
+      "mean_delta": -0.02026984167120342,
+      "mean_relative_change_percent": -10.783500036057552
+    },
+    "whole_rel_l2": {
+      "mean_delta": -0.010622049026702976,
+      "mean_relative_change_percent": -10.528990430458228
+    }
+  },
+  "experiment": "H64-v3 tail sampling plus final Brinkman output three-seed replication",
+  "per_seed": {
+    "0": {
+      "full_band": {
+        "divergence_error_mse": {
+          "mean_delta": -0.004188007276594519,
+          "relative_change_percent": -14.618938279355216,
+          "trajectory_bootstrap_ci": [
+            -0.006943111861009841,
+            -0.0019195640878121984
+          ]
+        },
+        "divergence_rms": {
+          "mean_delta": -0.0045634396774403285,
+          "relative_change_percent": -3.3839956294577074,
+          "trajectory_bootstrap_ci": [
+            -0.008829307236158001,
+            -0.0006886925091293964
+          ]
+        },
+        "solid_compliance": {
+          "mean_delta": -0.00012577099050758989,
+          "relative_change_percent": -16.98592004930889,
+          "trajectory_bootstrap_ci": [
+            -0.00019837626680185844,
+            -6.27626524298819e-05
+          ]
+        },
+        "vorticity_rel_l2": {
+          "mean_delta": -0.0048177975891121605,
+          "relative_change_percent": -2.0240787833331195,
+          "trajectory_bootstrap_ci": [
+            -0.008202313934395989,
+            -0.0017812853955945231
+          ]
+        },
+        "wake_energy_rel_error": {
+          "mean_delta": -0.004033256572144928,
+          "relative_change_percent": -12.622361008167966,
+          "trajectory_bootstrap_ci": [
+            -0.008114774893387642,
+            -0.0003225742121409124
+          ]
+        },
+        "wake_rel_l2": {
+          "mean_delta": -0.010980707791304667,
+          "relative_change_percent": -8.698991419662972,
+          "trajectory_bootstrap_ci": [
+            -0.015863882303673905,
+            -0.006570977557677797
+          ]
+        },
+        "whole_rel_l2": {
+          "mean_delta": -0.00574005372720876,
+          "relative_change_percent": -8.440438718714164,
+          "trajectory_bootstrap_ci": [
+            -0.008434577103152208,
+            -0.003366840119423387
+          ]
+        }
+      },
+      "long_band": {
+        "wake_rel_l2": {
+          "mean_delta": -0.023515754055551952,
+          "relative_change_percent": -13.092944893920214,
+          "trajectory_bootstrap_ci": [
+            -0.03383457272475424,
+            -0.01392990281829044
+          ]
+        },
+        "whole_rel_l2": {
+          "mean_delta": -0.012381510954583064,
+          "relative_change_percent": -12.803902751468652,
+          "trajectory_bootstrap_ci": [
+            -0.018056911969460996,
+            -0.007244799883710589
+          ]
+        }
+      },
+      "long_primary_joint_win": true
+    },
+    "1": {
+      "full_band": {
+        "divergence_error_mse": {
+          "mean_delta": 0.0007227528167774722,
+          "relative_change_percent": 2.4638769600205297,
+          "trajectory_bootstrap_ci": [
+            -0.0011786109170208278,
+            0.0028299073352492598
+          ]
+        },
+        "divergence_rms": {
+          "mean_delta": 0.0008090446153801167,
+          "relative_change_percent": 0.5859544432125774,
+          "trajectory_bootstrap_ci": [
+            -0.0024440493919314576,
+            0.00445841514759877
+          ]
+        },
+        "solid_compliance": {
+          "mean_delta": -0.00010341675631053704,
+          "relative_change_percent": -15.705548421795516,
+          "trajectory_bootstrap_ci": [
+            -0.00015050148728423807,
+            -6.6049319257111e-05
+          ]
+        },
+        "vorticity_rel_l2": {
+          "mean_delta": -0.009771517316266909,
+          "relative_change_percent": -3.8907479904107776,
+          "trajectory_bootstrap_ci": [
+            -0.012709564476318746,
+            -0.006942413206456877
+          ]
+        },
+        "wake_energy_rel_error": {
+          "mean_delta": -0.002784109263982759,
+          "relative_change_percent": -7.165750156305128,
+          "trajectory_bootstrap_ci": [
+            -0.006605948178817022,
+            0.0009375070003971998
+          ]
+        },
+        "wake_rel_l2": {
+          "mean_delta": -0.005972563477030235,
+          "relative_change_percent": -4.464035120016045,
+          "trajectory_bootstrap_ci": [
+            -0.009341196164919552,
+            -0.003145024488483728
+          ]
+        },
+        "whole_rel_l2": {
+          "mean_delta": -0.003038177308894774,
+          "relative_change_percent": -4.21274271034724,
+          "trajectory_bootstrap_ci": [
+            -0.00480466979028904,
+            -0.0016180061073100666
+          ]
+        }
+      },
+      "long_band": {
+        "wake_rel_l2": {
+          "mean_delta": -0.012147579567681532,
+          "relative_change_percent": -6.3823405685830945,
+          "trajectory_bootstrap_ci": [
+            -0.019197417775285427,
+            -0.006370133974178316
+          ]
+        },
+        "whole_rel_l2": {
+          "mean_delta": -0.006153596058538824,
+          "relative_change_percent": -6.008155929333373,
+          "trajectory_bootstrap_ci": [
+            -0.009619090874912216,
+            -0.0032229778997589177
+          ]
+        }
+      },
+      "long_primary_joint_win": true
+    },
+    "2": {
+      "full_band": {
+        "divergence_error_mse": {
+          "mean_delta": -0.003316060016468114,
+          "relative_change_percent": -10.141803332168983,
+          "trajectory_bootstrap_ci": [
+            -0.004775956655454117,
+            -0.001972160179935667
+          ]
+        },
+        "divergence_rms": {
+          "mean_delta": -0.0031578474240632204,
+          "relative_change_percent": -2.1971810294837604,
+          "trajectory_bootstrap_ci": [
+            -0.005758349342113433,
+            -0.0007282452976596688
+          ]
+        },
+        "solid_compliance": {
+          "mean_delta": -0.00015556857403709046,
+          "relative_change_percent": -20.292681349003026,
+          "trajectory_bootstrap_ci": [
+            -0.00024104266002975547,
+            -8.62811059823443e-05
+          ]
+        },
+        "vorticity_rel_l2": {
+          "mean_delta": -0.011495891514869072,
+          "relative_change_percent": -4.4866527117784125,
+          "trajectory_bootstrap_ci": [
+            -0.016871663289077788,
+            -0.006657157916333745
+          ]
+        },
+        "wake_energy_rel_error": {
+          "mean_delta": -0.005972028073421676,
+          "relative_change_percent": -14.634914430540626,
+          "trajectory_bootstrap_ci": [
+            -0.011251036229304387,
+            -0.0015673590670122642
+          ]
+        },
+        "wake_rel_l2": {
+          "mean_delta": -0.011713601153815034,
+          "relative_change_percent": -8.561323048024756,
+          "trajectory_bootstrap_ci": [
+            -0.017221136208465278,
+            -0.006707919920614814
+          ]
+        },
+        "whole_rel_l2": {
+          "mean_delta": -0.006221404809309661,
+          "relative_change_percent": -8.492602830582484,
+          "trajectory_bootstrap_ci": [
+            -0.00915756022961034,
+            -0.003546561609654476
+          ]
+        }
+      },
+      "long_band": {
+        "wake_rel_l2": {
+          "mean_delta": -0.02514619139037677,
+          "relative_change_percent": -12.875214645669349,
+          "trajectory_bootstrap_ci": [
+            -0.03627072197900816,
+            -0.015040358989790548
+          ]
+        },
+        "whole_rel_l2": {
+          "mean_delta": -0.013331040066987043,
+          "relative_change_percent": -12.774912610572656,
+          "trajectory_bootstrap_ci": [
+            -0.01902170528951501,
+            -0.008055651021140876
+          ]
+        }
+      },
+      "long_primary_joint_win": true
+    }
+  },
+  "preregistered_gate": {
+    "favorable_long_primary_means": true,
+    "favorable_solid_mean": true,
+    "full_band_all_metrics_noninferior": true,
+    "full_band_noninferiority_percent": 3.0,
+    "long_primary_joint_seed_wins": 3,
+    "passed": true,
+    "required_joint_seed_wins": 2,
+    "required_solid_seed_wins": 2,
+    "rule": "whole and wake long-band mean deltas must both be favorable in at least two of three training seeds and favorable across seeds; solid compliance must improve in at least two seeds and across seeds; three-seed full-band mean relative changes for every reported accuracy and physics metric must be no worse than +3%",
+    "solid_seed_wins": 3
+  },
+  "statistical_unit": "training seed for replication; trajectory bootstrap intervals are secondary within-seed uncertainty",
+  "target_horizon_band": [
+    33,
+    64
+  ],
+  "technique": "tail_brinkman_combined",
+  "training_seeds": [
+    0,
+    1,
+    2
+  ],
+  "verdict": "replicated"
+}

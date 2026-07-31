@@ -182,6 +182,19 @@ def package(args: argparse.Namespace) -> int:
         copy_resources(root, research, stage)
         probe = runtime_probe(stage / "ReynPython")
         model_loader_probe = loader_probe(stage)
+        model_release_manifest = json.loads(
+            (
+                stage
+                / "resources/docs/models/model-release-manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        if (
+            model_release_manifest.get("bundle_sha256")
+            != model_loader_probe["bundled_model_sha256"]
+        ):
+            raise ValueError(
+                "bundled model release manifest does not match the authenticated model"
+            )
         dependency_closure = generate_supply_chain_artifacts(
             root,
             stage / "ReynPython",
@@ -222,6 +235,7 @@ def package(args: argparse.Namespace) -> int:
             "research_revision": research_revision,
             "rust_toolchain": pins["rust_toolchain"],
             "model_loader_probe": model_loader_probe,
+            "bundled_models": [model_release_manifest],
         }
         write_json(stage / "release-manifest.json", release_manifest)
         write_json(

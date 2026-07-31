@@ -1,0 +1,102 @@
+{
+  "experiment": "H64-v3 tail sampling x final Brinkman output 2x2 screen",
+  "factors": {
+    "final_brinkman_output": {
+      "operator": "u_raw/(1+(solver_dt/eta)*solid_fraction)",
+      "solver_dt": 0.01
+    },
+    "tail_sampling": {
+      "control": "uniform horizons 1-64",
+      "distribution": "25% uniform tail over horizons 48-64"
+    }
+  },
+  "pair_metrics": {
+    "brinkman_vs_control": {
+      "full_band_relative_changes_percent": {
+        "divergence_error_mse": 0.15299020775961378,
+        "divergence_rms": 2.0106082310403957,
+        "solid_compliance": -23.656136315045714,
+        "vorticity_rel_l2": 1.3218027625496886,
+        "wake_energy_rel_error": 2.030749695140562,
+        "wake_rel_l2": 1.0257333413869705,
+        "whole_rel_l2": 1.0370553177608837
+      },
+      "long_band_primary_relative_changes_percent": {
+        "wake_rel_l2": 0.04046871632055712,
+        "whole_rel_l2": 0.07987706471420894
+      }
+    },
+    "combined_vs_brinkman": {
+      "full_band_relative_changes_percent": {
+        "divergence_error_mse": -14.749363405397691,
+        "divergence_rms": -5.288277321393914,
+        "solid_compliance": 8.7370692859646,
+        "vorticity_rel_l2": -3.3022325448787853,
+        "wake_energy_rel_error": -14.36146529069992,
+        "wake_rel_l2": -9.62598779480083,
+        "whole_rel_l2": -9.38021600755128
+      },
+      "long_band_primary_relative_changes_percent": {
+        "wake_rel_l2": -13.12810083635503,
+        "whole_rel_l2": -12.873496844777176
+      }
+    },
+    "combined_vs_control": {
+      "full_band_relative_changes_percent": {
+        "divergence_error_mse": -14.618938279355216,
+        "divergence_rms": -3.3839956294577074,
+        "solid_compliance": -16.98592004930889,
+        "vorticity_rel_l2": -2.0240787833331195,
+        "wake_energy_rel_error": -12.622361008167966,
+        "wake_rel_l2": -8.698991419662972,
+        "whole_rel_l2": -8.440438718714164
+      },
+      "long_band_primary_relative_changes_percent": {
+        "wake_rel_l2": -13.092944893920214,
+        "whole_rel_l2": -12.803902751468652
+      }
+    },
+    "combined_vs_tail": {
+      "full_band_relative_changes_percent": {
+        "divergence_error_mse": -7.79275569336864,
+        "divergence_rms": -2.507851482240281,
+        "solid_compliance": -20.819097206912726,
+        "vorticity_rel_l2": -0.09044988970605188,
+        "wake_energy_rel_error": -9.773952085602042,
+        "wake_rel_l2": -2.8985341325889156,
+        "whole_rel_l2": -2.7663648581821474
+      },
+      "long_band_primary_relative_changes_percent": {
+        "wake_rel_l2": -4.141121205610239,
+        "whole_rel_l2": -3.9673888150555934
+      }
+    },
+    "tail_vs_control": {
+      "full_band_relative_changes_percent": {
+        "divergence_error_mse": -7.4030870755516665,
+        "divergence_rms": -0.8986817508261425,
+        "solid_compliance": 4.841037450179822,
+        "vorticity_rel_l2": -1.9353794421979291,
+        "wake_energy_rel_error": -3.1569696206447535,
+        "wake_rel_l2": -5.9736042450629885,
+        "whole_rel_l2": -5.835505226412884
+      },
+      "long_band_primary_relative_changes_percent": {
+        "wake_rel_l2": -9.338544119122211,
+        "whole_rel_l2": -9.201576243090233
+      }
+    }
+  },
+  "preregistered_gate": {
+    "brinkman_fixes_tail_solid": true,
+    "combined_full_primary_noninferior": true,
+    "combined_long_primary_better": true,
+    "combined_physics_not_worse": true,
+    "combined_solid_better": true,
+    "passed": true,
+    "rule": "combined versus control must conclusively improve whole and wake over horizons 33-64 and solid compliance over horizons 1-64, retain full-band primary noninferiority and no conclusive physics regression; combined versus tail must conclusively improve solid compliance; combined versus Brinkman must conclusively improve both long-band primary metrics",
+    "tail_improves_brinkman_primary": true
+  },
+  "training_seed": 0,
+  "verdict": "advance_combined_to_replication"
+}

@@ -70,7 +70,11 @@ NumPy 2.5.1, the CPU build of PyTorch 2.13.0, Cryptography 49.0.0,
 Safetensors 0.8.0, secure-systems-lib 1.4.0, and python-tuf 6.0.0. The package
 validator rejects a runtime that reports CUDA. It also imports the app-owned
 `model_bundle.py` from the staged engine directory and exercises the real model
-card and import rejection paths; file presence alone is not sufficient.
+card and import rejection paths; file presence alone is not sufficient. The YC
+package must contain exactly one default 2D model,
+`reyn-h64-tail-brinkman-seed0-v1.reynmodel`, with its detached signature,
+threshold-signed TUF repository, release manifest, and three-seed replication
+evidence.
 
 Regenerate the Python lock only when intentionally updating the runtime:
 
@@ -111,7 +115,7 @@ package must not claim Authenticode or SmartScreen reputation.
 - Automatic and CPU compute choices only
 - CUDA is not supported or qualified
 - Evidence signing controls are unavailable because Windows key storage is not implemented
-- Model runs still require a compatible verified model bundle
+- The bundled H64 model is a replicated research preview, not production-qualified CFD
 - Official YC binaries require an online login at each app launch; public source builds do not
 - Reyn Studio is not production-qualified
 
@@ -123,7 +127,7 @@ Automated Windows CI must pass:
 - Python engine and packaging tests
 - Release build with the Windows icon resource
 - Fail-closed verification of the compiled YC access contract
-- CPU runtime, app-owned model loader, model-card, and import probes from the staged directory
+- CPU runtime plus authenticated loading of the bundled H64 model from the staged directory
 - Package inventory, SBOM, notices, checksum, and deterministic ZIP validation
 - Runner launch smoke for the staged executable
 - Bundled engine READY on loopback
@@ -154,7 +158,7 @@ Python, Git, or developer tools installed:
 - Confirm `ReynPython\python.exe` loads all required DLLs without ambient Python
 - Confirm Automatic selects CPU and the UI does not offer MPS or CUDA
 - Import a supported STL, save, close, and reopen a project
-- Run a qualified model smoke case when a qualified model is available
+- Run the bundled H64 model smoke case and preserve its exact bundle hash in the record
 - Export and reopen evidence with the engine stopped
 - Confirm sidecar cleanup after normal exit, forced close, and engine failure
 - Test antivirus scanning, SmartScreen, and quarantine behavior
