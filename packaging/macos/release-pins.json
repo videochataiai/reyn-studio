@@ -1,0 +1,11 @@
+{
+  "schema": "com.reyn.studio.macos-release-pins.v1",
+  "research_repository": "videochataiai/reyn",
+  "research_revision": "3515cde4d0f5678437ad6ee6116774f1cd6a3c16",
+  "research_subdirectory": "reyn-research",
+  "runtime_architecture": "arm64",
+  "minimum_compute_macos": "14.0",
+  "python": "3.14.6",
+  "torch": "2.13.0",
+  "numpy": "2.5.1"
+}

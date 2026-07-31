@@ -632,10 +632,31 @@ fn managed_slot_root(
     runtime_id: &str,
 ) -> Result<PathBuf, RuntimeValidationError> {
     validate_runtime_id(runtime_id)?;
-    Ok(managed_root
-        .join("slots")
-        .join(runtime_id)
-        .join("ReynPython"))
+    let slots = managed_root.join("slots");
+    let portable = slots
+        .join(runtime_slot_name(runtime_id)?)
+        .join("ReynPython");
+    let legacy = slots.join(runtime_id).join("ReynPython");
+    Ok(if !portable.is_dir() && legacy.is_dir() {
+        legacy
+    } else {
+        portable
+    })
+}
+
+fn runtime_slot_name(runtime_id: &str) -> Result<&str, RuntimeValidationError> {
+    validate_runtime_id(runtime_id)?;
+    Ok(runtime_id
+        .strip_prefix("sha256:")
+        .expect("validated runtime IDs use sha256"))
+}
+
+fn runtime_id_from_slot_name(name: &str) -> Option<String> {
+    if validate_runtime_id(name).is_ok() {
+        return Some(name.to_owned());
+    }
+    (name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("sha256:{name}"))
 }
 
 fn validate_runtime_root(
@@ -1617,7 +1638,7 @@ fn activate_validated_candidate_impl(
     let runtime_id = candidate.runtime.manifest.runtime_id.clone();
     let expected_stage = managed_root
         .join("staging")
-        .join(&runtime_id)
+        .join(runtime_slot_name(&runtime_id)?)
         .join("ReynPython");
     if candidate.runtime.root != expected_stage {
         return Err(RuntimeValidationError::activation(format!(
@@ -1636,7 +1657,7 @@ fn activate_validated_candidate_impl(
     next.last_self_test = Some(candidate.self_test);
 
     let slots_root = managed_root.join("slots");
-    let slot_root = slots_root.join(&runtime_id);
+    let slot_root = slots_root.join(runtime_slot_name(&runtime_id)?);
     let published_runtime = slot_root.join("ReynPython");
     if published_runtime.exists() || slot_root.exists() {
         return Err(RuntimeValidationError::activation(format!(
@@ -1650,7 +1671,7 @@ fn activate_validated_candidate_impl(
             slot_root.display()
         ))
     })?;
-    fs::rename(&candidate.runtime.root, &published_runtime).map_err(|error| {
+    publish_path_atomic(&candidate.runtime.root, &published_runtime, false).map_err(|error| {
         RuntimeValidationError::activation(format!(
             "could not atomically publish validated runtime slot: {error}"
         ))
@@ -1668,14 +1689,60 @@ fn activate_validated_candidate_impl(
 
 #[allow(dead_code)] // Used by offline activation and garbage collection.
 fn sync_directory(path: &Path) -> Result<(), RuntimeValidationError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| {
-            RuntimeValidationError::activation(format!(
-                "could not sync runtime directory {}: {error}",
-                path.display()
-            ))
-        })
+    sync_directory_platform(path).map_err(|error| {
+        RuntimeValidationError::activation(format!(
+            "could not sync runtime directory {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_directory_platform(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(target_os = "windows")]
+fn sync_directory_platform(_path: &Path) -> std::io::Result<()> {
+    // Windows does not permit opening directory handles through std::fs::File.
+    // Publication uses MoveFileExW(MOVEFILE_WRITE_THROUGH), which waits for the
+    // directory metadata update to reach disk.
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn publish_path_atomic(source: &Path, destination: &Path, _replace: bool) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn publish_path_atomic(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1915,15 +1982,16 @@ pub(crate) fn garbage_collect_runtime_slots(
                 entry.path().display()
             ))
         })?;
-        if validate_runtime_id(&name).is_err()
-            || !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-        {
+        let Some(runtime_id) = runtime_id_from_slot_name(&name) else {
+            report.skipped.push(name);
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
             report.skipped.push(name);
             continue;
         }
-        if protected.contains(name.as_str()) {
-            report.retained.push(name);
+        if protected.contains(runtime_id.as_str()) {
+            report.retained.push(runtime_id);
             continue;
         }
         fs::remove_dir_all(entry.path()).map_err(|error| {
@@ -1932,7 +2000,7 @@ pub(crate) fn garbage_collect_runtime_slots(
                 entry.path().display()
             ))
         })?;
-        report.deleted.push(name);
+        report.deleted.push(runtime_id);
     }
     report.deleted.sort();
     report.retained.sort();
@@ -2120,19 +2188,17 @@ pub(crate) fn write_runtime_state_atomic(
                 temporary.display()
             ))
         })?;
-        fs::rename(&temporary, managed_root.join(STATE_NAME)).map_err(|error| {
+        publish_path_atomic(&temporary, &managed_root.join(STATE_NAME), true).map_err(|error| {
             RuntimeValidationError::state(format!(
                 "could not atomically publish runtime state: {error}"
             ))
         })?;
-        File::open(managed_root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                RuntimeValidationError::state(format!(
-                    "could not sync runtime state directory {}: {error}",
-                    managed_root.display()
-                ))
-            })
+        sync_directory_platform(managed_root).map_err(|error| {
+            RuntimeValidationError::state(format!(
+                "could not sync runtime state directory {}: {error}",
+                managed_root.display()
+            ))
+        })
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -2198,7 +2264,7 @@ mod tests {
         ) -> RuntimeManifest {
             let payloads = [
                 ("THIRD_PARTY_NOTICES.html", b"notices".as_slice()),
-                ("bin/python3.14", python_payload),
+                (target_platform_spec().python_relative_path, python_payload),
                 ("lib/runtime.bin", b"native runtime".as_slice()),
                 ("runtime-sbom.cdx.json", br#"{"bomFormat":"CycloneDX"}"#),
             ];
@@ -2245,7 +2311,7 @@ mod tests {
                 runtime_id: String::new(),
                 platform: TARGET_PLATFORM.into(),
                 architecture: architecture.into(),
-                minimum_macos: Some(MINIMUM_MACOS.into()),
+                minimum_macos: target_platform_spec().minimum_os.map(str::to_owned),
                 python: python.into(),
                 torch: TORCH_VERSION.into(),
                 numpy: NUMPY_VERSION.into(),
@@ -2287,7 +2353,7 @@ mod tests {
             let staged = self
                 .managed_root()
                 .join("staging")
-                .join(&manifest.runtime_id)
+                .join(runtime_slot_name(&manifest.runtime_id).unwrap())
                 .join("ReynPython");
             fs::create_dir_all(staged.parent().unwrap()).unwrap();
             fs::rename(temporary_runtime, &staged).unwrap();
@@ -2316,7 +2382,10 @@ mod tests {
             ));
             let staging_runtime = staging.join("ReynPython");
             let manifest = self.create_runtime(&staging_runtime, architecture, python, closure);
-            let slot = self.managed_root().join("slots").join(&manifest.runtime_id);
+            let slot = self
+                .managed_root()
+                .join("slots")
+                .join(runtime_slot_name(&manifest.runtime_id).unwrap());
             fs::create_dir_all(&slot).unwrap();
             let runtime = slot.join("ReynPython");
             fs::rename(staging_runtime, &runtime).unwrap();
@@ -2407,8 +2476,12 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
         );
         assert_eq!(manifest_runtime_id(&first).unwrap(), first.runtime_id);
         let canonical = canonical_manifest_bytes(&first).unwrap();
-        assert!(canonical
-            .starts_with(br#"{"architecture":"arm64","build_epoch":0,"engine_protocol":1"#));
+        assert!(canonical.starts_with(
+            format!(
+                r#"{{"architecture":"{TARGET_ARCHITECTURE}","build_epoch":0,"engine_protocol":1"#
+            )
+            .as_bytes()
+        ));
         assert!(!canonical.contains(&b'\n'));
     }
 
@@ -2425,6 +2498,14 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
         assert_eq!(
             factory_runtime_root_for(Path::new("/portable/Reyn Studio.exe"), "windows"),
             Some(PathBuf::from("/portable/ReynPython"))
+        );
+        let runtime_id = format!("sha256:{}", "a".repeat(64));
+        let slot_name = runtime_slot_name(&runtime_id).unwrap();
+        assert_eq!(slot_name, "a".repeat(64));
+        assert!(!slot_name.contains(':'));
+        assert_eq!(
+            runtime_id_from_slot_name(slot_name).as_deref(),
+            Some(runtime_id.as_str())
         );
     }
 
@@ -2552,8 +2633,13 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
 
     #[test]
     fn wrong_architecture_and_dependency_version_fall_back() {
+        let wrong_architecture = if TARGET_ARCHITECTURE == "arm64" {
+            "x86_64"
+        } else {
+            "arm64"
+        };
         for (architecture, python, expected_code) in [
-            ("x86_64", PYTHON_VERSION, "runtime.platform"),
+            (wrong_architecture, PYTHON_VERSION, "runtime.platform"),
             (TARGET_ARCHITECTURE, "3.13.9", "runtime.dependencies"),
         ] {
             let fixture = Fixture::new(expected_code);
@@ -2616,18 +2702,23 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
     }
 
     #[test]
-    fn incompatible_host_does_not_attempt_arm64_runtime() {
+    fn incompatible_host_does_not_attempt_factory_runtime() {
         let fixture = Fixture::new("intel");
         let closure = digest(8);
         fixture.create_factory(&closure);
         let factory = fixture.factory_root();
         let managed = fixture.managed_root();
+        let incompatible_architecture = if TARGET_ARCHITECTURE == "arm64" {
+            "x86_64"
+        } else {
+            "arm64"
+        };
         let discovery = discover_runtime(RuntimeDiscoveryRequest {
             factory_root: Some(&factory),
             managed_root: Some(&managed),
             host: &HostCompatibility {
                 platform: TARGET_PLATFORM.into(),
-                architecture: "x86_64".into(),
+                architecture: incompatible_architecture.into(),
                 macos_version: Some("26.5".into()),
             },
             expected_research_closure_sha256: &closure,
@@ -2785,7 +2876,7 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
         assert!(fixture
             .managed_root()
             .join("slots")
-            .join(&manifest.runtime_id)
+            .join(runtime_slot_name(&manifest.runtime_id).unwrap())
             .join("ReynPython")
             .is_dir());
         assert!(!staged.exists());
@@ -2944,14 +3035,19 @@ printf 'REYN_RUNTIME_SMOKE {"schema":"com.reyn.runtime-smoke/1","python":"3.14.6
         fixture.write_state(&state);
         let slots = fixture.managed_root().join("slots");
         for runtime_id in [&active, &previous, &last_known_good, &factory, &orphan] {
-            fs::create_dir_all(slots.join(runtime_id).join("ReynPython")).unwrap();
+            fs::create_dir_all(
+                slots
+                    .join(runtime_slot_name(runtime_id).unwrap())
+                    .join("ReynPython"),
+            )
+            .unwrap();
         }
         fs::create_dir_all(slots.join("not-a-runtime-id")).unwrap();
 
         let report = garbage_collect_runtime_slots(&fixture.managed_root()).unwrap();
         assert_eq!(report.deleted, vec![orphan.clone()]);
         for protected in [&active, &previous, &last_known_good, &factory] {
-            assert!(slots.join(protected).is_dir());
+            assert!(slots.join(runtime_slot_name(protected).unwrap()).is_dir());
             assert!(report.retained.contains(protected));
         }
         assert!(slots.join("not-a-runtime-id").is_dir());

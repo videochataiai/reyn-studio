@@ -10,8 +10,12 @@ results, settings, and recovery data stay on the user's computer.
 
 ## Current status
 
+- The corrective release under review is **0.1.1**.
 - The app is an early research preview, not production-qualified CFD software.
-- macOS development and packaging paths are implemented.
+- macOS packaging now requires an exact arm64 factory runtime and pinned private
+  research checkout. A universal2 shell may open projects on Intel, but compute
+  is unsupported there. Developer ID signing, notarization, and a qualified
+  production model remain external release gates.
 - Windows 11 x64 portable packaging is implemented but remains labeled
   **preview pending clean-machine verification**.
 - Windows CUDA, an installer, and automatic updates are not available.
@@ -39,9 +43,11 @@ Python resolution falls back to `<research>/.venv/bin/python` and then
 bundled runtime and do not fall back to a developer checkout.
 
 Public source builds do not require the invitation service. Official YC
-artifacts are compiled with a login gate. The username, password digest, and
-hashing keys are encrypted Cloudflare Worker secrets and are not present in
-this repository or the binary. The service implementation is in
+artifacts are compiled with a login gate and do not construct the studio,
+inspect projects/models, or start Python before authentication. Expired
+sessions tear down the sidecar and in-memory studio before returning to login.
+The username, password digest, and hashing keys are encrypted Cloudflare Worker
+secrets and are not present in this repository or the binary. The service implementation is in
 [`services/yc-access-worker`](services/yc-access-worker/).
 
 ## Test

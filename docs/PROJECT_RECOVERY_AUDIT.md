@@ -203,24 +203,24 @@ Atomic replacement protects against many torn-write cases, but ignored durabilit
 - Reopen and validate critical JSON after publish.
 - Distinguish “atomically replaced” from “durably committed” in status/error handling.
 
-### [P2] Persist non-cancelled engine failures as terminal immutable attempts
+### [Resolved in 0.1.1] Persist engine failures and cancellations as terminal immutable attempts
 
 **Evidence**
 
-- A submitted engineering run stores its exact workflow in `pending_run`: `src/app.rs:1822-1869`.
-- On `engine::Msg::Error`, the app clears `pending_run` and returns the case to Ready without appending a run: `src/app.rs:934-952`.
-- The model supports `LifecycleState::Failed`, and `append_run` accepts it as terminal: `src/project.rs:86-96`, `src/project.rs:1250-1263`.
-- The PRD defines a Run as an immutable execution attempt with runtime, warnings, and stop reason, and includes `Failed` as a lifecycle state: `PRD.md:218-245`.
+- A submitted engineering run appends a `Running` attempt and checkpoints recovery before dispatch.
+- Correlated sidecar errors terminalize only their matching attempt as `Failed`.
+- Cancellation terminalizes the attempt as `Cancelled`, terminates the sidecar, and starts a fresh engine for retry.
+- Stale responses remain discard-only and cannot mutate the current attempt.
 
 **User impact**
 
-Engine failures are visible only in transient UI state. Reopening the project cannot answer what was attempted, with which exact inputs/model/device, how long it ran, or why it failed.
+Reopened projects retain exact inputs, model/device identity, elapsed runtime, and the failure or cancellation reason.
 
 **Recommended fix**
 
-- When an accepted, non-cancelled request fails, append a terminal `Failed` run using the captured pending workflow, elapsed runtime, device/model identity, and sanitized error as stop reason/warning.
-- Keep the current `REQ-N6-RUN-01` rule that cancelled and stale results create no run or evidence.
-- Do not create evidence artifacts unless failure output bytes actually exist and verify.
+- Failed and cancelled attempts are immutable terminal runs; neither creates fabricated evidence.
+- Stale responses create no run, result, or evidence.
+- Retry starts only against the replacement engine.
 
 ### [P2] Add migration handling for local recent/recovery state and forward settings data
 
@@ -337,16 +337,16 @@ For each state, exercise every mutation entry point and assert central policy en
 
 ### 5. Migration and downgrade fixtures
 
-- Project v1, current v2, malformed, unknown-field, and future-version fixtures.
+- Project v1/v2, current v3, malformed, unknown-field, and future-version fixtures.
 - Settings, recent list, recovery, and case-template fixtures for every supported version plus future versions.
 - Verify unknown/future data is never overwritten by an older build.
 - Verify corrupt settings are preserved and last-known-good templates/trust state can be restored.
 
 ### 6. Immutable terminal-run tests
 
-- Successful request creates one `Complete` run and linked evidence.
+- Successful request creates one `Succeeded` run and linked evidence.
 - Engine failure after accepted submission creates one `Failed` run with exact captured contract and stop reason, and no fabricated evidence.
-- Cancelled and stale requests create no run/result/evidence, preserving `REQ-N6-RUN-01`.
+- Cancellation persists one `Cancelled` attempt and no result/evidence; stale responses create nothing.
 - Persistence failure must not present the transient result as a durable project result and must offer retry/recovery.
 
 ### 7. Undo/redo boundary tests

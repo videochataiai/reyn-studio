@@ -73,7 +73,7 @@ function fixture(options: { validPassword?: boolean; rateLimited?: boolean } = {
     terms_version: "1.0",
     privacy_version: "1.0",
     client: {
-      app_version: "0.1.0",
+      app_version: "0.1.1",
       platform: "windows",
       architecture: "x86_64",
     },

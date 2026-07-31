@@ -12,6 +12,8 @@ From `reyn-studio/`, build the native Rust-host architecture with:
 ```bash
 SOURCE_DATE_EPOCH=315532800 python3 scripts/package_macos.py \
   --target host \
+  --research-source-dir /path/to/pinned/reyn/reyn-research \
+  --runtime-dir /path/to/arm64/ReynPython \
   --build-number 1
 ```
 
@@ -21,11 +23,11 @@ Explicit thin and universal targets are:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 SOURCE_DATE_EPOCH=315532800 python3 scripts/package_macos.py \
-  --target aarch64-apple-darwin --build-number 1
+  --target aarch64-apple-darwin --runtime-dir /path/to/arm64/ReynPython --build-number 1
 SOURCE_DATE_EPOCH=315532800 python3 scripts/package_macos.py \
-  --target x86_64-apple-darwin --build-number 1
+  --target x86_64-apple-darwin --runtime-dir /path/to/arm64/ReynPython --build-number 1
 SOURCE_DATE_EPOCH=315532800 python3 scripts/package_macos.py \
-  --target universal2 --build-number 1
+  --target universal2 --runtime-dir /path/to/arm64/ReynPython --build-number 1
 ```
 
 The preflight detects the Rust host, macOS SDK, required commands, and installed Rust standard
@@ -38,14 +40,15 @@ silently treated as tested.
 Outputs for build number `1` can include:
 
 - `dist/macos/Reyn Studio.app`
-- `dist/macos/Reyn-Studio-0.1.0-build.1-arm64.app.zip`
-- `dist/macos/Reyn-Studio-0.1.0-build.1-x86_64.app.zip`
-- `dist/macos/Reyn-Studio-0.1.0-build.1-universal2.app.zip`
+- `dist/macos/Reyn-Studio-0.1.1-build.1-arm64.app.zip`
+- `dist/macos/Reyn-Studio-0.1.1-build.1-x86_64.app.zip`
+- `dist/macos/Reyn-Studio-0.1.1-build.1-universal2.app.zip`
 - `dist/macos/SHA256SUMS`
 
 The command performs a locked optimized Cargo build in `target/package-macos`, assembles the
 bundle, includes the `.icns`, Python sidecar, exact lightweight `reyn-research` Python-module
-import closure, model-trust contract, SPDX runtime inventory, third-party notices, and local
+import closure, relocatable arm64 factory runtime, model-trust contract, SPDX/CycloneDX runtime
+inventories, third-party notices, and local
 `docs/PRD.md`, validates metadata/resources/architectures/dynamic libraries, and creates a
 fixed-timestamp ZIP plus SHA-256. `Cargo.lock` pins Rust dependencies; `SOURCE_DATE_EPOCH` normalizes
 archive timestamps. The release manifest uses only bundle-relative paths and records the byte count
@@ -76,9 +79,18 @@ source thin-binary hashes/sizes, and an architecture-neutral resource-set invent
 recomputes that resource inventory, preventing architecture-specific packages from silently
 drifting in bundled Python modules, icon, or runtime contract.
 
-To package from a non-sibling research source, pass `--research-source-dir PATH` or set
-`REYN_RESEARCH_SOURCE_DIR`. That source path is used only at build time and is not written into the
-bundle.
+The research source must be a Git checkout at the exact private revision in
+`packaging/macos/release-pins.json`; a directory with matching-looking files but a different or
+unverifiable revision fails closed. Pass `--research-source-dir PATH` or set
+`REYN_RESEARCH_SOURCE_DIR`. `--runtime-dir` is mandatory and must name a relocatable arm64 prefix
+whose installed versions match `python-runtime.lock.json`.
+
+The currently accessible private revision does not yet contain
+`pressure_channel_contract_3d.py`, `pressure_model_contract_3d.py`, or the four security packages
+required in its `uv.lock`. `packaging/macos/RESEARCH_SOURCE_REQUEST.json` is the exact handoff
+contract. Consequently, 0.1.1 package assembly intentionally remains blocked until the private
+repository publishes a replacement commit and `release-pins.json` is updated; local uncommitted
+research files are never substituted.
 
 Validate an existing bundle and require a specific target with:
 
@@ -111,11 +123,11 @@ The strict command is expected to exit `2` while the blockers below remain.
   `Contents/Resources/research`: model definitions, datasets, flow contracts/quantities, and the 2D
   and 3D solvers they import, including `model_bundle.py` and `physics_losses.py`. Tests,
   training/evaluation programs, candidate datasets, and checkpoints are intentionally excluded.
-- Python is not bundled. Runtime resolution remains `REYN_PYTHON`, then
-  `<REYN_RESEARCH_DIR>/.venv/bin/python`, then `python3` on `PATH`. The locked external inventory is
-  Python `>=3.14`, cryptography `49.0.0`, safetensors `0.8.0`, python-tuf `7.0.0`,
-  securesystemslib `1.4.0`, NumPy `2.5.0`, and PyTorch `2.12.1`. Missing or
-  architecture-incompatible external dependencies are runtime diagnostics, not packaging success.
+- The package requires `Contents/Frameworks/ReynPython`, a relocatable **arm64-only** factory
+  runtime. Its canonical manifest inventories every payload file and binds Python `3.14.6`,
+  cryptography `49.0.0`, safetensors `0.8.0`, python-tuf `7.0.0`,
+  securesystemslib `1.4.0`, NumPy `2.5.1`, and PyTorch `2.13.0` to the exact app research closure.
+  Missing, non-arm64, externally prefixed, or version-drifted runtimes fail packaging.
 - Model assets are not bundled. Production loading accepts only an adjacent
   `<name>.reynmodel`, `<name>.reynmodel.sig`, and `<name>.reynmodel.tuf/metadata/` set. Metadata is
   offline-only and contains versioned root, targets, delegated `models`, and snapshot roles plus
@@ -126,9 +138,8 @@ The strict command is expected to exit `2` while the blockers below remain.
   triplets while it remains unset. Runtime model authentication therefore fails closed. No test
   root, ephemeral key, private key, detached signature, or TUF repository is presented as a
   production trust anchor.
-- `security/SBOM.spdx.json` records the external Python dependency/version/license inventory and
-  `security/THIRD_PARTY_NOTICES.md` records applicable attributions. These files do not imply that
-  Python wheels or native dependencies are redistributed.
+- `security/SBOM.spdx.json`, the runtime CycloneDX SBOM, package/runtime notices, upstream license
+  files, `LICENSE`, and `NOTICE` record the redistributed dependency inventory.
 - Bundle metadata declares Reyn project/template UTIs for `.reyn`, the currently implemented
   `.reynproj`, and `.reyntemplate`. It deliberately omits `CFBundleDocumentTypes`: startup does not
   handle Finder/LaunchServices open events, `.reyn` is not accepted by the current project dialogs,
@@ -136,9 +147,10 @@ The strict command is expected to exit `2` while the blockers below remain.
   app without opening the document.
 - Engine startup failures reach the app as `engine unavailable` with explicit sidecar/resource,
   research-module, interpreter, NumPy/PyTorch, and pre-handshake stderr diagnostics.
-- Local packaging supports arm64, x86_64, or `universal2`. The checked minimum is macOS 11.0.
-  Static Mach-O validation is not a runtime smoke: arm64 and x86_64 still need clean-machine launch,
-  rendering, engine, save/reopen, and evidence tests on supported hardware.
+- The UI shell may be arm64, x86_64, or `universal2` with a macOS 11.0 shell floor. Compute is
+  qualified only for arm64 on macOS 14 or later. An Intel/universal2 shell must remain review-only
+  and must not fall through to ambient Python. Clean-machine launch, rendering, engine,
+  save/reopen, and evidence tests remain required on supported arm64 hardware.
 
 Bundle validation fails if a required sidecar/research module is absent, if the release manifest
 omits or mis-hashes a staged file, or if any staged file—including the Mach-O executable and opaque

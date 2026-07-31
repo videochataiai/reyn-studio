@@ -49,6 +49,7 @@ pub struct MenuSyncState {
     pub can_undo_case_edit: bool,
     pub can_redo_case_edit: bool,
     pub analysis_available: bool,
+    pub fea_export_available: bool,
     pub sandbox_enabled: bool,
     pub sandbox_live: bool,
     pub recents: Vec<(String, PathBuf)>,
@@ -265,6 +266,7 @@ impl MenuBar {
                 can_undo_case_edit: true,
                 can_redo_case_edit: true,
                 analysis_available: true,
+                fea_export_available: true,
                 sandbox_enabled: true,
                 sandbox_live: false,
                 recents: Vec::new(),
@@ -306,7 +308,9 @@ impl MenuBar {
         }
         if state.analysis_available != self.synced.analysis_available {
             self.run_item.set_enabled(state.analysis_available);
-            self.export_fea_item.set_enabled(state.analysis_available);
+        }
+        if state.fea_export_available != self.synced.fea_export_available {
+            self.export_fea_item.set_enabled(state.fea_export_available);
         }
         if state.sandbox_enabled != self.synced.sandbox_enabled {
             self.research_menu.set_enabled(state.sandbox_enabled);
@@ -389,6 +393,7 @@ mod tests {
         assert!(!state.can_undo_case_edit);
         assert!(!state.can_redo_case_edit);
         assert!(!state.analysis_available);
+        assert!(!state.fea_export_available);
         assert!(!state.sandbox_enabled);
         assert!(!state.sandbox_live);
         assert!(state.recents.is_empty());

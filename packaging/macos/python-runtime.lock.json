@@ -1,0 +1,27 @@
+{
+  "schema": "com.reyn.studio.macos-python-runtime-lock.v1",
+  "platform": "macos",
+  "architecture": "arm64",
+  "minimum_macos": "14.0",
+  "distributions": [
+    {"name": "Python", "version": "3.14.6", "license": "PSF-2.0", "purl": "pkg:generic/cpython@3.14.6"},
+    {"name": "cffi", "version": "2.1.0", "license": "MIT", "purl": "pkg:pypi/cffi@2.1.0"},
+    {"name": "cryptography", "version": "49.0.0", "license": "Apache-2.0 OR BSD-3-Clause", "purl": "pkg:pypi/cryptography@49.0.0"},
+    {"name": "filelock", "version": "3.32.2", "license": "Unlicense", "purl": "pkg:pypi/filelock@3.32.2"},
+    {"name": "fsspec", "version": "2026.7.0", "license": "BSD-3-Clause", "purl": "pkg:pypi/fsspec@2026.7.0"},
+    {"name": "Jinja2", "version": "3.1.6", "license": "BSD-3-Clause", "purl": "pkg:pypi/jinja2@3.1.6"},
+    {"name": "MarkupSafe", "version": "3.0.3", "license": "BSD-3-Clause", "purl": "pkg:pypi/markupsafe@3.0.3"},
+    {"name": "mpmath", "version": "1.3.0", "license": "BSD-3-Clause", "purl": "pkg:pypi/mpmath@1.3.0"},
+    {"name": "networkx", "version": "3.6.1", "license": "BSD-3-Clause", "purl": "pkg:pypi/networkx@3.6.1"},
+    {"name": "NumPy", "version": "2.5.1", "license": "BSD-3-Clause", "purl": "pkg:pypi/numpy@2.5.1"},
+    {"name": "pycparser", "version": "3.0", "license": "BSD-3-Clause", "purl": "pkg:pypi/pycparser@3.0"},
+    {"name": "safetensors", "version": "0.8.0", "license": "Apache-2.0", "purl": "pkg:pypi/safetensors@0.8.0"},
+    {"name": "securesystemslib", "version": "1.4.0", "license": "MIT", "purl": "pkg:pypi/securesystemslib@1.4.0"},
+    {"name": "setuptools", "version": "83.0.0", "license": "MIT", "purl": "pkg:pypi/setuptools@83.0.0"},
+    {"name": "sympy", "version": "1.14.0", "license": "BSD-3-Clause", "purl": "pkg:pypi/sympy@1.14.0"},
+    {"name": "PyTorch", "version": "2.13.0", "license": "BSD-3-Clause", "purl": "pkg:pypi/torch@2.13.0"},
+    {"name": "python-tuf", "version": "7.0.0", "license": "MIT", "purl": "pkg:pypi/tuf@7.0.0"},
+    {"name": "typing-extensions", "version": "4.16.0", "license": "PSF-2.0", "purl": "pkg:pypi/typing-extensions@4.16.0"},
+    {"name": "urllib3", "version": "2.7.0", "license": "MIT", "purl": "pkg:pypi/urllib3@2.7.0"}
+  ]
+}

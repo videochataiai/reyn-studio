@@ -38,6 +38,7 @@ from macos_packaging import (  # noqa: E402
     file_manifest,
     info_plist,
     load_config,
+    load_macos_release_pins,
     parse_macho_minimum_macos,
     require_executable_architectures,
     require_local_architecture_runtime,
@@ -46,14 +47,19 @@ from macos_packaging import (  # noqa: E402
     resource_metadata,
     rosetta_status,
     runtime_requirements,
+    stage_factory_runtime,
     standalone_blockers,
     validate_bundle,
     validate_architecture_metadata,
     validate_build_number,
     validate_release_manifest,
     validate_research_dependency_lock,
+    validate_research_source_pin,
     validate_resource_metadata,
     validate_runtime_contract,
+    validate_runtime_dependency_lock,
+    validate_runtime_sboms,
+    validate_factory_runtime_manifest,
     validate_model_assets,
     validate_security_artifacts,
     write_sha256sums,
@@ -75,7 +81,7 @@ class MacOSPackagingTests(unittest.TestCase):
     def test_bundle_identity_and_version_are_canonical_cargo_metadata(self):
         self.assertEqual(self.config.bundle_identifier, "com.reyn.studio")
         self.assertEqual(self.config.display_name, "Reyn Studio")
-        self.assertEqual(self.config.version, "0.1.0")
+        self.assertEqual(self.config.version, "0.1.1")
         self.assertEqual(self.config.minimum_system_version, "11.0")
 
     def test_plist_declares_types_without_claiming_broken_finder_open(self):
@@ -102,9 +108,11 @@ class MacOSPackagingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_build_number(value)
 
-    def test_runtime_contract_does_not_claim_bundled_dependencies_or_signing(self):
+    def test_runtime_contract_declares_arm64_factory_runtime_without_signing(self):
         contract = runtime_requirements()
-        self.assertFalse(contract["python"]["bundled"])
+        self.assertTrue(contract["python"]["bundled"])
+        self.assertEqual(contract["python"]["architecture"], "arm64")
+        self.assertEqual(contract["python"]["compute_unsupported_on"], ["x86_64"])
         self.assertFalse(contract["checkpoints"]["bundled"])
         self.assertFalse(
             contract["apple_distribution"]["developer_id_signing_performed"]
@@ -138,10 +146,10 @@ class MacOSPackagingTests(unittest.TestCase):
             path = Path(directory) / "runtime-requirements.json"
             write_json(path, contract)
             self.assertEqual(validate_runtime_contract(path), [])
-            contract["python"]["bundled"] = True
+            contract["python"]["bundled"] = False
             write_json(path, contract)
             self.assertIn(
-                "python.bundled=True, expected False",
+                "python.bundled=False, expected True",
                 validate_runtime_contract(path),
             )
 
@@ -292,7 +300,7 @@ class MacOSPackagingTests(unittest.TestCase):
             source = root / "src/main.rs"
             source.write_text("fn main() {}\n", encoding="utf-8")
             (root / "Cargo.toml").write_text(
-                "[package]\nname='reyn-studio'\nversion='0.1.0'\n",
+                "[package]\nname='reyn-studio'\nversion='0.1.1'\n",
                 encoding="utf-8",
             )
             target_dir = root / "target"
@@ -425,7 +433,7 @@ class MacOSPackagingTests(unittest.TestCase):
         blockers = "\n".join(standalone_blockers(ROOT))
         self.assertNotIn("CARGO_MANIFEST_DIR", blockers)
         self.assertNotIn("developer-specific absolute path", blockers)
-        self.assertIn("Python, NumPy, and PyTorch are not bundled", blockers)
+        self.assertNotIn("Python, NumPy, and PyTorch are not bundled", blockers)
         self.assertIn("production TUF root is intentionally unset", blockers)
         self.assertIn("No authenticated .reynmodel/.sig/.tuf triplet", blockers)
         self.assertIn("Developer ID signing and Apple notarization", blockers)
@@ -532,6 +540,134 @@ class MacOSPackagingTests(unittest.TestCase):
             validate_research_dependency_lock(research_source),
             [],
         )
+        self.assertEqual(validate_runtime_dependency_lock(ROOT), [])
+        self.assertEqual(validate_runtime_sboms(ROOT), [])
+        pins = load_macos_release_pins(ROOT)
+        self.assertRegex(pins["research_revision"], r"^[0-9a-f]{40}$")
+        self.assertEqual(pins["runtime_architecture"], "arm64")
+        locked_names = {
+            distribution["name"]
+            for distribution in json.loads(
+                (ROOT / "packaging/macos/python-runtime.lock.json").read_text()
+            )["distributions"]
+        }
+        for name in (
+            "cryptography",
+            "safetensors",
+            "securesystemslib",
+            "python-tuf",
+        ):
+            self.assertIn(name, locked_names)
+
+    def test_spdx_and_cyclonedx_cover_every_locked_distribution(self):
+        lock = json.loads(
+            (ROOT / "packaging/macos/python-runtime.lock.json").read_text()
+        )
+        expected = {
+            (distribution["name"], distribution["version"])
+            for distribution in lock["distributions"]
+        }
+        spdx = json.loads((ROOT / "packaging/macos/SBOM.spdx.json").read_text())
+        cyclonedx = json.loads(
+            (ROOT / "packaging/macos/runtime-sbom.cdx.json").read_text()
+        )
+        spdx_inventory = {
+            (package["name"], package["versionInfo"])
+            for package in spdx["packages"]
+            if package["name"] != "Reyn Studio"
+        }
+        cyclonedx_inventory = {
+            (component["name"], component["version"])
+            for component in cyclonedx["components"]
+        }
+        self.assertEqual(spdx_inventory, expected)
+        self.assertEqual(cyclonedx_inventory, expected)
+        self.assertEqual(len(spdx_inventory), len(lock["distributions"]))
+
+    def test_research_lock_requires_the_full_security_runtime_closure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            research_source = Path(directory)
+            (research_source / "pyproject.toml").write_text(
+                '[project]\nrequires-python = ">=3.14"\n',
+                encoding="utf-8",
+            )
+            packages = (
+                "cryptography",
+                "numpy",
+                "safetensors",
+                "securesystemslib",
+                "torch",
+            )
+            (research_source / "uv.lock").write_text(
+                "".join(
+                    f'[[package]]\nname = "{name}"\nversion = "1.0.0"\n'
+                    for name in packages
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "research uv.lock omits tuf",
+                validate_research_dependency_lock(research_source),
+            )
+
+    def test_factory_runtime_staging_is_manifested_and_arm64_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-runtime"
+            interpreter = source / "bin/python3.14"
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+            interpreter.chmod(0o755)
+            (source / "lib").mkdir()
+            (source / "lib/payload.bin").write_bytes(b"runtime payload")
+            resources = root / "Resources"
+            for folder, names in (
+                ("engine", ENGINE_RESOURCES),
+                ("research", RESEARCH_RESOURCES),
+            ):
+                (resources / folder).mkdir(parents=True)
+                for name in names:
+                    (resources / folder / name).write_text(name, encoding="utf-8")
+            observed = {
+                "architecture": "arm64",
+                "Python": RUNTIME_DEPENDENCIES["Python"][0],
+                "distributions": {
+                    name: version
+                    for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+                    if name != "Python"
+                },
+                "prefix": str((root / "factory").resolve()),
+            }
+            completed = subprocess.CompletedProcess(
+                ["python"], 0, stdout=json.dumps(observed)
+            )
+            with (
+                patch(
+                    "macos_packaging.executable_architectures",
+                    return_value=("arm64",),
+                ),
+                patch("macos_packaging.run", return_value=completed),
+            ):
+                manifest = stage_factory_runtime(
+                    source,
+                    root / "factory",
+                    resources=resources,
+                    source_revision="a" * 40,
+                    build_epoch=315532800,
+                    compliance_root=ROOT / "packaging/macos",
+                )
+                self.assertEqual(
+                    validate_factory_runtime_manifest(root / "factory"), []
+                )
+            self.assertEqual(manifest["architecture"], "arm64")
+            self.assertEqual(manifest["python"], "3.14.6")
+            self.assertTrue(manifest["runtime_id"].startswith("sha256:"))
+            self.assertTrue(
+                (root / "factory/runtime-sbom.cdx.json").is_file()
+            )
+            self.assertTrue(
+                (root / "factory/THIRD_PARTY_NOTICES.html").is_file()
+            )
 
     def test_model_triplet_layout_requires_matching_relative_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -800,6 +936,42 @@ class MacOSPackagingTests(unittest.TestCase):
             write_json(
                 resources / "runtime-requirements.json", runtime_requirements()
             )
+            runtime_source = Path(directory) / "runtime-source"
+            runtime_python = runtime_source / "bin/python3.14"
+            runtime_python.parent.mkdir(parents=True)
+            runtime_python.write_text("#!/bin/sh\n", encoding="utf-8")
+            runtime_python.chmod(0o755)
+            runtime_destination = contents / "Frameworks/ReynPython"
+            observed = {
+                "architecture": "arm64",
+                "Python": RUNTIME_DEPENDENCIES["Python"][0],
+                "distributions": {
+                    name: version
+                    for name, (version, _license) in RUNTIME_DEPENDENCIES.items()
+                    if name != "Python"
+                },
+                "prefix": str(runtime_destination.resolve()),
+            }
+            with (
+                patch(
+                    "macos_packaging.executable_architectures",
+                    return_value=("arm64",),
+                ),
+                patch(
+                    "macos_packaging.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["python"], 0, stdout=json.dumps(observed)
+                    ),
+                ),
+            ):
+                stage_factory_runtime(
+                    runtime_source,
+                    runtime_destination,
+                    resources=resources,
+                    source_revision="a" * 40,
+                    build_epoch=315532800,
+                    compliance_root=ROOT / "packaging/macos",
+                )
             manifest_path = resources / "release-manifest.json"
             manifest_files = [
                 path for path in contents.rglob("*") if path.is_file()
@@ -838,6 +1010,12 @@ class MacOSPackagingTests(unittest.TestCase):
                 ),
                 patch("macos_packaging.linked_libraries", return_value=[]),
                 patch("macos_packaging.signing_state", return_value="ad-hoc"),
+                patch(
+                    "macos_packaging.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["python"], 0, stdout=json.dumps(observed)
+                    ),
+                ),
             ):
                 checks = validate_bundle(
                     bundle,

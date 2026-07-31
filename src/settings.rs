@@ -356,6 +356,10 @@ pub struct AppSettings {
     /// User-owned reusable defaults. Entries are also exportable as strict,
     /// versioned `.reyntemplate` files for another machine.
     pub case_templates: Vec<CaseTemplate>,
+    /// Session-only fail-closed guard. When malformed settings could not be
+    /// quarantined, saving defaults must not overwrite the only recovery copy.
+    #[serde(skip)]
+    pub protected_malformed_settings_path: Option<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -397,6 +401,7 @@ impl Default for AppSettings {
             default_export_directory: String::new(),
             operating_presets: Vec::new(),
             case_templates: Vec::new(),
+            protected_malformed_settings_path: None,
         }
     }
 }
@@ -416,12 +421,24 @@ impl AppSettings {
     }
 
     fn load_from_path(path: &Path) -> (Self, Option<String>) {
-        match std::fs::read_to_string(path)
-            .map_err(|error| error.to_string())
-            .and_then(|text| serde_json::from_str::<Self>(&text).map_err(|error| error.to_string()))
-        {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                let mut defaults = Self::default();
+                defaults.protected_malformed_settings_path = Some(path.to_owned());
+                return (
+                    defaults,
+                    Some(format!(
+                        "settings could not be read and were not overwritten; preserve or recover {} before saving: {error}",
+                        path.display()
+                    )),
+                );
+            }
+        };
+        match serde_json::from_str::<Self>(&text) {
             Ok(mut settings) => {
                 settings.telemetry = false;
+                settings.protected_malformed_settings_path = None;
                 let migrated_models = settings.migrate_legacy_model_defaults();
                 settings.normalize();
                 let warning = migrated_models.then(|| {
@@ -432,12 +449,26 @@ impl AppSettings {
                 });
                 (settings, warning)
             }
-            Err(error) => (
-                Self::default(),
-                Some(format!(
-                    "settings could not be read; defaults restored: {error}"
-                )),
-            ),
+            Err(error) => match quarantine_malformed_settings(path) {
+                Ok(recovery_path) => (
+                    Self::default(),
+                    Some(format!(
+                        "malformed settings were preserved at {}; session defaults are active: {error}",
+                        recovery_path.display()
+                    )),
+                ),
+                Err(quarantine_error) => {
+                    let mut defaults = Self::default();
+                    defaults.protected_malformed_settings_path = Some(path.to_owned());
+                    (
+                        defaults,
+                        Some(format!(
+                            "malformed settings were not overwritten because quarantine failed ({quarantine_error}); recover {} before saving: {error}",
+                            path.display()
+                        )),
+                    )
+                }
+            },
         }
     }
 
@@ -2687,7 +2718,57 @@ fn short_fingerprint(fingerprint: &str) -> String {
     }
 }
 
+fn quarantine_malformed_settings(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "settings path has no parent directory".to_string())?;
+    let file_stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("settings");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("json");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    for collision in 0..1_000u16 {
+        let suffix = if collision == 0 {
+            String::new()
+        } else {
+            format!("-{collision}")
+        };
+        let recovery_path = parent.join(format!(
+            "{file_stem}.malformed-{timestamp}{suffix}.{extension}"
+        ));
+        if recovery_path.exists() {
+            continue;
+        }
+        std::fs::rename(path, &recovery_path).map_err(|error| {
+            format!(
+                "could not move {} to {}: {error}",
+                path.display(),
+                recovery_path.display()
+            )
+        })?;
+        return Ok(recovery_path);
+    }
+    Err("could not allocate a unique malformed-settings recovery path".into())
+}
+
 fn save_to(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    if settings
+        .protected_malformed_settings_path
+        .as_deref()
+        .is_some_and(|protected| protected == path && protected.exists())
+    {
+        return Err(format!(
+            "refusing to overwrite malformed settings at {}; move or recover that file first",
+            path.display()
+        ));
+    }
     let parent = path
         .parent()
         .ok_or_else(|| "settings path has no parent directory".to_string())?;
@@ -2982,7 +3063,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "reyn-settings-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let path = root.join("settings.json");
         let settings = AppSettings {
@@ -3048,6 +3132,51 @@ mod tests {
     }
 
     #[test]
+    fn malformed_settings_are_quarantined_before_defaults_can_save() {
+        let root = std::env::temp_dir().join(format!(
+            "reyn-settings-malformed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).unwrap();
+        let malformed = br#"{"theme":"instrument","unfinished":"#;
+        std::fs::write(&path, malformed).unwrap();
+
+        let (defaults, warning) = AppSettings::load_from_path(&path);
+        assert!(warning
+            .expect("malformed settings warning")
+            .contains("preserved"));
+        assert!(!path.exists());
+        let recovery_paths = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("settings.malformed-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_paths.len(), 1);
+        assert_eq!(std::fs::read(&recovery_paths[0]).unwrap(), malformed);
+
+        save_to(&defaults, &path).unwrap();
+        assert!(path.is_file());
+        assert_eq!(std::fs::read(&recovery_paths[0]).unwrap(), malformed);
+
+        let mut protected = AppSettings::default();
+        protected.protected_malformed_settings_path = Some(path.clone());
+        assert!(save_to(&protected, &path)
+            .unwrap_err()
+            .contains("refusing to overwrite malformed settings"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn legacy_partial_settings_receive_safe_defaults() {
         let settings: AppSettings =
             serde_json::from_str(r#"{"python_path":"python3","research_dir":"/tmp"}"#).unwrap();
@@ -3095,7 +3224,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "reyn-settings-model-migration-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let path = root.join("settings.json");
         std::fs::create_dir_all(&root).unwrap();

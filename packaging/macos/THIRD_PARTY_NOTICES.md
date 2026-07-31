@@ -1,10 +1,10 @@
 # Reyn Studio macOS Python Runtime Notices
 
-This bundle includes Reyn Studio's lightweight Python source closure, but it does
-not redistribute a Python interpreter, Python wheels, native Python extensions,
-PyTorch, model weights, detached model signatures, or TUF repository metadata.
-The components below are external runtime requirements recorded from
-`reyn-research/uv.lock`; their licenses apply when an operator supplies them.
+The 0.1.1 macOS package includes Reyn Studio's lightweight Python source closure
+and an exact arm64 factory runtime. It does not include model weights, detached
+model signatures, a production TUF root, or TUF repository metadata. The
+components below are locked in `python-runtime.lock.json`; the runtime also
+retains each installed distribution's complete license files.
 
 ## cryptography 49.0.0
 
@@ -38,7 +38,7 @@ License: MIT License.
 
 Copyright (c) New York University and the securesystemslib contributors.
 
-## NumPy 2.5.0
+## NumPy 2.5.1
 
 Project: <https://numpy.org/>
 
@@ -46,11 +46,10 @@ License: BSD 3-Clause License.
 
 Copyright (c) 2005-2026, NumPy Developers.
 
-NumPy wheels contain additional third-party components and notices. An operator
-redistributing a Python environment must preserve the complete license inventory
-from that environment rather than treating this summary as a wheel license file.
+NumPy wheels contain additional third-party components and notices; those files
+remain in the bundled runtime.
 
-## PyTorch 2.12.1
+## PyTorch 2.13.0
 
 Project: <https://pytorch.org/>
 
@@ -59,10 +58,9 @@ License: BSD 3-Clause License.
 Copyright (c) 2016-2026 Facebook, Inc. and PyTorch contributors.
 
 PyTorch distributions include a separate `NOTICE` and licenses for bundled
-third-party components. An operator redistributing PyTorch must preserve those
-distribution files; they are not copied here because PyTorch is not bundled.
+third-party components; those files remain in the bundled runtime.
 
-## Python 3.14 or newer
+## Python 3.14.6
 
 Project: <https://www.python.org/>
 
@@ -71,6 +69,22 @@ licenses.
 
 Copyright (c) 2001-2026 Python Software Foundation; all rights reserved.
 
-The full license texts accompany the upstream distributions linked above. This
-notice is an inventory and attribution record, not a replacement for license
-files required when those external distributions are redistributed.
+## Locked transitive runtime distributions
+
+The exact runtime additionally contains:
+
+- cffi 2.1.0 — MIT
+- filelock 3.32.2 — Unlicense
+- fsspec 2026.7.0 — BSD-3-Clause
+- Jinja2 3.1.6 — BSD-3-Clause
+- MarkupSafe 3.0.3 — BSD-3-Clause
+- mpmath 1.3.0 — BSD-3-Clause
+- networkx 3.6.1 — BSD-3-Clause
+- pycparser 3.0 — BSD-3-Clause
+- setuptools 83.0.0 — MIT
+- sympy 1.14.0 — BSD-3-Clause
+- typing-extensions 4.16.0 — PSF-2.0
+- urllib3 2.7.0 — MIT
+
+The full license texts accompany the upstream distributions in the factory
+runtime. This notice is an inventory and attribution index.

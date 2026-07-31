@@ -13,7 +13,8 @@ pub const INTERNAL_FLOW_CONTRACT: &str = "internal_flow.reference_only.v1";
 pub const SURFACE_LOAD_METHOD: &str = "diffuse_interface_traction.v1";
 pub const ENGINEERING_RESULT_SCHEMA: &str = "engineering_result.v1";
 pub const ENGINEERING_FIELD_SCHEMA: &str = "engineering_field.f32le.v1";
-pub const FEA_LOAD_SCHEMA: &str = "reyn_fea_surface_loads.v1";
+pub const FEA_LOAD_SCHEMA: &str = "reyn_fea_source_frame_surface_loads.v2";
+pub const FEA_DATA_DESCRIPTION: &str = "source-frame surface traction/load data";
 
 /// The frame every reported force and moment coefficient is expressed in.
 ///
@@ -1122,30 +1123,71 @@ pub fn decode_engineering_field(bytes: &[u8]) -> Result<EngineeringFieldBlob, St
     })
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FeaLoadProvenance {
+    pub project_id: String,
+    pub case_id: String,
+    pub case_name: String,
     pub source_revision_id: String,
+    pub source_name: String,
+    pub source_sha256: String,
     pub case_revision_id: String,
     pub run_id: String,
+    pub model_id: String,
     pub model_sha256: String,
+    pub solver_name: String,
+    pub solver_version: String,
     pub contract_kind: String,
     pub coordinate_frame: String,
+    pub traction_frame: String,
+    pub body_frame_semantics: String,
+    pub wind_frame_semantics: String,
+    pub source_to_solver_transform_4x4_column_major: [f64; 16],
+    pub source_length_unit: String,
+    pub meters_per_source_unit: f64,
+    pub position_units: String,
+    pub traction_units: String,
+    pub cp_units: String,
+    pub reference_length_m: f64,
+    pub free_stream_velocity_mps: f64,
+    pub density_kg_m3: f64,
+    pub dynamic_viscosity_pa_s: f64,
+    pub reference_pressure_pa: f64,
+    pub dynamic_pressure_pa: f64,
+    pub declared_flow_direction: [f64; 3],
+    pub integration_method: String,
+    pub resultant_force_newtons_wind_axes: [f64; 3],
+    pub resultant_moment_newton_meters_wind_axes: [f64; 3],
+    pub exported_sample_force_newtons_wind_axes: [f64; 3],
+    pub exported_sample_moment_newton_meters_wind_axes: [f64; 3],
+    pub force_reconciliation_residual_newtons: [f64; 3],
+    pub moment_reconciliation_residual_newton_meters: [f64; 3],
+    pub moment_reference: String,
+    pub integrated_surface_area_m2: f64,
+    pub pressure_force_fraction: f64,
+    pub reconciliation_method: String,
+    pub reconciliation_status: String,
 }
 
-const FEA_CSV_HEADER: &str = "x_m,y_m,z_m,traction_x_pa,traction_y_pa,traction_z_pa,cp,source_class,method,schema,source_revision_id,case_revision_id,run_id,model_sha256,contract_kind,coordinate_frame";
+const FEA_CSV_HEADER: &str = "source_frame_x_m,source_frame_y_m,source_frame_z_m,source_frame_traction_x_pa,source_frame_traction_y_pa,source_frame_traction_z_pa,integration_area_weight_m2,cp,source_class,method,schema,source_revision_id,case_revision_id,run_id,model_sha256,contract_kind,coordinate_frame";
 const FEA_SOURCE_CLASS: &str = "derived_from_model_prediction_and_recovered_pressure";
 
 fn validate_fea_loads(
     positions: &[[f64; 3]],
     tractions: &[[f64; 3]],
+    area_weights_m2: &[f64],
     cp: &[f64],
     provenance: &FeaLoadProvenance,
 ) -> Result<(), String> {
-    if positions.len() != tractions.len() || positions.len() != cp.len() {
+    if positions.len() != tractions.len()
+        || positions.len() != area_weights_m2.len()
+        || positions.len() != cp.len()
+    {
         return Err(format!(
-            "FEA load arrays must have matching lengths (positions {}, tractions {}, Cp {}).",
+            "FEA load arrays must have matching lengths (positions {}, tractions {}, area weights {}, Cp {}).",
             positions.len(),
             tractions.len(),
+            area_weights_m2.len(),
             cp.len()
         ));
     }
@@ -1153,12 +1195,43 @@ fn validate_fea_loads(
         return Err("FEA load export requires at least one mapped surface-load row.".into());
     }
     for (label, value) in [
+        ("project ID", provenance.project_id.as_str()),
+        ("case ID", provenance.case_id.as_str()),
+        ("case name", provenance.case_name.as_str()),
         ("source revision", provenance.source_revision_id.as_str()),
+        ("source name", provenance.source_name.as_str()),
+        ("source SHA-256", provenance.source_sha256.as_str()),
         ("case revision", provenance.case_revision_id.as_str()),
         ("run", provenance.run_id.as_str()),
+        ("model ID", provenance.model_id.as_str()),
         ("model SHA-256", provenance.model_sha256.as_str()),
+        ("solver name", provenance.solver_name.as_str()),
+        ("solver version", provenance.solver_version.as_str()),
         ("contract", provenance.contract_kind.as_str()),
         ("coordinate frame", provenance.coordinate_frame.as_str()),
+        ("traction frame", provenance.traction_frame.as_str()),
+        (
+            "body-frame semantics",
+            provenance.body_frame_semantics.as_str(),
+        ),
+        (
+            "wind-frame semantics",
+            provenance.wind_frame_semantics.as_str(),
+        ),
+        ("source length unit", provenance.source_length_unit.as_str()),
+        ("position units", provenance.position_units.as_str()),
+        ("traction units", provenance.traction_units.as_str()),
+        ("Cp units", provenance.cp_units.as_str()),
+        ("integration method", provenance.integration_method.as_str()),
+        ("moment reference", provenance.moment_reference.as_str()),
+        (
+            "reconciliation method",
+            provenance.reconciliation_method.as_str(),
+        ),
+        (
+            "reconciliation status",
+            provenance.reconciliation_status.as_str(),
+        ),
     ] {
         if value.trim().is_empty() {
             return Err(format!("FEA load export requires a persisted {label}."));
@@ -1169,13 +1242,19 @@ fn validate_fea_loads(
             ));
         }
     }
-    if provenance.model_sha256.len() != 64
-        || !provenance
-            .model_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("FEA load export requires a canonical lowercase model SHA-256.".into());
+    for (label, digest) in [
+        ("source", provenance.source_sha256.as_str()),
+        ("model", provenance.model_sha256.as_str()),
+    ] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "FEA load export requires a canonical lowercase {label} SHA-256."
+            ));
+        }
     }
     if provenance.contract_kind != EXTERNAL_FLOW_CONTRACT {
         return Err(format!(
@@ -1183,9 +1262,58 @@ fn validate_fea_loads(
             provenance.contract_kind
         ));
     }
+    let scalar_metadata = [
+        provenance.meters_per_source_unit,
+        provenance.reference_length_m,
+        provenance.free_stream_velocity_mps,
+        provenance.density_kg_m3,
+        provenance.dynamic_viscosity_pa_s,
+        provenance.reference_pressure_pa,
+        provenance.dynamic_pressure_pa,
+        provenance.integrated_surface_area_m2,
+        provenance.pressure_force_fraction,
+    ];
+    if provenance
+        .source_to_solver_transform_4x4_column_major
+        .iter()
+        .chain(provenance.declared_flow_direction.iter())
+        .chain(provenance.resultant_force_newtons_wind_axes.iter())
+        .chain(provenance.resultant_moment_newton_meters_wind_axes.iter())
+        .chain(provenance.exported_sample_force_newtons_wind_axes.iter())
+        .chain(
+            provenance
+                .exported_sample_moment_newton_meters_wind_axes
+                .iter(),
+        )
+        .chain(provenance.force_reconciliation_residual_newtons.iter())
+        .chain(
+            provenance
+                .moment_reconciliation_residual_newton_meters
+                .iter(),
+        )
+        .chain(scalar_metadata.iter())
+        .any(|value| !value.is_finite())
+        || provenance.meters_per_source_unit <= 0.0
+        || provenance.reference_length_m <= 0.0
+        || provenance.free_stream_velocity_mps <= 0.0
+        || provenance.density_kg_m3 <= 0.0
+        || provenance.dynamic_viscosity_pa_s <= 0.0
+        || provenance.dynamic_pressure_pa <= 0.0
+        || provenance.integrated_surface_area_m2 <= 0.0
+        || !(0.0..=1.0).contains(&provenance.pressure_force_fraction)
+    {
+        return Err(
+            "FEA load export requires finite, physically valid transform and reference metadata."
+                .into(),
+        );
+    }
     let axes = ["x", "y", "z"];
-    for (row, ((position, traction), coefficient)) in
-        positions.iter().zip(tractions).zip(cp).enumerate()
+    for (row, (((position, traction), area_weight), coefficient)) in positions
+        .iter()
+        .zip(tractions)
+        .zip(area_weights_m2)
+        .zip(cp)
+        .enumerate()
     {
         for axis in 0..3 {
             if !position[axis].is_finite() {
@@ -1206,6 +1334,12 @@ fn validate_fea_loads(
         if !coefficient.is_finite() {
             return Err(format!(
                 "FEA load row {} has a non-finite Cp value.",
+                row + 1
+            ));
+        }
+        if !area_weight.is_finite() || *area_weight <= 0.0 {
+            return Err(format!(
+                "FEA load row {} has a non-positive or non-finite integration area weight.",
                 row + 1
             ));
         }
@@ -1239,24 +1373,37 @@ pub fn write_fea_load_csv<W: Write>(
     writer: &mut W,
     positions: &[[f64; 3]],
     tractions: &[[f64; 3]],
+    area_weights_m2: &[f64],
     cp: &[f64],
     provenance: &FeaLoadProvenance,
 ) -> Result<(), String> {
-    validate_fea_loads(positions, tractions, cp, provenance)?;
+    validate_fea_loads(positions, tractions, area_weights_m2, cp, provenance)?;
     let write = |result: std::io::Result<()>| {
         result.map_err(|error| format!("FEA load CSV write failed: {error}"))
     };
+    let metadata = serde_json::json!({
+        "schema": FEA_LOAD_SCHEMA,
+        "data_description": FEA_DATA_DESCRIPTION,
+        "source_class": FEA_SOURCE_CLASS,
+        "provenance": provenance,
+    });
+    let metadata_json = serde_json::to_string(&metadata)
+        .map_err(|error| format!("FEA load metadata serialization failed: {error}"))?;
+    write(writeln!(writer, "# reyn_fea_metadata_json={metadata_json}"))?;
     write(writeln!(writer, "{FEA_CSV_HEADER}"))?;
-    for ((position, traction), coefficient) in positions.iter().zip(tractions).zip(cp) {
+    for (((position, traction), area_weight), coefficient) in
+        positions.iter().zip(tractions).zip(area_weights_m2).zip(cp)
+    {
         write(write!(
             writer,
-            "{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+            "{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
             position[0],
             position[1],
             position[2],
             traction[0],
             traction[1],
             traction[2],
+            area_weight,
             coefficient,
         ))?;
         for value in [
@@ -1281,11 +1428,19 @@ pub fn write_fea_load_csv<W: Write>(
 pub fn fea_load_csv(
     positions: &[[f64; 3]],
     tractions: &[[f64; 3]],
+    area_weights_m2: &[f64],
     cp: &[f64],
     provenance: &FeaLoadProvenance,
 ) -> Result<String, String> {
     let mut bytes = Vec::new();
-    write_fea_load_csv(&mut bytes, positions, tractions, cp, provenance)?;
+    write_fea_load_csv(
+        &mut bytes,
+        positions,
+        tractions,
+        area_weights_m2,
+        cp,
+        provenance,
+    )?;
     String::from_utf8(bytes).map_err(|error| format!("FEA load CSV encoding failed: {error}"))
 }
 
@@ -1366,6 +1521,56 @@ pub fn solver_point_to_source_m(
     Ok(inverse.map(|row| {
         (row[0] * translated[0] + row[1] * translated[1] + row[2] * translated[2])
             * meters_per_source_unit
+    }))
+}
+
+/// Rotate a physical vector from solver/wind axes into the imported source
+/// axes. The preprocessing transform may contain the uniform geometry scale,
+/// but physical traction magnitudes are not scaled during a basis change.
+pub fn solver_vector_to_source(
+    solver_vector: [f64; 3],
+    transform_4x4: [f64; 16],
+) -> Result<[f64; 3], String> {
+    if solver_vector
+        .iter()
+        .chain(transform_4x4.iter())
+        .any(|component| !component.is_finite())
+    {
+        return Err("Vector or preprocessing transform contains a non-finite value.".into());
+    }
+    let columns = [
+        [transform_4x4[0], transform_4x4[1], transform_4x4[2]],
+        [transform_4x4[4], transform_4x4[5], transform_4x4[6]],
+        [transform_4x4[8], transform_4x4[9], transform_4x4[10]],
+    ];
+    let norms = columns.map(|column| column.iter().map(|value| value * value).sum::<f64>().sqrt());
+    let scale = norms.iter().sum::<f64>() / 3.0;
+    let tolerance = scale.abs().max(1.0) * 1e-9;
+    if !scale.is_finite()
+        || scale <= 1e-18
+        || norms.iter().any(|norm| (*norm - scale).abs() > tolerance)
+    {
+        return Err(
+            "Preprocessing transform is not a finite uniform-scale rotation/reflection.".into(),
+        );
+    }
+    for left in 0..3 {
+        for right in left + 1..3 {
+            let dot = (0..3)
+                .map(|axis| columns[left][axis] * columns[right][axis])
+                .sum::<f64>();
+            if dot.abs() > tolerance * scale {
+                return Err("Preprocessing transform basis is not orthogonal.".into());
+            }
+        }
+    }
+    Ok(columns.map(|source_axis| {
+        source_axis
+            .iter()
+            .zip(solver_vector)
+            .map(|(basis_component, vector_component)| basis_component * vector_component)
+            .sum::<f64>()
+            / scale
     }))
 }
 
@@ -1608,27 +1813,74 @@ mod tests {
 
     fn fea_provenance() -> FeaLoadProvenance {
         FeaLoadProvenance {
+            project_id: "project-1".into(),
+            case_id: "case-1".into(),
+            case_name: "baseline".into(),
             source_revision_id: "source-1".into(),
+            source_name: "cube.stl".into(),
+            source_sha256: "b".repeat(64),
             case_revision_id: "case-revision-1".into(),
             run_id: "run-1".into(),
+            model_id: "qualified-model".into(),
             model_sha256: "a".repeat(64),
+            solver_name: "reyn-engine".into(),
+            solver_version: "0.1.1".into(),
             contract_kind: EXTERNAL_FLOW_CONTRACT.into(),
             coordinate_frame: "approved_stl_source_frame".into(),
+            traction_frame: "approved_stl_source_frame".into(),
+            body_frame_semantics: "imported source axes".into(),
+            wind_frame_semantics: COEFFICIENT_REFERENCE_FRAME.into(),
+            source_to_solver_transform_4x4_column_major: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            source_length_unit: "m".into(),
+            meters_per_source_unit: 1.0,
+            position_units: "m".into(),
+            traction_units: "Pa".into(),
+            cp_units: "1".into(),
+            reference_length_m: 1.0,
+            free_stream_velocity_mps: 10.0,
+            density_kg_m3: 1.225,
+            dynamic_viscosity_pa_s: 1.81e-5,
+            reference_pressure_pa: 101_325.0,
+            dynamic_pressure_pa: 61.25,
+            declared_flow_direction: [1.0, 0.0, 0.0],
+            integration_method: SURFACE_LOAD_METHOD.into(),
+            resultant_force_newtons_wind_axes: [4.0, 5.0, 6.0],
+            resultant_moment_newton_meters_wind_axes: [0.0; 3],
+            exported_sample_force_newtons_wind_axes: [4.0, 5.0, 6.0],
+            exported_sample_moment_newton_meters_wind_axes: [0.0; 3],
+            force_reconciliation_residual_newtons: [0.0; 3],
+            moment_reconciliation_residual_newton_meters: [0.0; 3],
+            moment_reference: "diffuse-surface area centroid".into(),
+            integrated_surface_area_m2: 1.0,
+            pressure_force_fraction: 0.8,
+            reconciliation_method: "sample quadrature minus reported resultant".into(),
+            reconciliation_status: "within tolerance".into(),
         }
     }
 
     #[test]
     fn fea_export_is_versioned_and_shape_checked() {
         let provenance = fea_provenance();
-        let csv =
-            fea_load_csv(&[[1.0, 2.0, 3.0]], &[[4.0, 5.0, 6.0]], &[0.7], &provenance).unwrap();
+        let csv = fea_load_csv(
+            &[[1.0, 2.0, 3.0]],
+            &[[4.0, 5.0, 6.0]],
+            &[1.0],
+            &[0.7],
+            &provenance,
+        )
+        .unwrap();
         assert!(csv.contains(SURFACE_LOAD_METHOD));
         assert!(csv.contains("traction_x_pa"));
         assert!(csv.contains("source-1,case-revision-1,run-1"));
         assert!(csv.contains("1.00000000000000000e0"));
-        let error = fea_load_csv(&[], &[[0.0; 3]], &[], &provenance).unwrap_err();
-        assert!(error.contains("positions 0, tractions 1, Cp 0"));
-        assert!(fea_load_csv(&[], &[], &[], &provenance)
+        assert!(csv.contains(FEA_DATA_DESCRIPTION));
+        assert!(csv.contains("source_to_solver_transform_4x4_column_major"));
+        assert!(csv.contains("resultant_force_newtons_wind_axes"));
+        let error = fea_load_csv(&[], &[[0.0; 3]], &[], &[], &provenance).unwrap_err();
+        assert!(error.contains("positions 0, tractions 1, area weights 0, Cp 0"));
+        assert!(fea_load_csv(&[], &[], &[], &[], &provenance)
             .unwrap_err()
             .contains("at least one"));
     }
@@ -1642,6 +1894,7 @@ mod tests {
         let csv = fea_load_csv(
             &[[1.25, 2.5, 3.75]],
             &[[4.0, 5.0, 6.0]],
+            &[1.0],
             &[0.7],
             &provenance,
         )
@@ -1657,6 +1910,7 @@ mod tests {
             &mut output,
             &[[f64::NAN, 0.0, 0.0]],
             &[[0.0; 3]],
+            &[1.0],
             &[0.0],
             &provenance,
         )
@@ -1668,13 +1922,14 @@ mod tests {
         let error = fea_load_csv(
             &[[0.0; 3]],
             &[[0.0, f64::INFINITY, 0.0]],
+            &[1.0],
             &[0.0],
             &provenance,
         )
         .unwrap_err();
         assert!(error.contains("non-finite y traction"));
         assert!(
-            fea_load_csv(&[[0.0; 3]], &[[0.0; 3]], &[f64::NAN], &provenance)
+            fea_load_csv(&[[0.0; 3]], &[[0.0; 3]], &[1.0], &[f64::NAN], &provenance,)
                 .unwrap_err()
                 .contains("non-finite Cp")
         );
@@ -1684,14 +1939,18 @@ mod tests {
     fn fea_export_rejects_invalid_provenance_and_streams_to_writer() {
         let mut provenance = fea_provenance();
         provenance.contract_kind = INTERNAL_FLOW_CONTRACT.into();
-        assert!(fea_load_csv(&[[0.0; 3]], &[[0.0; 3]], &[0.0], &provenance)
-            .unwrap_err()
-            .contains(EXTERNAL_FLOW_CONTRACT));
+        assert!(
+            fea_load_csv(&[[0.0; 3]], &[[0.0; 3]], &[1.0], &[0.0], &provenance)
+                .unwrap_err()
+                .contains(EXTERNAL_FLOW_CONTRACT)
+        );
         provenance = fea_provenance();
         provenance.model_sha256 = "A".repeat(64);
-        assert!(fea_load_csv(&[[0.0; 3]], &[[0.0; 3]], &[0.0], &provenance)
-            .unwrap_err()
-            .contains("canonical lowercase"));
+        assert!(
+            fea_load_csv(&[[0.0; 3]], &[[0.0; 3]], &[1.0], &[0.0], &provenance)
+                .unwrap_err()
+                .contains("canonical lowercase")
+        );
         provenance = fea_provenance();
 
         #[derive(Default)]
@@ -1709,9 +1968,18 @@ mod tests {
 
         let positions = vec![[1.0, 2.0, 3.0]; 4_096];
         let tractions = vec![[4.0, 5.0, 6.0]; positions.len()];
+        let area_weights = vec![1.0; positions.len()];
         let cp = vec![0.7; positions.len()];
         let mut counter = ByteCounter::default();
-        write_fea_load_csv(&mut counter, &positions, &tractions, &cp, &provenance).unwrap();
+        write_fea_load_csv(
+            &mut counter,
+            &positions,
+            &tractions,
+            &area_weights,
+            &cp,
+            &provenance,
+        )
+        .unwrap();
         assert!(counter.0 > positions.len() * 200);
 
         struct FailingWriter;
@@ -1728,6 +1996,7 @@ mod tests {
             &mut FailingWriter,
             &positions[..1],
             &tractions[..1],
+            &area_weights[..1],
             &cp[..1],
             &provenance,
         )
@@ -1742,6 +2011,20 @@ mod tests {
         ];
         let point = solver_point_to_source_m([12.0, 24.0, 36.0], transform, 1e-3).unwrap();
         assert_eq!(point, [0.001, 0.002, 0.003]);
+    }
+
+    #[test]
+    fn solver_vectors_rotate_to_source_without_scaling_magnitude() {
+        // Source +X maps to solver +Y under a +90-degree Z rotation and a
+        // geometry-only scale of two.
+        let transform = [
+            0.0, 2.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 10.0, 20.0, 30.0, 1.0,
+        ];
+        let source = solver_vector_to_source([0.0, 7.0, 0.0], transform).unwrap();
+        assert!((source[0] - 7.0).abs() < 1e-12);
+        assert!(source[1].abs() < 1e-12);
+        assert!(source[2].abs() < 1e-12);
+        assert!(solver_vector_to_source([1.0, 0.0, 0.0], [0.0; 16]).is_err());
     }
 
     #[test]

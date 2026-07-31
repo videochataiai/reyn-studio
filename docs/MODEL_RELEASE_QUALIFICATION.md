@@ -396,7 +396,7 @@ source metadata.
 
 ### Current state
 
-- Studio version is 0.1.0; bundle ID is `com.reyn.studio`; minimum declared macOS is
+- Studio version is 0.1.1; bundle ID is `com.reyn.studio`; minimum declared macOS is
   11.0.
 - Apple silicon/Metal is the exercised product target. Intel compute is not established.
 - Python is not bundled. The local package resolves `REYN_PYTHON`, a research virtual
