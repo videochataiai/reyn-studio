@@ -86,8 +86,7 @@ fn parse_3mf_model_xml(xml: &str) -> Result<ThreeMfImport, String> {
         "foot" => "ft",
         "micron" | "micrometer" => {
             return Err(
-                "3MF micron units are not supported yet; re-export the model in millimetres"
-                    .into(),
+                "3MF micron units are not supported yet; re-export the model in millimetres".into(),
             );
         }
         other => {

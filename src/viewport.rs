@@ -670,12 +670,19 @@ fn draw_markers(
 pub fn draw_axis_triad(painter: &egui::Painter, rect: Rect, cam: &Camera) {
     const SIZE: f32 = 54.0;
     const MARGIN: f32 = 18.0;
-    let origin = Pos2::new(rect.min.x + MARGIN + SIZE * 0.5, rect.max.y - MARGIN - SIZE * 0.5);
+    let origin = Pos2::new(
+        rect.min.x + MARGIN + SIZE * 0.5,
+        rect.max.y - MARGIN - SIZE * 0.5,
+    );
     if !rect.contains(origin) {
         return;
     }
     let pad = Rect::from_center_size(origin, Vec2::splat(SIZE + 16.0));
-    painter.rect_filled(pad, egui::CornerRadius::same(3), Color32::from_rgba_unmultiplied(28, 22, 18, 210));
+    painter.rect_filled(
+        pad,
+        egui::CornerRadius::same(3),
+        Color32::from_rgba_unmultiplied(28, 22, 18, 210),
+    );
     painter.rect_stroke(
         pad,
         egui::CornerRadius::same(3),
@@ -953,87 +960,87 @@ pub fn show(
         });
     }
 
-        let use_model = model_streamlines(
-            opts.streamlines,
-            opts.model_velocity.is_some() && !opts.research_sandbox,
-        );
-        let use_analytic = analytic_streamlines(opts.streamlines, opts.research_sandbox);
-        if opts.gpu {
-            let ppp = ui.ctx().pixels_per_point();
-            let instances: Vec<GpuInstance> = proj
-                .iter()
-                .map(|q| GpuInstance {
-                    pos: q.ndc,
-                    radius_px: q.r_pts * ppp,
-                    weight: q.weight,
-                    color: [
-                        q.base[0] * q.gain,
-                        q.base[1] * q.gain,
-                        q.base[2] * q.gain,
-                        1.0,
-                    ],
-                })
-                .collect();
-            let segments = if use_analytic {
-                streamline_segments(&project, particles, rect, ppp)
-            } else if use_model {
-                if let Some(field) = opts.model_velocity.as_ref() {
-                    model_streamline_segments(&project, field, rect, ppp)
-                } else {
-                    Vec::new()
-                }
+    let use_model = model_streamlines(
+        opts.streamlines,
+        opts.model_velocity.is_some() && !opts.research_sandbox,
+    );
+    let use_analytic = analytic_streamlines(opts.streamlines, opts.research_sandbox);
+    if opts.gpu {
+        let ppp = ui.ctx().pixels_per_point();
+        let instances: Vec<GpuInstance> = proj
+            .iter()
+            .map(|q| GpuInstance {
+                pos: q.ndc,
+                radius_px: q.r_pts * ppp,
+                weight: q.weight,
+                color: [
+                    q.base[0] * q.gain,
+                    q.base[1] * q.gain,
+                    q.base[2] * q.gain,
+                    1.0,
+                ],
+            })
+            .collect();
+        let segments = if use_analytic {
+            streamline_segments(&project, particles, rect, ppp)
+        } else if use_model {
+            if let Some(field) = opts.model_velocity.as_ref() {
+                model_streamline_segments(&project, field, rect, ppp)
             } else {
                 Vec::new()
-            };
-            gpu::add_flow(ui, rect, instances, segments);
+            }
         } else {
-            // CPU fallback: depth-sorted faint halo + bright core (soft glow, no GPU)
-            proj.sort_by(|a, b| {
-                b.depth
-                    .partial_cmp(&a.depth)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for q in &proj {
-                let col = Color32::from_rgba_unmultiplied(
-                    (q.base[0] * 255.0) as u8,
-                    (q.base[1] * 255.0) as u8,
-                    (q.base[2] * 255.0) as u8,
-                    (q.weight.clamp(0.0, 1.0) * 255.0) as u8,
-                );
-                let halo = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), col.a() / 3);
-                p.circle_filled(q.screen, q.r_pts * 2.1, halo);
-                p.circle_filled(q.screen, q.r_pts, col);
-            }
-            if use_analytic {
-                for poly in streamline_polys(&project, particles) {
-                    p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
-                }
-            } else if use_model {
-                if let Some(field) = opts.model_velocity.as_ref() {
-                    for poly in model_streamline_polys(&project, field) {
-                        p.line(poly, Stroke::new(1.2, BRAND.gamma_multiply(0.75)));
-                    }
-                }
-            }
+            Vec::new()
+        };
+        gpu::add_flow(ui, rect, instances, segments);
+    } else {
+        // CPU fallback: depth-sorted faint halo + bright core (soft glow, no GPU)
+        proj.sort_by(|a, b| {
+            b.depth
+                .partial_cmp(&a.depth)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for q in &proj {
+            let col = Color32::from_rgba_unmultiplied(
+                (q.base[0] * 255.0) as u8,
+                (q.base[1] * 255.0) as u8,
+                (q.base[2] * 255.0) as u8,
+                (q.weight.clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let halo = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), col.a() / 3);
+            p.circle_filled(q.screen, q.r_pts * 2.1, halo);
+            p.circle_filled(q.screen, q.r_pts, col);
         }
-
         if use_analytic {
-            p.text(
-                rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
-                egui::Align2::LEFT_TOP,
-                ANALYTIC_STREAMLINE_LABEL,
-                mono_s().resolve(ui.style()),
-                WARN,
-            );
+            for poly in streamline_polys(&project, particles) {
+                p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
+            }
         } else if use_model {
-            p.text(
-                rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
-                egui::Align2::LEFT_TOP,
-                MODEL_STREAMLINE_LABEL,
-                mono_s().resolve(ui.style()),
-                GOLD,
-            );
+            if let Some(field) = opts.model_velocity.as_ref() {
+                for poly in model_streamline_polys(&project, field) {
+                    p.line(poly, Stroke::new(1.2, BRAND.gamma_multiply(0.75)));
+                }
+            }
         }
+    }
+
+    if use_analytic {
+        p.text(
+            rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
+            egui::Align2::LEFT_TOP,
+            ANALYTIC_STREAMLINE_LABEL,
+            mono_s().resolve(ui.style()),
+            WARN,
+        );
+    } else if use_model {
+        p.text(
+            rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
+            egui::Align2::LEFT_TOP,
+            MODEL_STREAMLINE_LABEL,
+            mono_s().resolve(ui.style()),
+            GOLD,
+        );
+    }
 
     // billboarded critical points, projected with this mode's own camera
     draw_markers(ui, rect, cam, opts, Some(&project));
@@ -1042,13 +1049,18 @@ pub fn show(
 
 fn sample_model_velocity(field: &ModelVelocityField, pos: [f32; 3]) -> [f32; 3] {
     let n = field.n.max(2);
-    let to_index = |coordinate: f32| ((coordinate + 1.0) * 0.5 * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
+    let to_index =
+        |coordinate: f32| ((coordinate + 1.0) * 0.5 * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
     let ix = to_index(pos[0]) as usize;
     let iy = to_index(pos[1]) as usize;
     let iz = to_index(pos[2]) as usize;
     let cube = n * n * n;
     let at = |component: usize, x: usize, y: usize, z: usize| {
-        field.vel.get(component * cube + z * n * n + y * n + x).copied().unwrap_or(0.0)
+        field
+            .vel
+            .get(component * cube + z * n * n + y * n + x)
+            .copied()
+            .unwrap_or(0.0)
     };
     [at(0, ix, iy, iz), at(1, ix, iy, iz), at(2, ix, iy, iz)]
 }
@@ -1075,11 +1087,10 @@ fn model_streamline_polys(
         for _ in 0..32 {
             poly.push(project(pos).0);
             let velocity = sample_model_velocity(field, pos);
-            let speed = (velocity[0] * velocity[0]
-                + velocity[1] * velocity[1]
-                + velocity[2] * velocity[2])
-                .sqrt()
-                .max(1e-4);
+            let speed =
+                (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
+                    .sqrt()
+                    .max(1e-4);
             let step = 0.035 / speed;
             for axis in 0..3 {
                 pos[axis] = (pos[axis] + velocity[axis] * step).clamp(-1.0, 1.0);

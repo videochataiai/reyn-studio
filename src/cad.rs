@@ -65,7 +65,9 @@ impl From<GeometryParseError> for String {
     fn from(value: GeometryParseError) -> Self {
         match value {
             GeometryParseError::Message(message) => message,
-            GeometryParseError::ChooseShell(choice) => crate::cad_step::StepParseError::ChooseShell(choice).into(),
+            GeometryParseError::ChooseShell(choice) => {
+                crate::cad_step::StepParseError::ChooseShell(choice).into()
+            }
         }
     }
 }
@@ -110,16 +112,16 @@ pub fn parse_geometry_selecting(
             })
         }
         Some("stp" | "step") => {
-            let imported = match crate::cad_step::parse_step_selecting(bytes, selected_shell_entity_id)
-            {
-                Ok(imported) => imported,
-                Err(crate::cad_step::StepParseError::ChooseShell(choice)) => {
-                    return Err(GeometryParseError::ChooseShell(choice));
-                }
-                Err(crate::cad_step::StepParseError::Message(message)) => {
-                    return Err(GeometryParseError::Message(message));
-                }
-            };
+            let imported =
+                match crate::cad_step::parse_step_selecting(bytes, selected_shell_entity_id) {
+                    Ok(imported) => imported,
+                    Err(crate::cad_step::StepParseError::ChooseShell(choice)) => {
+                        return Err(GeometryParseError::ChooseShell(choice));
+                    }
+                    Err(crate::cad_step::StepParseError::Message(message)) => {
+                        return Err(GeometryParseError::Message(message));
+                    }
+                };
             Ok(GeometryImport {
                 mesh: imported.mesh,
                 format: GeometryFormat::Step,

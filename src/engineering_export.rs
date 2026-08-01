@@ -5,7 +5,9 @@
 //! regenerated and compared without inventing numbers.
 
 use crate::report::{engineering_report_html, ReportInput, REPORT_SCHEMA};
-use crate::signing::{self, PublicKeyRecord, SignedEvidenceArtifact, SigningKeyProvider, SigningLineage};
+use crate::signing::{
+    self, PublicKeyRecord, SignedEvidenceArtifact, SigningKeyProvider, SigningLineage,
+};
 use flate2::{write::ZlibEncoder, Compression};
 use fontdue::{Font, FontSettings};
 use sha2::{Digest, Sha256};
@@ -96,7 +98,9 @@ fn lab_sheet_lines(input: &ReportInput<'_>, html_sha256: &str) -> Result<Vec<She
         .as_ref()
         .ok_or_else(|| "A completed run result is required for a report.".to_string())?;
     let mut lines = Vec::new();
-    lines.push(SheetLine::Title("Reyn Studio · Engineering case report".into()));
+    lines.push(SheetLine::Title(
+        "Reyn Studio · Engineering case report".into(),
+    ));
     lines.push(SheetLine::Muted(format!(
         "{LAB_SHEET_SCHEMA} · app {} · generated {}",
         input.app_version,
@@ -115,12 +119,11 @@ fn lab_sheet_lines(input: &ReportInput<'_>, html_sha256: &str) -> Result<Vec<She
     ));
     lines.push(SheetLine::Kv(
         "Model SHA-256".into(),
-        case.model_sha256.clone().unwrap_or_else(|| "UNKNOWN".into()),
+        case.model_sha256
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".into()),
     ));
-    lines.push(SheetLine::Kv(
-        "HTML digest".into(),
-        html_sha256.to_owned(),
-    ));
+    lines.push(SheetLine::Kv("HTML digest".into(), html_sha256.to_owned()));
     lines.push(SheetLine::Heading("Operating point".into()));
     lines.push(SheetLine::Kv(
         "Velocity".into(),
@@ -164,15 +167,9 @@ fn lab_sheet_lines(input: &ReportInput<'_>, html_sha256: &str) -> Result<Vec<She
     ));
     lines.push(SheetLine::Kv(
         "Cp range".into(),
-        format!(
-            "[{:.4}, {:.4}] · RECOVERED",
-            result.cp_min, result.cp_max
-        ),
+        format!("[{:.4}, {:.4}] · RECOVERED", result.cp_min, result.cp_max),
     ));
-    lines.push(SheetLine::Kv(
-        "Method".into(),
-        result.method.clone(),
-    ));
+    lines.push(SheetLine::Kv("Method".into(), result.method.clone()));
     if !result.warnings.is_empty() {
         lines.push(SheetLine::Heading("Warnings".into()));
         for warning in &result.warnings {

@@ -280,7 +280,6 @@ struct QueuedRunRequest {
     note: String,
 }
 
-
 struct PendingOrientation {
     generation: u64,
     request_id: String,
@@ -439,7 +438,6 @@ fn classify_orientation_result(
     }
 }
 
-
 struct GeometryImportWorkRequest {
     generation: u64,
     request_id: String,
@@ -497,8 +495,7 @@ struct PendingShellChoice {
 
 impl GeometryImportWorker {
     fn spawn(repaint_context: Option<egui::Context>) -> Result<Self, String> {
-        let (request_tx, request_rx) =
-            std::sync::mpsc::channel::<GeometryImportWorkRequest>();
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<GeometryImportWorkRequest>();
         let (result_tx, result_rx) = std::sync::mpsc::channel::<GeometryImportWorkResult>();
         std::thread::Builder::new()
             .name("reyn-geometry-import".into())
@@ -2409,11 +2406,16 @@ impl ReynApp {
     }
 
     fn apply_case_view_state_from_active(&mut self) {
-        let Some(view) = self.cad.as_ref().map(|case| case.workflow.view_state.clone()) else {
+        let Some(view) = self
+            .cad
+            .as_ref()
+            .map(|case| case.workflow.view_state.clone())
+        else {
             return;
         };
         if let Some(name) = view.colormap.as_deref() {
-            if let Ok(map) = serde_json::from_value::<field2d::FieldColormap>(serde_json::json!(name))
+            if let Ok(map) =
+                serde_json::from_value::<field2d::FieldColormap>(serde_json::json!(name))
             {
                 self.settings.colormap = map;
                 field2d::set_view_colormap(map);
@@ -4450,7 +4452,11 @@ impl ReynApp {
                 let mut name = existing.name;
                 let mut role = existing.role;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&candidate_id).text_style(mono_s()).color(TEXT_DIM));
+                    ui.label(
+                        RichText::new(&candidate_id)
+                            .text_style(mono_s())
+                            .color(TEXT_DIM),
+                    );
                     ui.add(
                         egui::TextEdit::singleline(&mut name)
                             .hint_text("Label")
@@ -4472,11 +4478,13 @@ impl ReynApp {
                     .find(|region| region.candidate_id == candidate_id)
                 else {
                     if !name.trim().is_empty() || role != "unassigned" {
-                        case.workflow.named_regions.push(engineering::NamedRegionAssignment {
-                            name,
-                            candidate_id,
-                            role,
-                        });
+                        case.workflow
+                            .named_regions
+                            .push(engineering::NamedRegionAssignment {
+                                name,
+                                candidate_id,
+                                role,
+                            });
                     }
                     continue;
                 };
@@ -4486,10 +4494,7 @@ impl ReynApp {
                     self.case_draft_dirty = true;
                 }
             }
-            if ui
-                .add(egui::Button::new("Clear region labels"))
-                .clicked()
-            {
+            if ui.add(egui::Button::new("Clear region labels")).clicked() {
                 case.workflow.named_regions.clear();
                 self.case_draft_dirty = true;
             }
@@ -12050,7 +12055,10 @@ impl ReynApp {
         }
         self.geometry_import_generation = self.geometry_import_generation.wrapping_add(1).max(1);
         let generation = self.geometry_import_generation;
-        let request_id = format!("geometry-import-{generation}-{}", uuid::Uuid::new_v4().simple());
+        let request_id = format!(
+            "geometry-import-{generation}-{}",
+            uuid::Uuid::new_v4().simple()
+        );
         let request = GeometryImportWorkRequest {
             generation,
             request_id: request_id.clone(),
@@ -12098,10 +12106,13 @@ impl ReynApp {
             .map(|worker| worker.result_rx.try_iter().collect())
             .unwrap_or_default();
         for completed in completed {
-            let is_current = self.geometry_import_pending.as_ref().is_some_and(|pending| {
-                pending.generation == completed.generation
-                    && pending.request_id == completed.request_id
-            });
+            let is_current = self
+                .geometry_import_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.generation == completed.generation
+                        && pending.request_id == completed.request_id
+                });
             if !is_current {
                 continue;
             }
@@ -12269,25 +12280,28 @@ impl ReynApp {
                     .max_by_key(|card| card.grid)
             })
             .cloned();
-        let (model, model_sha256, model_max_steps, model_support, model_warning) =
-            if let Some(model_card) = model_card.filter(|card| card.grid as usize == vm.n) {
-                (
-                    model_card.id,
-                    Some(model_card.checkpoint_sha256),
-                    model_card.max_steps,
-                    engineering::ModelSupport {
-                        status: model_card.status,
-                        dimension: model_card.dimension,
-                        grid: model_card.grid,
-                        input_channels: model_card.in_channels,
-                        output_channels: model_card.out_channels,
-                        scenario: model_card.scenario,
-                        physics_contract: model_card.physics_contract,
-                    },
-                    None,
-                )
-            } else {
-                (
+        let (model, model_sha256, model_max_steps, model_support, model_warning) = if let Some(
+            model_card,
+        ) =
+            model_card.filter(|card| card.grid as usize == vm.n)
+        {
+            (
+                model_card.id,
+                Some(model_card.checkpoint_sha256),
+                model_card.max_steps,
+                engineering::ModelSupport {
+                    status: model_card.status,
+                    dimension: model_card.dimension,
+                    grid: model_card.grid,
+                    input_channels: model_card.in_channels,
+                    output_channels: model_card.out_channels,
+                    scenario: model_card.scenario,
+                    physics_contract: model_card.physics_contract,
+                },
+                None,
+            )
+        } else {
+            (
                     String::new(),
                     None,
                     0,
@@ -12300,38 +12314,38 @@ impl ReynApp {
                         vm.n
                     )),
                 )
-            };
-            let mask = std::sync::Arc::new(vm.mask);
-            let source_revision_id = format!("source-{}", uuid::Uuid::new_v4());
-            let case_id = self
-                .cad
-                .as_ref()
-                .map(|case| case.workflow.case_id.clone())
-                .unwrap_or_else(|| format!("case-{}", uuid::Uuid::new_v4()));
-            let case_revision_id = format!("case-revision-{}", uuid::Uuid::new_v4());
-            let parent_source_revision_id = self
-                .cad
-                .as_ref()
-                .and_then(|case| case.workflow.source_revision_id.clone());
-            let parent_case_revision_id = self
-                .cad
-                .as_ref()
-                .and_then(|case| case.workflow.case_revision_id.clone());
-            let source_revision_number = parent_source_revision_id
-                .as_ref()
-                .and_then(|parent| {
-                    self.project
-                        .manifest()
-                        .source_revisions()
-                        .iter()
-                        .find(|source| source.source_revision_id == *parent)
-                        .map(|source| source.revision + 1)
-                })
-                .unwrap_or(1);
-            let mut warnings = model_warning.into_iter().collect::<Vec<_>>();
-            warnings.extend(imported.warnings.clone());
-            if imported.format == cad::GeometryFormat::Step {
-                warnings.push(format!(
+        };
+        let mask = std::sync::Arc::new(vm.mask);
+        let source_revision_id = format!("source-{}", uuid::Uuid::new_v4());
+        let case_id = self
+            .cad
+            .as_ref()
+            .map(|case| case.workflow.case_id.clone())
+            .unwrap_or_else(|| format!("case-{}", uuid::Uuid::new_v4()));
+        let case_revision_id = format!("case-revision-{}", uuid::Uuid::new_v4());
+        let parent_source_revision_id = self
+            .cad
+            .as_ref()
+            .and_then(|case| case.workflow.source_revision_id.clone());
+        let parent_case_revision_id = self
+            .cad
+            .as_ref()
+            .and_then(|case| case.workflow.case_revision_id.clone());
+        let source_revision_number = parent_source_revision_id
+            .as_ref()
+            .and_then(|parent| {
+                self.project
+                    .manifest()
+                    .source_revisions()
+                    .iter()
+                    .find(|source| source.source_revision_id == *parent)
+                    .map(|source| source.revision + 1)
+            })
+            .unwrap_or(1);
+        let mut warnings = model_warning.into_iter().collect::<Vec<_>>();
+        warnings.extend(imported.warnings.clone());
+        if imported.format == cad::GeometryFormat::Step {
+            warnings.push(format!(
                     "STEP TESSELLATION · {} {} · relative chord tolerance {:.6} (absolute {:.6} source units) · face-boundary weld tolerance {:.6} relative · {} B-rep shell(s). The original STEP bytes remain authoritative.",
                     imported.translator,
                     imported.translator_version,
@@ -12342,270 +12356,267 @@ impl ReynApp {
                     imported.vertex_weld_relative_tolerance.unwrap_or_default(),
                     imported.source_shells,
                 ));
-            }
-            if mesh_diagnostics.inconsistent_winding_edges > 0 {
-                warnings.push(format!(
-                    "{} edges have inconsistent winding.",
-                    mesh_diagnostics.inconsistent_winding_edges
-                ));
-            }
-            if mesh_diagnostics.self_intersection_pairs > 0 {
-                warnings.push(format!(
-                    "{} non-adjacent triangle pairs intersect.",
-                    mesh_diagnostics.self_intersection_pairs
-                ));
-            }
-            if mesh_diagnostics.signed_volume < 0.0 {
-                warnings.push(format!(
+        }
+        if mesh_diagnostics.inconsistent_winding_edges > 0 {
+            warnings.push(format!(
+                "{} edges have inconsistent winding.",
+                mesh_diagnostics.inconsistent_winding_edges
+            ));
+        }
+        if mesh_diagnostics.self_intersection_pairs > 0 {
+            warnings.push(format!(
+                "{} non-adjacent triangle pairs intersect.",
+                mesh_diagnostics.self_intersection_pairs
+            ));
+        }
+        if mesh_diagnostics.signed_volume < 0.0 {
+            warnings.push(format!(
                     "The derived {} triangle winding is inward. The value is recorded; current diffuse-interface loads derive normals from the occupancy mask and are not sign-flipped by source winding.",
                     imported.format.label()
                 ));
-            }
-            if mesh_diagnostics.components > 1 {
+        }
+        if mesh_diagnostics.components > 1 {
+            warnings.push(format!(
+                "{} disconnected {} components detected.",
+                mesh_diagnostics.components,
+                imported.format.label(),
+            ));
+        }
+        if let Some(previous) = &self.cad {
+            let prior = &previous.workflow.preflight;
+            if prior.source_sha256 != source_sha256 {
                 warnings.push(format!(
-                    "{} disconnected {} components detected.",
-                    mesh_diagnostics.components,
-                    imported.format.label(),
+                    "REIMPORT CHANGE · source SHA-256 {} → {}.",
+                    short_hash(&prior.source_sha256),
+                    short_hash(&source_sha256)
                 ));
             }
-            if let Some(previous) = &self.cad {
-                let prior = &previous.workflow.preflight;
-                if prior.source_sha256 != source_sha256 {
-                    warnings.push(format!(
-                        "REIMPORT CHANGE · source SHA-256 {} → {}.",
-                        short_hash(&prior.source_sha256),
-                        short_hash(&source_sha256)
-                    ));
-                }
-                if prior.triangles != mesh_diagnostics.triangles {
-                    warnings.push(format!(
-                        "REIMPORT CHANGE · triangle count {} → {}.",
-                        prior.triangles, mesh_diagnostics.triangles
-                    ));
-                }
-                let next_extents = mesh_diagnostics.extents.map(f64::from);
-                if prior.source_extents != next_extents {
-                    warnings.push(format!(
+            if prior.triangles != mesh_diagnostics.triangles {
+                warnings.push(format!(
+                    "REIMPORT CHANGE · triangle count {} → {}.",
+                    prior.triangles, mesh_diagnostics.triangles
+                ));
+            }
+            let next_extents = mesh_diagnostics.extents.map(f64::from);
+            if prior.source_extents != next_extents {
+                warnings.push(format!(
                         "REIMPORT CHANGE · source extents {:?} → {:?}; stable face-region identity is not preserved by the current {} import path.",
                         prior.source_extents,
                         next_extents,
                         imported.format.label(),
                     ));
-                }
-                if prior.boundary_edges != mesh_diagnostics.boundary_edges
-                    || prior.non_manifold_edges != mesh_diagnostics.non_manifold_edges
-                    || prior.degenerate_triangles != mesh_diagnostics.degenerate_triangles
-                {
-                    warnings.push(format!(
-                        "REIMPORT CHANGE · defects open/non-manifold/degenerate {}·{}·{} → {}·{}·{}.",
-                        prior.boundary_edges,
-                        prior.non_manifold_edges,
-                        prior.degenerate_triangles,
-                        mesh_diagnostics.boundary_edges,
-                        mesh_diagnostics.non_manifold_edges,
-                        mesh_diagnostics.degenerate_triangles
-                    ));
-                }
             }
-            let preflight = engineering::GeometryPreflight {
-                source_sha256: source_sha256.clone(),
-                source_bytes: bytes.len() as u64,
-                source_format: match imported.format {
-                    cad::GeometryFormat::Stl => "stl",
-                    cad::GeometryFormat::Step => "step",
-                    cad::GeometryFormat::ThreeMf => "3mf",
+            if prior.boundary_edges != mesh_diagnostics.boundary_edges
+                || prior.non_manifold_edges != mesh_diagnostics.non_manifold_edges
+                || prior.degenerate_triangles != mesh_diagnostics.degenerate_triangles
+            {
+                warnings.push(format!(
+                    "REIMPORT CHANGE · defects open/non-manifold/degenerate {}·{}·{} → {}·{}·{}.",
+                    prior.boundary_edges,
+                    prior.non_manifold_edges,
+                    prior.degenerate_triangles,
+                    mesh_diagnostics.boundary_edges,
+                    mesh_diagnostics.non_manifold_edges,
+                    mesh_diagnostics.degenerate_triangles
+                ));
+            }
+        }
+        let preflight = engineering::GeometryPreflight {
+            source_sha256: source_sha256.clone(),
+            source_bytes: bytes.len() as u64,
+            source_format: match imported.format {
+                cad::GeometryFormat::Stl => "stl",
+                cad::GeometryFormat::Step => "step",
+                cad::GeometryFormat::ThreeMf => "3mf",
+            }
+            .into(),
+            source_declared_units: imported.declared_unit.clone(),
+            geometry_translator: imported.translator.clone(),
+            geometry_translator_version: imported.translator_version.clone(),
+            tessellation_tolerance_source_units: imported.tessellation_tolerance_source_units,
+            vertex_weld_relative_tolerance: imported.vertex_weld_relative_tolerance,
+            source_shells: imported.source_shells,
+            triangles: mesh_diagnostics.triangles,
+            components: mesh_diagnostics.components,
+            degenerate_triangles: mesh_diagnostics.degenerate_triangles,
+            boundary_edges: mesh_diagnostics.boundary_edges,
+            non_manifold_edges: mesh_diagnostics.non_manifold_edges,
+            inconsistent_winding_edges: mesh_diagnostics.inconsistent_winding_edges,
+            self_intersection_pairs: mesh_diagnostics.self_intersection_pairs,
+            source_signed_volume: mesh_diagnostics.signed_volume,
+            source_extents: mesh_diagnostics.extents.map(f64::from),
+            proposed_scale: vm.scale,
+            solver_characteristic_length: vm.char_len as f64,
+            angle_of_attack_deg: 0.0,
+            yaw_deg: 0.0,
+            roll_deg: 0.0,
+            transform_4x4: vm.transform_4x4,
+            target_grid: vm.n,
+            solid_voxels: vm.solid_voxels,
+            voxel_components: vm.components,
+            minimum_cells_across: vm.minimum_cells_across,
+            boundary_clearance_cells: vm.boundary_clearance_cells,
+            voxel_axis_disagreement_fraction: vm.axis_disagreement_fraction,
+            voxel_odd_crossing_rows: vm.odd_crossing_rows,
+            voxel_classification_version: vm.classification_version,
+            warnings: warnings.clone(),
+            waivers: Vec::new(),
+            transform_approved: false,
+        };
+        let reference_length = mesh_diagnostics.extents[1]
+            .max(mesh_diagnostics.extents[2])
+            .max(1e-6) as f64;
+        let declared_length_unit = match imported.declared_unit.as_deref() {
+            Some("mm") => engineering::LengthUnit::Millimeter,
+            Some("cm") => engineering::LengthUnit::Centimeter,
+            Some("m") => engineering::LengthUnit::Meter,
+            Some("in") => engineering::LengthUnit::Inch,
+            Some("ft") => engineering::LengthUnit::Foot,
+            _ => engineering::LengthUnit::Unknown,
+        };
+        let workflow = engineering::ExternalFlowCase {
+            stage: engineering::CaseStage::Preflight,
+            case_id: case_id.clone(),
+            name: path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Geometry")
+                .to_string(),
+            source_name: name.clone(),
+            source_revision_id: Some(source_revision_id.clone()),
+            case_revision_id: Some(case_revision_id.clone()),
+            model_id: model.clone(),
+            model_sha256,
+            model_max_steps,
+            model_support,
+            preflight,
+            operating: engineering::OperatingPoint {
+                // STEP declarations prefill this control but do not
+                // approve the transform; the operator must still
+                // confirm it through the existing hard gate.
+                length_unit: declared_length_unit,
+                reference_length,
+                // Settings › Workflow default, clamped to the model.
+                horizon_steps: self
+                    .settings
+                    .default_horizon_steps
+                    .clamp(1, model_max_steps.max(1)),
+                ..Default::default()
+            },
+            result: None,
+            parent_run_id: self
+                .cad
+                .as_ref()
+                .and_then(|case| case.active_run_id.clone()),
+            named_regions: Vec::new(),
+            view_state: Default::default(),
+        };
+        if let Err(error) = self.add_project_content(
+            "Importing a geometry revision",
+            bytes.clone(),
+            imported.format.media_type(),
+            &source_sha256,
+        ) {
+            self.project_notice = Some((format!("Geometry content was not stored: {error}"), true));
+            return;
+        }
+        let source = project::SourceRevision {
+            source_revision_id: source_revision_id.clone(),
+            source_kind: project::SourceKind::Geometry,
+            revision: source_revision_number,
+            imported_utc_unix: now_utc_unix(),
+            uri_hint: Some(path.display().to_string()),
+            byte_size: bytes.len() as u64,
+            content_sha256: source_sha256,
+            declared_units: imported.declared_unit.clone(),
+            frame: Some("source frame; preprocessing transform pending approval".into()),
+            transform_4x4: vm.transform_4x4,
+            parent_revision_id: parent_source_revision_id,
+            warnings,
+        };
+        let revision = project::CaseRevision {
+            case_revision_id: case_revision_id.clone(),
+            parent_revision_id: parent_case_revision_id,
+            created_utc_unix: now_utc_unix(),
+            source_revision_ids: vec![source_revision_id],
+            contract: workflow.exact_contract(),
+            discretization: serde_json::json!({
+                "grid": [vm.n, vm.n, vm.n],
+                "solid_voxels": vm.solid_voxels,
+                "minimum_cells_across": vm.minimum_cells_across,
+                "boundary_clearance_cells": vm.boundary_clearance_cells,
+                "axis_disagreement_fraction": vm.axis_disagreement_fraction,
+                "odd_crossing_rows_xyz": vm.odd_crossing_rows,
+                "classification_version": vm.classification_version,
+                "transform_4x4": vm.transform_4x4,
+            }),
+            outputs: serde_json::json!({
+                "velocity": "model_prediction",
+                "pressure": "recovered",
+                "surface_loads": engineering::SURFACE_LOAD_METHOD,
+            }),
+        };
+        let existing_case = self
+            .project
+            .manifest()
+            .cases()
+            .iter()
+            .any(|case| case.case_id() == case_id);
+        let persist_result = self.transact_project(
+            "Importing a geometry revision",
+            now_utc_unix(),
+            |manifest| {
+                manifest.add_source_revision(source, now_utc_unix())?;
+                if existing_case {
+                    manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
+                } else {
+                    manifest.create_case(
+                        case_id.clone(),
+                        workflow.name.clone(),
+                        revision,
+                        now_utc_unix(),
+                    )?;
                 }
-                .into(),
-                source_declared_units: imported.declared_unit.clone(),
-                geometry_translator: imported.translator.clone(),
-                geometry_translator_version: imported.translator_version.clone(),
-                tessellation_tolerance_source_units: imported
-                    .tessellation_tolerance_source_units,
-                vertex_weld_relative_tolerance: imported.vertex_weld_relative_tolerance,
-                source_shells: imported.source_shells,
-                triangles: mesh_diagnostics.triangles,
-                components: mesh_diagnostics.components,
-                degenerate_triangles: mesh_diagnostics.degenerate_triangles,
-                boundary_edges: mesh_diagnostics.boundary_edges,
-                non_manifold_edges: mesh_diagnostics.non_manifold_edges,
-                inconsistent_winding_edges: mesh_diagnostics.inconsistent_winding_edges,
-                self_intersection_pairs: mesh_diagnostics.self_intersection_pairs,
-                source_signed_volume: mesh_diagnostics.signed_volume,
-                source_extents: mesh_diagnostics.extents.map(f64::from),
-                proposed_scale: vm.scale,
-                solver_characteristic_length: vm.char_len as f64,
-                angle_of_attack_deg: 0.0,
-                yaw_deg: 0.0,
-                roll_deg: 0.0,
-                transform_4x4: vm.transform_4x4,
-                target_grid: vm.n,
-                solid_voxels: vm.solid_voxels,
-                voxel_components: vm.components,
-                minimum_cells_across: vm.minimum_cells_across,
-                boundary_clearance_cells: vm.boundary_clearance_cells,
-                voxel_axis_disagreement_fraction: vm.axis_disagreement_fraction,
-                voxel_odd_crossing_rows: vm.odd_crossing_rows,
-                voxel_classification_version: vm.classification_version,
-                warnings: warnings.clone(),
-                waivers: Vec::new(),
-                transform_approved: false,
-            };
-            let reference_length = mesh_diagnostics.extents[1]
-                .max(mesh_diagnostics.extents[2])
-                .max(1e-6) as f64;
-            let declared_length_unit = match imported.declared_unit.as_deref() {
-                Some("mm") => engineering::LengthUnit::Millimeter,
-                Some("cm") => engineering::LengthUnit::Centimeter,
-                Some("m") => engineering::LengthUnit::Meter,
-                Some("in") => engineering::LengthUnit::Inch,
-                Some("ft") => engineering::LengthUnit::Foot,
-                _ => engineering::LengthUnit::Unknown,
-            };
-            let workflow = engineering::ExternalFlowCase {
-                stage: engineering::CaseStage::Preflight,
-                case_id: case_id.clone(),
-                name: path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("Geometry")
-                    .to_string(),
-                source_name: name.clone(),
-                source_revision_id: Some(source_revision_id.clone()),
-                case_revision_id: Some(case_revision_id.clone()),
-                model_id: model.clone(),
-                model_sha256,
-                model_max_steps,
-                model_support,
-                preflight,
-                operating: engineering::OperatingPoint {
-                    // STEP declarations prefill this control but do not
-                    // approve the transform; the operator must still
-                    // confirm it through the existing hard gate.
-                    length_unit: declared_length_unit,
-                    reference_length,
-                    // Settings › Workflow default, clamped to the model.
-                    horizon_steps: self
-                        .settings
-                        .default_horizon_steps
-                        .clamp(1, model_max_steps.max(1)),
-                    ..Default::default()
-                },
-                result: None,
-                parent_run_id: self
-                    .cad
-                    .as_ref()
-                    .and_then(|case| case.active_run_id.clone()),
-                named_regions: Vec::new(),
-                view_state: Default::default(),
-            };
-            if let Err(error) = self.add_project_content(
-                "Importing a geometry revision",
-                bytes.clone(),
-                imported.format.media_type(),
-                &source_sha256,
-            ) {
-                self.project_notice =
-                    Some((format!("Geometry content was not stored: {error}"), true));
-                return;
-            }
-            let source = project::SourceRevision {
-                source_revision_id: source_revision_id.clone(),
-                source_kind: project::SourceKind::Geometry,
-                revision: source_revision_number,
-                imported_utc_unix: now_utc_unix(),
-                uri_hint: Some(path.display().to_string()),
-                byte_size: bytes.len() as u64,
-                content_sha256: source_sha256,
-                declared_units: imported.declared_unit.clone(),
-                frame: Some("source frame; preprocessing transform pending approval".into()),
-                transform_4x4: vm.transform_4x4,
-                parent_revision_id: parent_source_revision_id,
-                warnings,
-            };
-            let revision = project::CaseRevision {
-                case_revision_id: case_revision_id.clone(),
-                parent_revision_id: parent_case_revision_id,
-                created_utc_unix: now_utc_unix(),
-                source_revision_ids: vec![source_revision_id],
-                contract: workflow.exact_contract(),
-                discretization: serde_json::json!({
-                    "grid": [vm.n, vm.n, vm.n],
-                    "solid_voxels": vm.solid_voxels,
-                    "minimum_cells_across": vm.minimum_cells_across,
-                    "boundary_clearance_cells": vm.boundary_clearance_cells,
-                    "axis_disagreement_fraction": vm.axis_disagreement_fraction,
-                    "odd_crossing_rows_xyz": vm.odd_crossing_rows,
-                    "classification_version": vm.classification_version,
-                    "transform_4x4": vm.transform_4x4,
-                }),
-                outputs: serde_json::json!({
-                    "velocity": "model_prediction",
-                    "pressure": "recovered",
-                    "surface_loads": engineering::SURFACE_LOAD_METHOD,
-                }),
-            };
-            let existing_case = self
-                .project
-                .manifest()
-                .cases()
-                .iter()
-                .any(|case| case.case_id() == case_id);
-            let persist_result = self.transact_project(
-                "Importing a geometry revision",
-                now_utc_unix(),
-                |manifest| {
-                    manifest.add_source_revision(source, now_utc_unix())?;
-                    if existing_case {
-                        manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
-                    } else {
-                        manifest.create_case(
-                            case_id.clone(),
-                            workflow.name.clone(),
-                            revision,
-                            now_utc_unix(),
-                        )?;
-                    }
-                    Ok(())
-                },
-            );
-            if let Err(error) = persist_result {
-                self.project_notice =
-                    Some((format!("Case revision was not recorded: {error}"), true));
-                return;
-            }
-            self.dependencies_dirty = true;
-            self.invalidate_cad_section();
-            self.cad = Some(CadCase {
-                mask: mask.clone(),
-                mask_bounds: cad::mask_bounds(mask.as_ref(), vm.n),
-                model: model.clone(),
-                steps: workflow.operating.horizon_steps,
-                surf: None,
-                surf_mask_source: None,
-                name: name.clone(),
-                workflow,
-                velocity: Vec::new(),
-                pressure: Vec::new(),
-                cp: Vec::new(),
-                traction: Vec::new(),
-                result_grid: 0,
-                dt_frame: 0.0,
-                active_run_id: None,
-                pending: false,
-                pending_request_id: None,
-                pending_run: None,
-                playback: HorizonPlayback::default(),
-            });
-            self.case_draft_dirty = false;
-            self.orientation_draft = None;
-            self.orientation_pending = None;
-            self.rebase_case_draft_history();
-            self.nav = Nav::Case;
-            self.engine_status = format!(
-                "● {name}: {} triangles → {} solid voxels @ {}³ · preflight required",
-                mesh_diagnostics.triangles, vm.solid_voxels, vm.n
-            );
-            self.project_notice = Some((
+                Ok(())
+            },
+        );
+        if let Err(error) = persist_result {
+            self.project_notice = Some((format!("Case revision was not recorded: {error}"), true));
+            return;
+        }
+        self.dependencies_dirty = true;
+        self.invalidate_cad_section();
+        self.cad = Some(CadCase {
+            mask: mask.clone(),
+            mask_bounds: cad::mask_bounds(mask.as_ref(), vm.n),
+            model: model.clone(),
+            steps: workflow.operating.horizon_steps,
+            surf: None,
+            surf_mask_source: None,
+            name: name.clone(),
+            workflow,
+            velocity: Vec::new(),
+            pressure: Vec::new(),
+            cp: Vec::new(),
+            traction: Vec::new(),
+            result_grid: 0,
+            dt_frame: 0.0,
+            active_run_id: None,
+            pending: false,
+            pending_request_id: None,
+            pending_run: None,
+            playback: HorizonPlayback::default(),
+        });
+        self.case_draft_dirty = false;
+        self.orientation_draft = None;
+        self.orientation_pending = None;
+        self.rebase_case_draft_history();
+        self.nav = Nav::Case;
+        self.engine_status = format!(
+            "● {name}: {} triangles → {} solid voxels @ {}³ · preflight required",
+            mesh_diagnostics.triangles, vm.solid_voxels, vm.n
+        );
+        self.project_notice = Some((
                 "Geometry revision stored. Confirm units, transform, preflight, and operating point before execution."
                     .into(),
                 false,
@@ -13026,17 +13037,13 @@ impl ReynApp {
                                 case.workflow.view_state.colormap = Some(
                                     serde_json::to_value(self.settings.colormap)
                                         .ok()
-                                        .and_then(|value| {
-                                            value.as_str().map(str::to_owned)
-                                        })
+                                        .and_then(|value| value.as_str().map(str::to_owned))
                                         .unwrap_or_else(|| format!("{:?}", self.settings.colormap)),
                                 );
                                 case.workflow.view_state.cp_range_mode = Some(
                                     serde_json::to_value(self.settings.cp_range_mode)
                                         .ok()
-                                        .and_then(|value| {
-                                            value.as_str().map(str::to_owned)
-                                        })
+                                        .and_then(|value| value.as_str().map(str::to_owned))
                                         .unwrap_or_else(|| {
                                             format!("{:?}", self.settings.cp_range_mode)
                                         }),
@@ -18093,7 +18100,9 @@ fn spawn_screenshot_write(
                     let cropped = image.region(&rect, Some(pixels_per_point));
                     color_image_png_bytes_with_footer(&cropped, 0, &provenance.footer_lines)
                 }
-                None => color_image_png_bytes_with_footer(image.as_ref(), 0, &provenance.footer_lines),
+                None => {
+                    color_image_png_bytes_with_footer(image.as_ref(), 0, &provenance.footer_lines)
+                }
             }
             .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
             let _ = result_tx.send(ScreenshotWriteResult { kind, path, result });
@@ -18172,50 +18181,126 @@ fn stamp_footer_text(
     // Compact 5×7 glyphs for the provenance digits/letters we actually emit.
     fn glyph(ch: char) -> Option<[u8; 7]> {
         Some(match ch {
-            '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-            '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-            '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-            '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
-            '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-            '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-            '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-            '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-            '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-            '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+            '0' => [
+                0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+            ],
+            '1' => [
+                0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+            ],
+            '2' => [
+                0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+            ],
+            '3' => [
+                0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110,
+            ],
+            '4' => [
+                0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+            ],
+            '5' => [
+                0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+            ],
+            '6' => [
+                0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+            ],
+            '7' => [
+                0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+            ],
+            '8' => [
+                0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+            ],
+            '9' => [
+                0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+            ],
             'a'..='z' => return glyph(ch.to_ascii_uppercase()),
-            'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-            'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-            'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-            'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-            'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-            'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-            'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
-            'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-            'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-            'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
-            'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-            'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-            'M' => [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001],
-            'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-            'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-            'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-            'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-            'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-            'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-            'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-            'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-            'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-            'W' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b11011, 0b10001],
-            'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-            'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-            'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+            'A' => [
+                0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'B' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+            ],
+            'C' => [
+                0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+            ],
+            'D' => [
+                0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+            ],
+            'E' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+            ],
+            'F' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'G' => [
+                0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+            ],
+            'H' => [
+                0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'I' => [
+                0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+            ],
+            'J' => [
+                0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100,
+            ],
+            'K' => [
+                0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+            ],
+            'L' => [
+                0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+            ],
+            'M' => [
+                0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001,
+            ],
+            'N' => [
+                0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+            ],
+            'O' => [
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'P' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'Q' => [
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+            ],
+            'R' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+            ],
+            'S' => [
+                0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+            ],
+            'T' => [
+                0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            ],
+            'U' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'V' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+            ],
+            'W' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b11011, 0b10001,
+            ],
+            'X' => [
+                0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+            ],
+            'Y' => [
+                0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+            ],
+            'Z' => [
+                0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+            ],
             ' ' => [0; 7],
             '.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
             '-' => [0, 0, 0, 0b01110, 0, 0, 0],
             ':' => [0, 0b00100, 0, 0, 0b00100, 0, 0],
             '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0],
-            '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
-            ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
+            '[' => [
+                0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,
+            ],
+            ']' => [
+                0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110,
+            ],
             '·' | '•' => [0, 0, 0b00100, 0, 0, 0, 0],
             _ => return None,
         })
@@ -18293,10 +18378,7 @@ fn draw_section_cp_profile(
         );
         return;
     }
-    let mut lo = series
-        .iter()
-        .map(|(_, v)| *v)
-        .fold(f32::INFINITY, f32::min);
+    let mut lo = series.iter().map(|(_, v)| *v).fold(f32::INFINITY, f32::min);
     let mut hi = series
         .iter()
         .map(|(_, v)| *v)
