@@ -123,16 +123,18 @@ pub enum NavScheme {
     Reyn,
     SolidWorks,
     Fusion,
+    ParaView,
 }
 
 impl NavScheme {
-    pub const ALL: [Self; 3] = [Self::Reyn, Self::SolidWorks, Self::Fusion];
+    pub const ALL: [Self; 4] = [Self::Reyn, Self::SolidWorks, Self::Fusion, Self::ParaView];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Reyn => "Reyn default",
             Self::SolidWorks => "SolidWorks-style",
             Self::Fusion => "Fusion-style",
+            Self::ParaView => "ParaView-style",
         }
     }
 
@@ -155,6 +157,11 @@ impl NavScheme {
                 ("Pan", "Middle-drag"),
                 ("Zoom", "Scroll (toward the cursor)"),
             ],
+            Self::ParaView => [
+                ("Orbit", "Left-drag"),
+                ("Pan", "Middle-drag"),
+                ("Zoom", "Right-drag, or scroll"),
+            ],
         }
     }
 
@@ -168,6 +175,9 @@ impl NavScheme {
             }
             Self::Fusion => {
                 "Fusion 360 pans with the middle button and orbits with ⇧ + middle."
+            }
+            Self::ParaView => {
+                "ParaView orbits with the left button, pans with the middle button, and zooms with right-drag or scroll."
             }
         }
     }
@@ -206,6 +216,15 @@ fn gesture_for(scheme: NavScheme, primary: bool, middle: bool, shift: bool, ctrl
                 Gesture::Orbit
             } else if middle || (primary && shift) {
                 Gesture::Pan
+            } else {
+                Gesture::None
+            }
+        }
+        NavScheme::ParaView => {
+            if middle {
+                Gesture::Pan
+            } else if primary {
+                Gesture::Orbit
             } else {
                 Gesture::None
             }
@@ -489,6 +508,9 @@ pub struct ViewOpts {
     /// True only on the research-sandbox screens. The analytic streamline
     /// overlay is quarantined behind this flag (see [`analytic_streamlines`]).
     pub research_sandbox: bool,
+    /// Model velocity for engineering streamlines. When present and
+    /// `streamlines` is on, ribbons advect this field instead of the ABC demo.
+    pub model_velocity: Option<ModelVelocityField>,
 }
 
 /// HAZARD GATE. [`streamline_polys`] advects an **analytic ABC demo field**,
@@ -498,15 +520,31 @@ pub struct ViewOpts {
 /// state, every rendered quantity traceable to a source), so they are hard
 /// quarantined to the research sandbox and labeled there.
 ///
-/// Driving the overlay from real model velocity is the only way to un-gate it;
-/// until that exists this function must keep returning false off-sandbox.
+/// [`model_streamline_polys`] is the honest engineering path: it interpolates
+/// the stored model velocity field and must be labeled MODEL.
 pub fn analytic_streamlines(streamlines_on: bool, research_sandbox: bool) -> bool {
     streamlines_on && research_sandbox
+}
+
+/// Engineering-path gate: streamlines only when a model velocity volume is present.
+pub fn model_streamlines(streamlines_on: bool, has_model_velocity: bool) -> bool {
+    streamlines_on && has_model_velocity
 }
 
 /// The label the sandbox paints whenever the analytic overlay is live.
 pub const ANALYTIC_STREAMLINE_LABEL: &str =
     "ANALYTIC DEMO FIELD · not model velocity · research sandbox only";
+
+/// Label for model-field streamlines in the engineering viewport.
+pub const MODEL_STREAMLINE_LABEL: &str = "MODEL · streamlines from predicted velocity";
+
+/// Dense velocity volume for engineering streamlines: `vel` is `[3,N,N,N]` in
+/// domain coordinates, same layout as `engine::CadField.vel`.
+#[derive(Clone)]
+pub struct ModelVelocityField {
+    pub n: usize,
+    pub vel: std::sync::Arc<[f32]>,
+}
 
 /// A billboarded critical-point annotation: fixed screen-size ring + value chip
 /// at a 3D domain position (the 3D counterpart of the 2D Field Insights).
@@ -621,6 +659,67 @@ fn draw_markers(
         }
         insight_marker(&p, rect, screen, m.color, &m.text, &mut chips);
     }
+}
+
+/// Screen-space axis triad in the lower-left of the viewport well.
+///
+/// World axes are +X (free stream / ember), +Y (side / blue), +Z (up / green),
+/// matching the solver frame and the View menu station labels. Drawn as a
+/// compact instrument overlay so it shares the camera-chip vocabulary rather
+/// than introducing a second chrome language.
+pub fn draw_axis_triad(painter: &egui::Painter, rect: Rect, cam: &Camera) {
+    const SIZE: f32 = 54.0;
+    const MARGIN: f32 = 18.0;
+    let origin = Pos2::new(rect.min.x + MARGIN + SIZE * 0.5, rect.max.y - MARGIN - SIZE * 0.5);
+    if !rect.contains(origin) {
+        return;
+    }
+    let pad = Rect::from_center_size(origin, Vec2::splat(SIZE + 16.0));
+    painter.rect_filled(pad, egui::CornerRadius::same(3), Color32::from_rgba_unmultiplied(28, 22, 18, 210));
+    painter.rect_stroke(
+        pad,
+        egui::CornerRadius::same(3),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(90, 72, 60, 180)),
+        egui::StrokeKind::Inside,
+    );
+
+    let (_, right, up) = cam.basis();
+    // Project world axes into the view plane (ignore depth — this is a compass,
+    // not a perspective gizmo). Flip Y because screen Y grows downward.
+    let project_axis = |world: [f32; 3]| -> Vec2 {
+        let x = world[0] * right[0] + world[1] * right[1] + world[2] * right[2];
+        let y = world[0] * up[0] + world[1] * up[1] + world[2] * up[2];
+        Vec2::new(x, -y)
+    };
+    let axes = [
+        ([1.0, 0.0, 0.0], Color32::from_rgb(214, 98, 42), "X"), // stream
+        ([0.0, 1.0, 0.0], Color32::from_rgb(72, 132, 188), "Y"),
+        ([0.0, 0.0, 1.0], Color32::from_rgb(72, 148, 96), "Z"),
+    ];
+    let tip_len = SIZE * 0.42;
+    // Draw shorter axes first so the longest (most foreshortened last) sits on top.
+    let mut order: Vec<(usize, f32)> = axes
+        .iter()
+        .enumerate()
+        .map(|(i, (w, _, _))| (i, project_axis(*w).length()))
+        .collect();
+    order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, _) in order {
+        let (world, color, label) = axes[i];
+        let dir = project_axis(world);
+        let len = dir.length().max(1e-4);
+        let tip = origin + dir * (tip_len / len);
+        painter.line_segment([origin, tip], Stroke::new(2.0, color));
+        painter.circle_filled(tip, 2.2, color);
+        painter.text(
+            tip + dir * (8.0 / len),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::monospace(10.0),
+            color,
+        );
+    }
+    painter.circle_filled(origin, 2.5, Color32::from_rgb(230, 214, 200));
 }
 
 /// blue (neg) -> dark -> ember -> gold (pos), returned as linear-ish rgb 0..1.
@@ -854,68 +953,168 @@ pub fn show(
         });
     }
 
-    if opts.gpu {
-        let ppp = ui.ctx().pixels_per_point();
-        let instances: Vec<GpuInstance> = proj
-            .iter()
-            .map(|q| GpuInstance {
-                pos: q.ndc,
-                radius_px: q.r_pts * ppp,
-                weight: q.weight,
-                color: [
-                    q.base[0] * q.gain,
-                    q.base[1] * q.gain,
-                    q.base[2] * q.gain,
-                    1.0,
-                ],
-            })
-            .collect();
-        let segments = if analytic_streamlines(opts.streamlines, opts.research_sandbox) {
-            streamline_segments(&project, particles, rect, ppp)
+        let use_model = model_streamlines(
+            opts.streamlines,
+            opts.model_velocity.is_some() && !opts.research_sandbox,
+        );
+        let use_analytic = analytic_streamlines(opts.streamlines, opts.research_sandbox);
+        if opts.gpu {
+            let ppp = ui.ctx().pixels_per_point();
+            let instances: Vec<GpuInstance> = proj
+                .iter()
+                .map(|q| GpuInstance {
+                    pos: q.ndc,
+                    radius_px: q.r_pts * ppp,
+                    weight: q.weight,
+                    color: [
+                        q.base[0] * q.gain,
+                        q.base[1] * q.gain,
+                        q.base[2] * q.gain,
+                        1.0,
+                    ],
+                })
+                .collect();
+            let segments = if use_analytic {
+                streamline_segments(&project, particles, rect, ppp)
+            } else if use_model {
+                if let Some(field) = opts.model_velocity.as_ref() {
+                    model_streamline_segments(&project, field, rect, ppp)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            gpu::add_flow(ui, rect, instances, segments);
         } else {
-            Vec::new()
-        };
-        gpu::add_flow(ui, rect, instances, segments);
-    } else {
-        // CPU fallback: depth-sorted faint halo + bright core (soft glow, no GPU)
-        proj.sort_by(|a, b| {
-            b.depth
-                .partial_cmp(&a.depth)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for q in &proj {
-            let col = Color32::from_rgba_unmultiplied(
-                (q.base[0] * 255.0) as u8,
-                (q.base[1] * 255.0) as u8,
-                (q.base[2] * 255.0) as u8,
-                (q.weight.clamp(0.0, 1.0) * 255.0) as u8,
-            );
-            let halo = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), col.a() / 3);
-            p.circle_filled(q.screen, q.r_pts * 2.1, halo);
-            p.circle_filled(q.screen, q.r_pts, col);
-        }
-        if analytic_streamlines(opts.streamlines, opts.research_sandbox) {
-            for poly in streamline_polys(&project, particles) {
-                p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
+            // CPU fallback: depth-sorted faint halo + bright core (soft glow, no GPU)
+            proj.sort_by(|a, b| {
+                b.depth
+                    .partial_cmp(&a.depth)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for q in &proj {
+                let col = Color32::from_rgba_unmultiplied(
+                    (q.base[0] * 255.0) as u8,
+                    (q.base[1] * 255.0) as u8,
+                    (q.base[2] * 255.0) as u8,
+                    (q.weight.clamp(0.0, 1.0) * 255.0) as u8,
+                );
+                let halo = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), col.a() / 3);
+                p.circle_filled(q.screen, q.r_pts * 2.1, halo);
+                p.circle_filled(q.screen, q.r_pts, col);
+            }
+            if use_analytic {
+                for poly in streamline_polys(&project, particles) {
+                    p.line(poly, Stroke::new(1.0, GOLD.gamma_multiply(0.5)));
+                }
+            } else if use_model {
+                if let Some(field) = opts.model_velocity.as_ref() {
+                    for poly in model_streamline_polys(&project, field) {
+                        p.line(poly, Stroke::new(1.2, BRAND.gamma_multiply(0.75)));
+                    }
+                }
             }
         }
-    }
 
-    // The quarantine is only credible if it is visible: whenever the analytic
-    // overlay renders, it names itself in the viewport.
-    if analytic_streamlines(opts.streamlines, opts.research_sandbox) {
-        p.text(
-            rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
-            egui::Align2::LEFT_TOP,
-            ANALYTIC_STREAMLINE_LABEL,
-            mono_s().resolve(ui.style()),
-            WARN,
-        );
-    }
+        if use_analytic {
+            p.text(
+                rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
+                egui::Align2::LEFT_TOP,
+                ANALYTIC_STREAMLINE_LABEL,
+                mono_s().resolve(ui.style()),
+                WARN,
+            );
+        } else if use_model {
+            p.text(
+                rect.left_top() + egui::vec2(16.0, rect.height() - 44.0),
+                egui::Align2::LEFT_TOP,
+                MODEL_STREAMLINE_LABEL,
+                mono_s().resolve(ui.style()),
+                GOLD,
+            );
+        }
 
     // billboarded critical points, projected with this mode's own camera
     draw_markers(ui, rect, cam, opts, Some(&project));
     interaction
+}
+
+fn sample_model_velocity(field: &ModelVelocityField, pos: [f32; 3]) -> [f32; 3] {
+    let n = field.n.max(2);
+    let to_index = |coordinate: f32| ((coordinate + 1.0) * 0.5 * (n - 1) as f32).clamp(0.0, (n - 1) as f32);
+    let ix = to_index(pos[0]) as usize;
+    let iy = to_index(pos[1]) as usize;
+    let iz = to_index(pos[2]) as usize;
+    let cube = n * n * n;
+    let at = |component: usize, x: usize, y: usize, z: usize| {
+        field.vel.get(component * cube + z * n * n + y * n + x).copied().unwrap_or(0.0)
+    };
+    [at(0, ix, iy, iz), at(1, ix, iy, iz), at(2, ix, iy, iz)]
+}
+
+fn model_streamline_polys(
+    project: &impl Fn([f32; 3]) -> (Pos2, f32),
+    field: &ModelVelocityField,
+) -> Vec<Vec<Pos2>> {
+    let n = field.n.max(2);
+    let mut seeds = Vec::new();
+    // Seed a rake of streamwise lines ahead of the body in the free-stream half.
+    for j in 0..6 {
+        for k in 0..6 {
+            let y = -0.6 + j as f32 * 0.24;
+            let z = -0.6 + k as f32 * 0.24;
+            seeds.push([-0.85, y, z]);
+        }
+    }
+    let _ = n;
+    let mut polys = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let mut pos = seed;
+        let mut poly = Vec::with_capacity(32);
+        for _ in 0..32 {
+            poly.push(project(pos).0);
+            let velocity = sample_model_velocity(field, pos);
+            let speed = (velocity[0] * velocity[0]
+                + velocity[1] * velocity[1]
+                + velocity[2] * velocity[2])
+                .sqrt()
+                .max(1e-4);
+            let step = 0.035 / speed;
+            for axis in 0..3 {
+                pos[axis] = (pos[axis] + velocity[axis] * step).clamp(-1.0, 1.0);
+            }
+        }
+        polys.push(poly);
+    }
+    polys
+}
+
+fn model_streamline_segments(
+    project: &impl Fn([f32; 3]) -> (Pos2, f32),
+    field: &ModelVelocityField,
+    rect: Rect,
+    ppp: f32,
+) -> Vec<SegInstance> {
+    let to_ndc = |s: Pos2| {
+        [
+            (s.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+            1.0 - (s.y - rect.min.y) / rect.height() * 2.0,
+        ]
+    };
+    let mut segments = Vec::new();
+    for poly in model_streamline_polys(project, field) {
+        for window in poly.windows(2) {
+            segments.push(SegInstance {
+                p0: to_ndc(window[0]),
+                p1: to_ndc(window[1]),
+                width_px: 1.6 * ppp,
+                _pad: 0.0,
+                color: [0.85, 0.42, 0.18, 1.0],
+            });
+        }
+    }
+    segments
 }
 
 /// Project a few streamlines to screen polylines, seeded from strong-vorticity

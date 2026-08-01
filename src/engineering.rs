@@ -226,6 +226,16 @@ pub struct SupportIssue {
 pub struct GeometryPreflight {
     pub source_sha256: String,
     pub source_bytes: u64,
+    /// Source container and translator facts are immutable provenance. For STEP,
+    /// the original B-rep bytes remain authoritative and the triangle mesh is a
+    /// derived tessellation with a recorded chord tolerance.
+    pub source_format: String,
+    pub source_declared_units: Option<String>,
+    pub geometry_translator: String,
+    pub geometry_translator_version: String,
+    pub tessellation_tolerance_source_units: Option<f64>,
+    pub vertex_weld_relative_tolerance: Option<f64>,
+    pub source_shells: usize,
     pub triangles: usize,
     pub components: usize,
     pub degenerate_triangles: usize,
@@ -310,16 +320,61 @@ impl GeometryPreflight {
         {
             issue(
                 "source.invalid_sha256",
-                "The STL source has no canonical SHA-256 identity.".into(),
+                "The geometry source has no canonical SHA-256 identity.".into(),
                 false,
             );
         }
         if self.source_bytes == 0 {
             issue(
                 "source.empty",
-                "The STL source contains no bytes.".into(),
+                "The geometry source contains no bytes.".into(),
                 false,
             );
+        }
+        if self.source_format == "step" {
+            if self.source_declared_units.is_none() {
+                issue(
+                    "source.step_units_missing",
+                    "The STEP source has no unambiguous declared length unit.".into(),
+                    false,
+                );
+            }
+            if self.geometry_translator.trim().is_empty()
+                || self.geometry_translator_version.trim().is_empty()
+            {
+                issue(
+                    "source.step_translator_missing",
+                    "The STEP tessellation translator and version must be recorded.".into(),
+                    false,
+                );
+            }
+            if self
+                .tessellation_tolerance_source_units
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+            {
+                issue(
+                    "source.step_tolerance_missing",
+                    "The STEP tessellation chord tolerance must be finite and positive.".into(),
+                    false,
+                );
+            }
+            if self
+                .vertex_weld_relative_tolerance
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+            {
+                issue(
+                    "source.step_weld_tolerance_missing",
+                    "The STEP face-boundary weld tolerance must be finite and positive.".into(),
+                    false,
+                );
+            }
+            if self.source_shells == 0 {
+                issue(
+                    "source.step_shells_missing",
+                    "The STEP import contains no recorded B-rep shells.".into(),
+                    false,
+                );
+            }
         }
         if self.triangles == 0 {
             issue(
@@ -382,7 +437,7 @@ impl GeometryPreflight {
             issue(
                 "mesh.disconnected_components",
                 format!(
-                    "The STL contains {} surface components; nested shells, intersections, and multiple bodies are ambiguous in the current solid contract.",
+                    "The geometry source contains {} surface components; nested shells, intersections, and multiple bodies are ambiguous in the current solid contract.",
                     self.components
                 ),
                 false,
@@ -591,7 +646,7 @@ impl ModelSupport {
             issues.push("The selected checkpoint has no accepted validation state.".into());
         }
         if self.dimension != 3 {
-            issues.push("External STL execution requires a 3D checkpoint.".into());
+            issues.push("External-geometry execution requires a 3D checkpoint.".into());
         }
         if self.grid as usize != target_grid {
             issues.push(format!(
@@ -650,6 +705,28 @@ pub struct ExternalFlowCase {
     pub operating: OperatingPoint,
     pub result: Option<EngineeringResult>,
     pub parent_run_id: Option<String>,
+    /// Operator-authored region labels for future internal-flow / BC mapping.
+    /// Empty for external-flow screening; persisted so reopen preserves drafts.
+    #[serde(default)]
+    pub named_regions: Vec<NamedRegionAssignment>,
+    /// Presentation that must reopen identically (colormap, Cp range, layers).
+    #[serde(default)]
+    pub view_state: CaseViewState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NamedRegionAssignment {
+    pub name: String,
+    pub candidate_id: String,
+    pub role: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CaseViewState {
+    pub colormap: Option<String>,
+    pub cp_range_mode: Option<String>,
+    pub cp_pinned_extent: Option<f64>,
+    pub streamlines: bool,
 }
 
 /// Scope key for one in-memory case-draft history.
@@ -857,6 +934,8 @@ impl ExternalFlowCase {
             "operating_point": self.operating,
             "preflight": self.preflight,
             "surface_load_method": SURFACE_LOAD_METHOD,
+            "named_regions": self.named_regions,
+            "view_state": self.view_state,
         })
     }
 }
@@ -1473,7 +1552,7 @@ pub fn seconds_per_horizon_step(
 }
 
 /// Convert a point from the current column-major solver transform back into the
-/// imported STL source frame and then apply the approved source-unit scale.
+/// imported geometry source frame and then apply the approved source-unit scale.
 pub fn solver_point_to_source_m(
     solver_point: [f64; 3],
     transform_4x4: [f64; 16],
@@ -1758,6 +1837,8 @@ mod tests {
             },
             result: None,
             parent_run_id: None,
+            named_regions: Vec::new(),
+            view_state: Default::default(),
         };
         assert!(case.ready());
         let contract = case.exact_contract();
@@ -2075,6 +2156,8 @@ mod tests {
                 ..Default::default()
             }),
             parent_run_id: Some("run-parent".into()),
+            named_regions: Vec::new(),
+            view_state: Default::default(),
         }
     }
 

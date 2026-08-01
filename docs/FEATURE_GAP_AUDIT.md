@@ -12,7 +12,9 @@ Companions: [`CFD_APP_LANDSCAPE.md`](CFD_APP_LANDSCAPE.md) (lifecycle/CAD strate
 
 1. **Customization in mature CAD/CFD tools is not a preferences page; it is a three-layer architecture.** Every incumbent separates (a) global application options, (b) per-document/per-case authoritative settings, and (c) reusable templates/defaults that seed new documents. SolidWorks makes the split explicit (System Options vs Document Properties saved into templates); Ansys Discovery scopes simulation units "only to new documents"; NX layers Site → Group → User customer defaults; Workbench keeps per-project unit systems above a global default. Reyn has layer (a) only (`src/settings.rs`) and an implicit layer (b) in the case contract (`src/engineering.rs`); layer (c) does not exist.
 
-2. **Competitor-scheme mouse emulation is a category-standard feature, not a nicety.** Onshape ships SolidWorks/NX/Creo/AutoCAD view-manipulation presets; Fusion ships SolidWorks/Inventor/Alias/Tinkercad/PowerMill presets; Discovery and ParaView expose full per-button rebinding. The vendors treat orbit muscle memory as a switching cost to be neutralized. Reyn's viewport currently has **no pan, no fit, no standard views, and hardcoded orbit/zoom bindings** (`src/viewport.rs:227-237`) — this is below the floor before customization even enters the picture.
+**Status refresh (0.1.2 candidate, feature/step-import):** R2 cancel/progress, R3 horizon playback, R4 body orientation, R7 fluid presets/templates, and R8 display units/precision are **SHIPPED**. R1 viewport nav is **SHIPPED** including axis triad and Reyn/SolidWorks/Fusion/ParaView schemes. R5 engineering report is **SHIPPED** for HTML + PNG/PDF lab sheets (optional Ed25519 sidecar when a Keychain key is configured). R6 viewport capture is **SHIPPED** with provenance footer. R9 has surface probe **SHIPPED** and Cp mid-line profile **SHIPPED**. R10 colormap presets are **SHIPPED** for app settings + case `view_state` reopen. STEP is **PARTIAL** (single-part Truck + async import worker + multi-shell pick-one; assemblies/OCCT bridge still open). 3MF is **SHIPPED** for Core mesh+units. Model-field streamlines are **SHIPPED** on Results; ABC demo remains sandbox-quarantined. Named regions, small run queue, and eng lab-sheet signing are **SHIPPED** under Scope A.
+
+2. **Competitor-scheme mouse emulation is a category-standard feature, not a nicety.** Onshape ships SolidWorks/NX/Creo/AutoCAD view-manipulation presets; Fusion ships SolidWorks/Inventor/Alias/Tinkercad/PowerMill presets; Discovery and ParaView expose full per-button rebinding. The vendors treat orbit muscle memory as a switching cost to be neutralized. Reyn now ships Reyn / SolidWorks / Fusion / **ParaView** schemes with pan, fit, and standard views.
 
 3. **Numeric display precision is a first-class engineering setting everywhere.** SolidWorks exposes 0–8 decimal places per document down to tolerance precision; Discovery exposes significant digits; even Fluent's colormap has `number-format-precision` and `number-format-type` preferences. Reyn hardcodes every format string (`{:.5}`, `{:.3e}` in `src/app.rs:1753-1848`).
 
@@ -22,7 +24,7 @@ Companions: [`CFD_APP_LANDSCAPE.md`](CFD_APP_LANDSCAPE.md) (lifecycle/CAD strate
 
 6. **0.1.1 uses the existing request identity and warmup cache.** Horizon previews remain display-only; cancellation terminates the blocking sidecar, persists the terminal attempt, and replaces the engine before retry.
 
-7. **One honesty-adjacent latent defect:** the streamline toggle advects seeds through the *analytic ABC field*, not the displayed model field (`src/viewport.rs:442-475`, comment "advected through the ABC field"). It is currently reachable only from the Research Sandbox layer controls, but it must never surface next to an engineering result in its present form (SCI-AC-01 risk).
+7. **Streamlines honesty (resolved on Results):** the ABC analytic field remains reachable only from the Research Sandbox. Engineering Results streamlines advect the model velocity volume and are labeled `MODEL · streamlines from predicted velocity` (`src/viewport.rs` model-streamline path).
 
 8. **What Reyn should not copy:** per-seat customization sprawl (NX's hundreds of customer defaults), a shortcut editor before there are enough commands to warrant one, or unit systems that silently re-interpret stored numbers. Every customization Reyn adds must be a *display or default* concern; the recorded evidence (SI values, exact contract, hashes) stays canonical.
 
@@ -93,10 +95,10 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Topology diagnostics (watertight, degenerate, non-manifold, components, winding) | SHIPPED | `src/cad.rs:32-121` (`diagnose_mesh`); surfaced in preflight spine `src/app.rs:2308-2316` |
 | Unit declaration gate + transform approval with visible 4×4 | SHIPPED | `src/engineering.rs:141-143`, `385-391`; 4×4 display `src/app.rs:1311-1325`; approval checkbox `src/app.rs:1341-1346` (N5X-CAD-01/02 per PRD §4.1) |
 | Voxel adequacy gates (empty, clearance, cells-across, disconnected) + named waivers | SHIPPED | `src/engineering.rs:344-437`; waiver UI `src/app.rs:1583-1607` (N5X-CAD-03) |
-| STEP/IGES/neutral B-rep | MISSING | Planned Stage 2 (PRD §8.2); STL-only today |
-| User-controlled placement/orientation (incl. angle of attack) | MISSING | Auto-fit only (`src/cad.rs:6-9`); flow direction hard-locked to +X (`src/engineering.rs:176-181`). The user cannot yaw/pitch the body inside Reyn — the single biggest *setup* gap that is app-side fixable (see R4) |
+| STEP/IGES/neutral B-rep | PARTIAL | 0.1.2: single-part STEP via Truck + async import worker + multi-shell pick-one; assemblies with occurrence transforms, IGES, healing, and OCCT bridge remain open (`docs/STEP_IMPORT_REVIEW.md`). 3MF Core is SHIPPED. |
+| User-controlled placement/orientation (incl. angle of attack) | SHIPPED | Body α/β/roll re-voxelization with off-thread orientation worker; stream remains +X (model contract). |
 | Geometry repair | N/A-BY-DESIGN | PRD §8.1: Reyn "does not silently repair source geometry"; waivers + external repair instead |
-| Named regions / face selections | MISSING | Acknowledged in landscape report §3.3; requires stable identity (P-CAD-02 territory) |
+| Named regions / face selections | PARTIAL | Operator-authored labels on structural candidates persist with the case (`named_regions`); stable CAD face IDs and internal-flow BC mapping remain open. |
 | Reimport with revision lineage | PARTIAL | Managed STL revisions exist (PRD §8.1 "Implemented for STL revisions"); no assignment-mapping diff UI |
 
 ### 2.2 Case setup
@@ -105,7 +107,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 |---|---|---|
 | Operating point with full validation (units, positivity, Re envelope 60–400, horizon ≤ model support) | SHIPPED | `src/engineering.rs:139-196`; live Reynolds + dynamic pressure readouts `src/app.rs:1512-1535` |
 | Model compatibility filtering + support display | SHIPPED | Picker filters to 3D, grid-matched, geometry-conditioned obstacle checkpoints `src/app.rs:1363-1373`; `ModelSupport::validation` `src/engineering.rs:452-479` (N5X-CAD-04) |
-| Fluid/material presets | MISSING | Manual density/viscosity entry only (`src/app.rs:1460-1485`); defaults are air-like numbers with no label |
+| Fluid/material presets | SHIPPED | Air/Water presets + case templates seed operating points; gates still apply. |
 | Case templates / duplicate-as-variant with defaults | PARTIAL | Operating-point variant creation exists (`src/app.rs:2024-2027` invalidates and returns to setup; parent lineage recorded); no named templates |
 | Boundary-condition / turbulence-model editors | N/A-BY-DESIGN | PRD §1.2 non-goal; the locked contract is displayed instead (`src/app.rs:1420-1433`) |
 | Internal-flow case kind | N/A-BY-DESIGN (blocked) | Reference-only contract, execution-blocked with structured blockers (`src/engineering.rs:697-736`); reference card in UI `src/app.rs:11454` |
@@ -120,7 +122,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Run start records exact contract | SHIPPED | `run_external_flow` commits the case revision before dispatch `src/app.rs:895-951`; exact contract JSON `src/engineering.rs:542-559` |
 | Progress indication | PARTIAL | Status-bar busy glyph + string only (`src/app.rs:3405-3421`); `PendingCadRun.started_at` exists (`src/app.rs:57-61`) but no elapsed display, no stage breakdown (warmup/predict/derive), no determinate bar |
 | **Cancellation** | SHIPPED | Cancel terminalizes the immutable attempt, terminates the blocking sidecar, replaces the engine, and exposes retry after readiness; stale correlated responses are ignored |
-| Queueing / batch runs | MISSING | One in-flight CAD request (`pending_request_id`, `src/app.rs:52`); no queue, no sweep execution (P-SWEEP-01 is post-N6 by design, but even two queued variants are impossible today) |
+| Queueing / batch runs | PARTIAL | Small follow-on FIFO (`RunQueue`) drains after the in-flight attempt; no parameter sweeps (P-SWEEP-01 remains post-N6). |
 | Run history with immutable lineage + deep links | SHIPPED | Run ledger `src/app.rs:2695-2729`; rerun-with-parent (N6-PROJ-04) |
 | Run log / stop-reason inspection | PARTIAL | Manifests record warnings/stop data; no in-app log or run-detail console beyond ledger + warnings list `src/app.rs:2743-2748` |
 
@@ -134,12 +136,12 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | 3D volume + Cp surface + clipping planes | SHIPPED | Layers + clip sliders `src/app.rs:1889-1908`; wgpu raymarch `src/viewport.rs:242-267` |
 | Geometry-linked 2D sections with calibrated legend + probe | SHIPPED | Section axis/quantity controls `src/app.rs:1910-1958`; legend `src/app.rs:10684`; section probe `src/app.rs:10743` |
 | Load/suction hotspots | SHIPPED | Billboarded markers (`src/viewport.rs:44-49`, layer toggle `src/app.rs:1907`) |
-| **3D point probe** (click → local velocity/Cp/traction) | MISSING | Probes exist only in 2D sandbox fields (`src/app.rs:10906`) and section view; the 3D engineering viewport has none |
-| **Streamlines on the model field** | MISSING (and latent hazard) | Streamline seeds advect the *analytic ABC demo field*, not model velocity (`src/viewport.rs:442-475`); not exposed in Results layers (`src/app.rs:1904-1908`) — keep it out until it integrates the actual `CadField.vel` |
-| XY plots (Cp vs. position, force vs. variant) | MISSING | Variant comparison is a numeric delta table (`src/app.rs:1850-1887`), not a plot; no line-extraction plot exists |
+| **3D point probe** (click → local velocity/Cp/traction) | SHIPPED | Surface probe on the engineering viewport with source-class chips; section probe remains. |
+| **Streamlines on the model field** | SHIPPED | Results path advects model velocity (`model_streamline_*`); ABC analytic field stays sandbox-quarantined. |
+| XY plots (Cp vs. position, force vs. variant) | PARTIAL | Cp mid-line profile under section view is SHIPPED; force-vs-variant XY remains a numeric delta table. |
 | **Horizon/time scrubbing within model support** | MISSING | Results show one horizon-H field; the engine caches warmup per mask so per-step fields are one model pass each (`src/engine.rs:142-144`) — feasible today, unbuilt |
 | Convergence/confidence indicators | PARTIAL | Divergence RMS + warnings + applicability banner shipped; honest "spatial error unavailable without reference" notice (`src/app.rs:1999-2004`); no consistency evidence (e.g. semigroup) attached to engineering runs, though the engine computes it for 2D sandbox (`src/engine.rs:105`) |
-| Colormap / legend range control | MISSING | Fixed ramp `src/viewport.rs:195-207`; no manual range lock |
+| Colormap / legend range control | SHIPPED | Ember/Viridis/Magma + Auto/Pinned Cp range in settings; persisted on case `view_state` for reopen. |
 | Shared-scale run/variant comparison | SHIPPED | Shared-unit parent/current comparison with evidence deep links (`src/app.rs:1850-1887`; N6-COMP-01 candidate per PRD §4.1) |
 
 ### 2.5 Reporting & export

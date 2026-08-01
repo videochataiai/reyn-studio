@@ -587,7 +587,7 @@ This report presents <b>model-derived</b> results from a neural fixed-body surro
 <li>Cp uses the recorded p∞, ρ∞, V∞ nondimensionalization; its pressure source remains recovered.</li>
 <li>Surface tractions are pressure + Newtonian viscous fluid loads on a diffuse interface — they are <b>not structural stress</b> and are not independently validated loads.</li>
 <li>No independent spatial error is shown without an attached solver reference.</li>
-<li>The supported contract is external fixed-body flow with +X free stream inside the qualified Reynolds envelope; STL import is managed tessellated preprocessing, not embedded or associative CAD.</li>
+<li>The supported contract is external fixed-body flow with +X free stream inside the qualified Reynolds envelope; STL and single-part STEP import are managed tessellated preprocessing, not embedded or associative CAD.</li>
 </ul>
 </div>
 </body>
@@ -666,6 +666,8 @@ mod tests {
                 warnings: vec!["horizon near support limit".into()],
             }),
             parent_run_id: None,
+            named_regions: Vec::new(),
+            view_state: crate::engineering::CaseViewState::default(),
         }
     }
 

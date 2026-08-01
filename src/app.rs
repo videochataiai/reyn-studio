@@ -9,8 +9,8 @@ use crate::menubar::{MenuBar, MenuCommand, MenuSignal, MenuSyncState};
 use crate::signing::LocalSigningKeyStore;
 use crate::theme::*;
 use crate::{
-    cad, engine, engineering, engineering_section, flow, gpu, library, painter, project,
-    project_lifecycle, report, settings, signing, units, viewport, vtk_export,
+    cad, engine, engineering, engineering_export, engineering_section, flow, gpu, library, painter,
+    project, project_lifecycle, report, settings, signing, units, viewport, vtk_export,
 };
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense,
@@ -264,6 +264,23 @@ struct PendingCadRun {
     manifest: project::RunManifest,
 }
 
+/// Small FIFO of external-flow run requests (Phase 0.4). Only one executes at a
+/// time; completions drain the next entry.
+#[derive(Default)]
+struct RunQueue {
+    waiting: std::collections::VecDeque<QueuedRunRequest>,
+}
+
+/// Queued follow-on external-flow request (Phase 0.4). Only one run executes;
+/// completions drain the next entry against the live case draft.
+#[derive(Clone)]
+struct QueuedRunRequest {
+    case_id: String,
+    queued_utc_unix: u64,
+    note: String,
+}
+
+
 struct PendingOrientation {
     generation: u64,
     request_id: String,
@@ -355,6 +372,7 @@ struct OrientationWorkRequest {
     request_id: String,
     case_id: String,
     source_sha256: String,
+    source_name: String,
     angles: [f64; 3],
     grid: usize,
     source_bytes: Vec<u8>,
@@ -421,6 +439,134 @@ fn classify_orientation_result(
     }
 }
 
+
+struct GeometryImportWorkRequest {
+    generation: u64,
+    request_id: String,
+    path: std::path::PathBuf,
+    source_name: String,
+    source_bytes: Vec<u8>,
+    grid: usize,
+    selected_shell_entity_id: Option<u64>,
+}
+
+struct GeometryImportReady {
+    imported: cad::GeometryImport,
+    diagnostics: cad::MeshDiagnostics,
+    voxel: cad::VoxelMask,
+}
+
+enum GeometryImportFailure {
+    Message(String),
+    ChooseShell(crate::cad_step::ShellChoiceRequired),
+}
+
+struct GeometryImportWorkResult {
+    generation: u64,
+    request_id: String,
+    path: std::path::PathBuf,
+    source_name: String,
+    source_bytes: Vec<u8>,
+    source_sha256: String,
+    #[allow(dead_code)]
+    selected_shell_entity_id: Option<u64>,
+    outcome: Result<GeometryImportReady, GeometryImportFailure>,
+}
+
+struct GeometryImportWorker {
+    request_tx: std::sync::mpsc::Sender<GeometryImportWorkRequest>,
+    result_rx: std::sync::mpsc::Receiver<GeometryImportWorkResult>,
+}
+
+struct PendingGeometryImport {
+    generation: u64,
+    request_id: String,
+    path: std::path::PathBuf,
+    started_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct PendingShellChoice {
+    path: std::path::PathBuf,
+    source_name: String,
+    source_bytes: Vec<u8>,
+    source_sha256: String,
+    declared_unit: String,
+    shells: Vec<crate::cad_step::ShellCandidate>,
+}
+
+impl GeometryImportWorker {
+    fn spawn(repaint_context: Option<egui::Context>) -> Result<Self, String> {
+        let (request_tx, request_rx) =
+            std::sync::mpsc::channel::<GeometryImportWorkRequest>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<GeometryImportWorkResult>();
+        std::thread::Builder::new()
+            .name("reyn-geometry-import".into())
+            .spawn(move || {
+                while let Ok(mut request) = request_rx.recv() {
+                    // Keep only the newest queued import; a pass already running
+                    // may finish, but the UI suppresses stale generations.
+                    while let Ok(newest) = request_rx.try_recv() {
+                        request = newest;
+                    }
+                    let source_sha256 = format!("{:x}", Sha256::digest(&request.source_bytes));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match cad::parse_geometry_selecting(
+                            &request.source_name,
+                            &request.source_bytes,
+                            request.selected_shell_entity_id,
+                        ) {
+                            Ok(imported) => {
+                                let diagnostics = cad::diagnose_mesh(&imported.mesh);
+                                match cad::voxelize(&imported.mesh, request.grid) {
+                                    Ok(voxel) => Ok(GeometryImportReady {
+                                        imported,
+                                        diagnostics,
+                                        voxel,
+                                    }),
+                                    Err(error) => Err(GeometryImportFailure::Message(error)),
+                                }
+                            }
+                            Err(cad::GeometryParseError::ChooseShell(choice)) => {
+                                Err(GeometryImportFailure::ChooseShell(choice))
+                            }
+                            Err(cad::GeometryParseError::Message(message)) => {
+                                Err(GeometryImportFailure::Message(message))
+                            }
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(GeometryImportFailure::Message(
+                            "geometry import worker panicked while translating or voxelizing"
+                                .into(),
+                        ))
+                    });
+                    let completed = GeometryImportWorkResult {
+                        generation: request.generation,
+                        request_id: request.request_id,
+                        path: request.path,
+                        source_name: request.source_name,
+                        source_bytes: request.source_bytes,
+                        source_sha256,
+                        selected_shell_entity_id: request.selected_shell_entity_id,
+                        outcome,
+                    };
+                    if result_tx.send(completed).is_err() {
+                        break;
+                    }
+                    if let Some(context) = &repaint_context {
+                        context.request_repaint();
+                    }
+                }
+            })
+            .map_err(|error| format!("geometry import worker could not start: {error}"))?;
+        Ok(Self {
+            request_tx,
+            result_rx,
+        })
+    }
+}
+
 impl OrientationWorker {
     fn spawn(repaint_context: Option<egui::Context>) -> Result<Self, String> {
         let (request_tx, request_rx) = std::sync::mpsc::channel();
@@ -434,13 +580,15 @@ impl OrientationWorker {
                     // generation is suppressed by the UI if it was superseded.
                     let request = coalesce_orientation_requests(request, &request_rx);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cad::parse_stl(&request.source_bytes).and_then(|mesh| {
-                            cad::voxelize_oriented(
-                                &mesh,
-                                request.grid,
-                                cad::BodyOrientation::from_degrees(request.angles),
-                            )
-                        })
+                        cad::parse_geometry(&request.source_name, &request.source_bytes).and_then(
+                            |imported| {
+                                cad::voxelize_oriented(
+                                    &imported.mesh,
+                                    request.grid,
+                                    cad::BodyOrientation::from_degrees(request.angles),
+                                )
+                            },
+                        )
                     }))
                     .unwrap_or_else(|_| {
                         Err("orientation worker panicked while re-voxelizing geometry".into())
@@ -474,6 +622,11 @@ impl OrientationWorker {
 enum ScreenshotWriteKind {
     Viewport,
     Qa,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ViewportShotProvenance {
+    footer_lines: Vec<String>,
 }
 
 struct ScreenshotWriteResult {
@@ -789,7 +942,7 @@ pub struct ReynApp {
     qa_shot_frames: u32,
     screenshot_result_tx: std::sync::mpsc::Sender<ScreenshotWriteResult>,
     screenshot_result_rx: std::sync::mpsc::Receiver<ScreenshotWriteResult>,
-    /// Dev/QA hook (REYN_STUDIO_IMPORT=path.stl): import a mesh through the
+    /// Dev/QA hook (REYN_STUDIO_IMPORT=path.stl|path.stp): import geometry through the
     /// ordinary import path once the model inventory has arrived, so captures
     /// of the case and viewport screens do not need a file dialog. Nothing is
     /// faked — the case is gated exactly as a hand-imported one.
@@ -848,6 +1001,8 @@ pub struct ReynApp {
     f2d_painted: Option<std::sync::Arc<Vec<f32>>>, // active painted IC in Fields (2D)
     // CAD flow analysis
     cad: Option<CadCase>,
+    /// FIFO of additional external-flow runs requested while one is in flight.
+    run_queue: RunQueue,
     waiver_draft: String,
     waiver_code: Option<String>,
     surface_on: bool,
@@ -896,6 +1051,10 @@ pub struct ReynApp {
     /// The only orientation result allowed to mutate the active case. Replacing
     /// this value cancels the old generation logically; its result is stale.
     orientation_pending: Option<PendingOrientation>,
+    geometry_import_worker: Option<GeometryImportWorker>,
+    geometry_import_generation: u64,
+    geometry_import_pending: Option<PendingGeometryImport>,
+    pending_shell_choice: Option<PendingShellChoice>,
     /// Session-only, bounded history of reversible case-draft inputs. Immutable
     /// source/model/run/evidence identity never enters these snapshots.
     case_draft_history: engineering::CaseDraftHistory,
@@ -1015,6 +1174,7 @@ impl Default for ReynApp {
             paint_last: None,
             f2d_painted: None,
             cad: None,
+            run_queue: RunQueue::default(),
             waiver_draft: String::new(),
             waiver_code: None,
             surface_on: false,
@@ -1049,6 +1209,10 @@ impl Default for ReynApp {
             probe3d: None,
             orientation_draft: None,
             orientation_worker: None,
+            geometry_import_worker: None,
+            geometry_import_generation: 0,
+            geometry_import_pending: None,
+            pending_shell_choice: None,
             orientation_generation: 0,
             orientation_pending: None,
             case_draft_history: engineering::CaseDraftHistory::default(),
@@ -1260,6 +1424,8 @@ impl ReynApp {
 impl eframe::App for ReynApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_orientation_results();
+        self.handle_geometry_import_results();
+        self.draw_shell_choice_modal(ui.ctx());
         self.handle_screenshot_write_results();
         // Complete any in-flight viewport PNG capture first: the screenshot
         // event carries the previous composited frame.
@@ -2215,6 +2381,56 @@ impl ReynApp {
                 engineering::CaseStage::Setup
             };
         }
+        if let Some(next) = self.run_queue.waiting.pop_front() {
+            let case_matches = self
+                .cad
+                .as_ref()
+                .is_some_and(|case| case.workflow.case_id == next.case_id);
+            if !case_matches {
+                self.project_notice = Some((
+                    format!(
+                        "Queued follow-on for case {} was skipped because another case is active.",
+                        short_id(&next.case_id)
+                    ),
+                    true,
+                ));
+                return;
+            }
+            let remaining = self.run_queue.waiting.len();
+            self.project_notice = Some((
+                format!(
+                    "Run finished · starting queued follow-on ({}) · {} still waiting · queued at {}.",
+                    next.note, remaining, next.queued_utc_unix
+                ),
+                false,
+            ));
+            self.run_external_flow();
+        }
+    }
+
+    fn apply_case_view_state_from_active(&mut self) {
+        let Some(view) = self.cad.as_ref().map(|case| case.workflow.view_state.clone()) else {
+            return;
+        };
+        if let Some(name) = view.colormap.as_deref() {
+            if let Ok(map) = serde_json::from_value::<field2d::FieldColormap>(serde_json::json!(name))
+            {
+                self.settings.colormap = map;
+                field2d::set_view_colormap(map);
+            }
+        }
+        if let Some(mode) = view.cp_range_mode.as_deref() {
+            if let Ok(parsed) =
+                serde_json::from_value::<settings::CpRangeMode>(serde_json::json!(mode))
+            {
+                self.settings.cp_range_mode = parsed;
+            }
+        }
+        if let Some(extent) = view.cp_pinned_extent {
+            self.settings.cp_pinned_extent = extent;
+        }
+        self.streamlines = view.streamlines;
+        self.settings_draft = self.settings.clone();
     }
 
     fn interrupt_and_restart_engine(&mut self) {
@@ -2628,6 +2844,7 @@ impl ReynApp {
         let digest = case.workflow.preflight.source_sha256.clone();
         let grid = case.workflow.preflight.target_grid;
         let case_id = case.workflow.case_id.clone();
+        let source_name = case.workflow.source_name.clone();
         let Some(bytes) = self.project.content_bytes(&digest).map(<[u8]>::to_vec) else {
             self.project_notice = Some((
                 format!(
@@ -2657,6 +2874,7 @@ impl ReynApp {
             request_id: request_id.clone(),
             case_id: case_id.clone(),
             source_sha256: digest.clone(),
+            source_name,
             angles,
             grid,
             source_bytes: bytes,
@@ -2975,7 +3193,8 @@ impl ReynApp {
             .cloned()
             .ok_or_else(|| "The active geometry source revision is unavailable.".to_string())?;
         let approved_units = workflow.operating.length_unit.symbol().to_string();
-        let approved_frame = "approved STL source frame to fixed-body solver frame".to_string();
+        let approved_frame =
+            "approved geometry source frame to fixed-body solver frame".to_string();
         let source_changed = current_source.declared_units.as_deref()
             != Some(approved_units.as_str())
             || current_source.frame.as_deref() != Some(approved_frame.as_str())
@@ -3150,6 +3369,39 @@ impl ReynApp {
     }
 
     fn run_external_flow(&mut self) {
+        if self.cad.as_ref().is_some_and(|case| case.pending) {
+            if self.run_queue.waiting.len() < 8 {
+                let case_id = self
+                    .cad
+                    .as_ref()
+                    .map(|case| case.workflow.case_id.clone())
+                    .unwrap_or_default();
+                let active = self
+                    .cad
+                    .as_ref()
+                    .and_then(|case| case.pending_run.as_ref())
+                    .map(|pending| short_id(&pending.run_id))
+                    .unwrap_or_else(|| "in-flight".into());
+                self.run_queue.waiting.push_back(QueuedRunRequest {
+                    case_id,
+                    queued_utc_unix: now_utc_unix(),
+                    note: format!("follow-on after {active}"),
+                });
+                self.project_notice = Some((
+                    format!(
+                        "Queued follow-on run · {} waiting behind the in-flight attempt.",
+                        self.run_queue.waiting.len()
+                    ),
+                    false,
+                ));
+                return;
+            }
+            self.project_notice = Some((
+                "Run queue is full (8). Wait for the in-flight attempt to finish.".into(),
+                true,
+            ));
+            return;
+        }
         if let Some(reason) = self.run_gate_reason() {
             self.project_notice = Some((reason, true));
             return;
@@ -3551,7 +3803,7 @@ impl ReynApp {
                 ui.label(RichText::new("No geometry imported").color(TEXT));
                 ui.label(
                     RichText::new(
-                        "Start with an STL. Reyn will preserve the source bytes, hash, transform, and every case revision.",
+                        "Start with an STL, single-part STEP, or 3MF file. Reyn preserves the source bytes, hash, transform, and every case revision.",
                     )
                     .text_style(caption())
                     .color(TEXT_MUTE),
@@ -3782,6 +4034,63 @@ impl ReynApp {
                     &short_hash(&case.workflow.preflight.source_sha256),
                     TEXT_MUTE,
                 );
+                let source_format = if case.workflow.preflight.source_format.is_empty() {
+                    "STL · legacy record".into()
+                } else {
+                    case.workflow.preflight.source_format.to_ascii_uppercase()
+                };
+                diag(ui, "Source format", &source_format, TEXT_DIM);
+                if case.workflow.preflight.source_format == "step"
+                    || case.workflow.preflight.source_format == "3mf"
+                {
+                    diag(
+                        ui,
+                        "Declared units",
+                        case.workflow
+                            .preflight
+                            .source_declared_units
+                            .as_deref()
+                            .unwrap_or("missing"),
+                        if case.workflow.preflight.source_declared_units.is_some() {
+                            TEXT_DIM
+                        } else {
+                            WARN
+                        },
+                    );
+                    diag(
+                        ui,
+                        if case.workflow.preflight.source_format == "step" {
+                            "STEP translator"
+                        } else {
+                            "3MF translator"
+                        },
+                        &format!(
+                            "{} {}",
+                            case.workflow.preflight.geometry_translator,
+                            case.workflow.preflight.geometry_translator_version
+                        ),
+                        TEXT_DIM,
+                    );
+                    if let Some(tolerance) =
+                        case.workflow.preflight.tessellation_tolerance_source_units
+                    {
+                        diag(
+                            ui,
+                            "Tessellation tolerance",
+                            &format!("{tolerance:.6} source units"),
+                            TEXT_DIM,
+                        );
+                    }
+                    if let Some(tolerance) = case.workflow.preflight.vertex_weld_relative_tolerance
+                    {
+                        diag(
+                            ui,
+                            "Face-boundary weld",
+                            &format!("{:.4}% of source diagonal", tolerance * 100.0),
+                            TEXT_DIM,
+                        );
+                    }
+                }
                 diag(
                     ui,
                     "Triangles",
@@ -4113,6 +4422,78 @@ impl ReynApp {
             }
             self.orientation_draft = next_orientation_draft;
         }
+        ui.add_space(10.0);
+        card(ui, |ui| {
+            ui.label(caps("Named regions"));
+            ui.label(
+                RichText::new(
+                    "Author labels on structural candidates for future boundary mapping. External-flow screening does not require them; they persist with the case.",
+                )
+                .text_style(caption())
+                .color(TEXT_MUTE),
+            );
+            ui.add_space(6.0);
+            let component_count = case.workflow.preflight.components.max(1);
+            for index in 0..component_count {
+                let candidate_id = format!("component-{index}");
+                let existing = case
+                    .workflow
+                    .named_regions
+                    .iter()
+                    .find(|region| region.candidate_id == candidate_id)
+                    .cloned()
+                    .unwrap_or_else(|| engineering::NamedRegionAssignment {
+                        name: String::new(),
+                        candidate_id: candidate_id.clone(),
+                        role: "unassigned".into(),
+                    });
+                let mut name = existing.name;
+                let mut role = existing.role;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&candidate_id).text_style(mono_s()).color(TEXT_DIM));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .hint_text("Label")
+                            .desired_width(120.0),
+                    );
+                    egui::ComboBox::from_id_salt(format!("region.role.{candidate_id}"))
+                        .selected_text(&role)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for option in ["unassigned", "wall", "inlet", "outlet", "symmetry"] {
+                                ui.selectable_value(&mut role, option.to_owned(), option);
+                            }
+                        });
+                });
+                let Some(slot) = case
+                    .workflow
+                    .named_regions
+                    .iter_mut()
+                    .find(|region| region.candidate_id == candidate_id)
+                else {
+                    if !name.trim().is_empty() || role != "unassigned" {
+                        case.workflow.named_regions.push(engineering::NamedRegionAssignment {
+                            name,
+                            candidate_id,
+                            role,
+                        });
+                    }
+                    continue;
+                };
+                if slot.name != name || slot.role != role {
+                    slot.name = name;
+                    slot.role = role;
+                    self.case_draft_dirty = true;
+                }
+            }
+            if ui
+                .add(egui::Button::new("Clear region labels"))
+                .clicked()
+            {
+                case.workflow.named_regions.clear();
+                self.case_draft_dirty = true;
+            }
+        });
         ui.add_space(10.0);
         card(ui, |ui| {
             ui.label(caps("Operating point"));
@@ -5501,7 +5882,7 @@ impl ReynApp {
                         );
                         ui.label(
                             RichText::new(
-                                "Import a fixed-body STL to create a source-aware, revisioned external-flow analysis.",
+                                "Import fixed-body STL or single-part STEP geometry to create a source-aware, revisioned external-flow analysis.",
                             )
                             .size(13.0)
                             .color(TEXT_MUTE),
@@ -5956,7 +6337,7 @@ impl ReynApp {
         } else {
             (
                 "No engineering result",
-                "Start with a fixed-body STL. Results appear here only after the supported case completes.",
+                "Start with fixed-body STL or single-part STEP geometry. Results appear here only after the supported case completes.",
                 "Start in Case Setup",
             )
         };
@@ -6817,7 +7198,7 @@ impl ReynApp {
         });
     }
 
-    /// Dev/QA hook (REYN_STUDIO_IMPORT=path.stl): run the ordinary import after
+    /// Dev/QA hook (REYN_STUDIO_IMPORT=path.stl|path.stp): run the ordinary import after
     /// a brief inventory wait. If no qualified model appears, the same
     /// model-independent diagnostic preflight used by a hand-import is shown.
     /// Failures surface as the normal import notice.
@@ -6878,6 +7259,7 @@ impl ReynApp {
             None,
             path,
             ScreenshotWriteKind::Qa,
+            ViewportShotProvenance::default(),
         );
     }
 
@@ -6925,6 +7307,7 @@ impl ReynApp {
             return;
         };
         let pixels_per_point = ctx.pixels_per_point();
+        let provenance = self.viewport_shot_provenance();
         spawn_screenshot_write(
             self.screenshot_result_tx.clone(),
             ctx.clone(),
@@ -6932,7 +7315,36 @@ impl ReynApp {
             self.last_render_rect.map(|rect| (rect, pixels_per_point)),
             path,
             ScreenshotWriteKind::Viewport,
+            provenance,
         );
+    }
+
+    fn viewport_shot_provenance(&self) -> ViewportShotProvenance {
+        let mut footer_lines = Vec::new();
+        footer_lines.push(format!(
+            "Reyn Studio {} · viewport evidence",
+            env!("CARGO_PKG_VERSION")
+        ));
+        if let Some(case) = self.cad.as_ref() {
+            if let Some(run_id) = case.active_run_id.as_deref() {
+                footer_lines.push(format!(
+                    "RUN {} · MODEL {}",
+                    short_id(run_id),
+                    case.workflow
+                        .model_sha256
+                        .as_deref()
+                        .map(short_hash)
+                        .unwrap_or_else(|| "UNKNOWN".into())
+                ));
+            }
+            footer_lines.push(format!(
+                "COLORMAP {:?} · CP RANGE {:?} · SOURCE MODEL/RECOVERED",
+                self.settings.colormap, self.settings.cp_range_mode
+            ));
+        } else {
+            footer_lines.push("No active engineering run · capture is unlabeled.".into());
+        }
+        ViewportShotProvenance { footer_lines }
     }
 
     fn handle_screenshot_write_results(&mut self) {
@@ -7019,23 +7431,88 @@ impl ReynApp {
             }
         };
         let file_name = format!(
-            "{}_{}_report.html",
+            "{}_{}_report",
             case.workflow.name.replace(' ', "_"),
             short_id(&run_id)
         );
         let Some(path) = self
-            .export_dialog(&file_name)
+            .export_dialog(&format!("{file_name}.html"))
             .add_filter("HTML", &["html"])
+            .add_filter("PNG lab sheet", &["png"])
+            .add_filter("PDF lab sheet", &["pdf"])
             .save_file()
         else {
             return;
         };
-        self.project_notice = Some(match std::fs::write(&path, html) {
-            Ok(()) => (
-                format!("Engineering report exported to {}.", path.display()),
-                false,
-            ),
-            Err(error) => (format!("Report was not written: {error}"), true),
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("html")
+            .to_ascii_lowercase();
+        self.project_notice = Some(match extension.as_str() {
+            "png" | "pdf" => {
+                let format = if extension == "png" {
+                    engineering_export::LabSheetFormat::Png
+                } else {
+                    engineering_export::LabSheetFormat::Pdf
+                };
+                let artifact = match self.settings.configured_signing_key() {
+                    Ok(Some(key)) => engineering_export::engineering_report_labsheet_signed(
+                        &input,
+                        format,
+                        &signing::NativeKeychainProvider,
+                        &key,
+                        self.settings.signing_key_is_revoked(),
+                        now_utc_unix(),
+                    ),
+                    _ => engineering_export::engineering_report_labsheet(&input, format),
+                };
+                match artifact {
+                    Ok(artifact) => {
+                        let sidecar = artifact.signature.as_ref().and_then(|signed| {
+                            let sidecar_path = if extension == "png" {
+                                path.with_extension("png.sig.json")
+                            } else {
+                                path.with_extension("pdf.sig.json")
+                            };
+                            signed.to_json().ok().and_then(|json| {
+                                std::fs::write(&sidecar_path, json).ok()?;
+                                Some(sidecar_path)
+                            })
+                        });
+                        match std::fs::write(&path, &artifact.bytes) {
+                            Ok(()) => (
+                                format!(
+                                    "Engineering {} report exported to {} · content {}… · html {}….{}",
+                                    format.extension().to_ascii_uppercase(),
+                                    path.display(),
+                                    &artifact.content_sha256[..12.min(artifact.content_sha256.len())],
+                                    &artifact.html_sha256[..12.min(artifact.html_sha256.len())],
+                                    sidecar
+                                        .map(|path| format!(" Signed sidecar: {}.", path.display()))
+                                        .unwrap_or_else(|| " Unsigned.".into())
+                                ),
+                                false,
+                            ),
+                            Err(error) => (format!("Report was not written: {error}"), true),
+                        }
+                    }
+                    Err(error) => (
+                        format!(
+                            "{} report was not produced: {error}",
+                            extension.to_ascii_uppercase()
+                        ),
+                        true,
+                    ),
+                }
+            }
+            _ => match std::fs::write(&path, html) {
+                Ok(()) => (
+                    format!("Engineering report exported to {}.", path.display()),
+                    false,
+                ),
+                Err(error) => (format!("Report was not written: {error}"), true),
+            },
         });
     }
 
@@ -7153,7 +7630,16 @@ impl ReynApp {
             return Some(reason);
         }
         if self.cad.as_ref().is_some_and(|case| case.pending) {
-            return Some("An immutable run attempt is already in flight.".to_owned());
+            let queued = self.run_queue.waiting.len();
+            if queued > 0 {
+                return Some(format!(
+                    "An immutable run is in flight · {queued} follow-on attempt(s) already queued."
+                ));
+            }
+            return Some(
+                "An immutable run attempt is already in flight. Start again after it finishes to queue a follow-on."
+                    .to_owned(),
+            );
         }
         if let Some(reason) = orientation_geometry_gate(
             "Starting a new run",
@@ -7261,7 +7747,7 @@ impl ReynApp {
                 self.case_history_gate_reason(CaseHistoryAction::Redo),
             ),
             (
-                "Import geometry (STL)…".into(),
+                "Import geometry (STL / STEP)…".into(),
                 PaletteAction::ImportGeometry,
                 None,
             ),
@@ -8351,7 +8837,7 @@ impl ReynApp {
                             ui.add_space(4.0);
                             ui.label(
                                 RichText::new(
-                                    "Fixed-body external flow · STL import and preprocessing. Everything stays on this machine.",
+                                    "Fixed-body external flow · STL and single-part STEP preprocessing. Everything stays on this machine.",
                                 )
                                 .text_style(caption())
                                 .color(TEXT_MUTE),
@@ -8365,7 +8851,7 @@ impl ReynApp {
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("Import geometry (STL)…")
+                                                    RichText::new("Import geometry (STL / STEP)…")
                                                         .color(ON_EMBER),
                                                 )
                                                 .fill(EMBER)
@@ -9183,7 +9669,7 @@ impl ReynApp {
                     });
             });
 
-        // Landing drop target (§4.2): dropped STL geometry starts an import,
+        // Landing drop target (§4.2): dropped STL/STEP geometry starts an import,
         // a dropped .reynproj opens through the same deferred (dirty-guarded)
         // path as the Open dialog. Anything else states why it was refused.
         let dropped: Vec<std::path::PathBuf> = ui.input(|input| {
@@ -9201,13 +9687,13 @@ impl ReynApp {
                 .map(str::to_ascii_lowercase)
                 .as_deref()
             {
-                Some("stl") => self.import_cad_path(path),
+                Some("stl" | "stp" | "step" | "3mf") => self.import_cad_path(path),
                 Some("reynproj") => {
                     requested_action = Some(project_lifecycle::DeferredProjectAction::Open(path));
                 }
                 _ => {
                     self.project_notice = Some((
-                        "Only STL geometry or .reynproj documents can be dropped here.".into(),
+                        "Only STL, STEP, or 3MF geometry or .reynproj documents can be dropped here.".into(),
                         true,
                     ));
                 }
@@ -10662,6 +11148,20 @@ impl ReynApp {
             operating,
             result: Some(result),
             parent_run_id: run.parent_run_id().map(str::to_owned),
+            named_regions: serde_json::from_value(
+                contract
+                    .get("named_regions")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .unwrap_or_default(),
+            view_state: serde_json::from_value(
+                contract
+                    .get("view_state")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .unwrap_or_default(),
         };
         let horizon = summary
             .get("horizon")
@@ -10695,6 +11195,7 @@ impl ReynApp {
             pending_run: None,
             playback: HorizonPlayback::default(),
         });
+        self.apply_case_view_state_from_active();
         self.rebase_case_draft_history();
         self.surface_on = true;
         self.volumetric = true;
@@ -10934,6 +11435,20 @@ impl ReynApp {
             operating,
             result,
             parent_run_id: selected_run_id.clone(),
+            named_regions: serde_json::from_value(
+                contract
+                    .get("named_regions")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .unwrap_or_default(),
+            view_state: serde_json::from_value(
+                contract
+                    .get("view_state")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .unwrap_or_default(),
         };
         let Some(field) = field_blob else {
             if self.orientation_worker.is_none() {
@@ -10958,6 +11473,7 @@ impl ReynApp {
                 request_id: request_id.clone(),
                 case_id: workflow.case_id.clone(),
                 source_sha256: source_sha256.clone(),
+                source_name: workflow.source_name.clone(),
                 angles,
                 grid: workflow.preflight.target_grid,
                 source_bytes,
@@ -11088,6 +11604,7 @@ impl ReynApp {
             pending_run: None,
             playback: HorizonPlayback::default(),
         });
+        self.apply_case_view_state_from_active();
         self.rebase_case_draft_history();
         self.nav = if self
             .cad
@@ -11444,11 +11961,14 @@ impl ReynApp {
         self.f2d_insights_key = Some(key);
     }
 
-    /// Import an STL, voxelize it onto the 3D model's grid, and send it to the
-    /// engine (which develops the flow with the real solver, then predicts).
+    /// Import supported geometry, voxelize it onto the 3D model's grid, and
+    /// send it to the engine (which develops the flow, then predicts).
     fn import_cad(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("STL", &["stl", "STL"])
+            .add_filter("Geometry", &["stl", "stp", "step", "3mf"])
+            .add_filter("STEP", &["stp", "step"])
+            .add_filter("3MF", &["3mf"])
+            .add_filter("STL", &["stl"])
             .pick_file()
         else {
             return;
@@ -11458,32 +11978,277 @@ impl ReynApp {
 
     /// Shared import path for the file dialog and the landing drop target.
     fn import_cad_path(&mut self, path: std::path::PathBuf) {
+        self.enqueue_geometry_import(path, None, None);
+    }
+
+    fn enqueue_geometry_import(
+        &mut self,
+        path: std::path::PathBuf,
+        selected_shell_entity_id: Option<u64>,
+        preloaded_bytes: Option<Vec<u8>>,
+    ) {
         if self.reject_project_mutation("Importing a geometry revision") {
             return;
         }
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let stage = match extension.as_str() {
+            "stp" | "step" => "Detecting STEP · translating B-rep · tessellating · voxelizing…",
+            "3mf" => "Reading 3MF package · tessellating · voxelizing…",
+            _ => "Reading geometry · voxelizing…",
+        };
+        self.project_notice = Some((stage.into(), false));
+        self.pending_shell_choice = None;
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("mesh")
             .to_string();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.project_notice = Some((format!("Geometry could not be read: {e}"), true));
-                return;
-            }
+        let bytes = match preloaded_bytes {
+            Some(bytes) => bytes,
+            None => match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.project_notice = Some((format!("Geometry could not be read: {e}"), true));
+                    return;
+                }
+            },
         };
-        let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
-        let mesh = match cad::parse_stl(&bytes) {
-            Ok(mesh) => mesh,
-            Err(error) => {
-                self.project_notice = Some((format!("STL import blocked: {error}"), true));
-                return;
-            }
+        let compatible = |card: &&engine::ModelCard| {
+            card.status != "invalid"
+                && engine::is_model_bundle_id(&card.id)
+                && card.authenticity_status == "verified"
+                && card.dimension == 3
+                && card.in_channels > card.out_channels
+                && card.grid > 0
         };
-        let mesh_diagnostics = cad::diagnose_mesh(&mesh);
-        // Use only an inventoried, verified geometry-conditioned 3D bundle.
-        // Prefer the persisted selection, then the highest declared grid.
+        let grid = self
+            .models
+            .iter()
+            .filter(compatible)
+            .find(|card| card.id == self.settings.default_3d_model)
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .filter(compatible)
+                    .max_by_key(|card| card.grid)
+            })
+            .map(|card| card.grid as usize)
+            .unwrap_or(DIAGNOSTIC_PREFLIGHT_GRID);
+        if self.geometry_import_worker.is_none() {
+            self.geometry_import_worker =
+                match GeometryImportWorker::spawn(self.repaint_context.clone()) {
+                    Ok(worker) => Some(worker),
+                    Err(error) => {
+                        self.project_notice = Some((error, true));
+                        return;
+                    }
+                };
+        }
+        self.geometry_import_generation = self.geometry_import_generation.wrapping_add(1).max(1);
+        let generation = self.geometry_import_generation;
+        let request_id = format!("geometry-import-{generation}-{}", uuid::Uuid::new_v4().simple());
+        let request = GeometryImportWorkRequest {
+            generation,
+            request_id: request_id.clone(),
+            path: path.clone(),
+            source_name: name,
+            source_bytes: bytes,
+            grid,
+            selected_shell_entity_id,
+        };
+        let sent = self
+            .geometry_import_worker
+            .as_ref()
+            .expect("geometry import worker was initialized")
+            .request_tx
+            .send(request);
+        if sent.is_err() {
+            self.geometry_import_worker = None;
+            self.project_notice = Some((
+                "Geometry import was not queued because the worker stopped.".into(),
+                true,
+            ));
+            return;
+        }
+        self.geometry_import_pending = Some(PendingGeometryImport {
+            generation,
+            request_id: request_id.clone(),
+            path,
+            started_at: std::time::Instant::now(),
+        });
+        self.engine_status = format!(
+            "● Geometry import running off-thread · {}",
+            short_id(&request_id)
+        );
+        self.project_notice = Some((
+            "Geometry translation and voxelization are running off the UI thread. Progress is indeterminate; you can cancel by importing another file (stale results are discarded)."
+                .into(),
+            false,
+        ));
+    }
+
+    fn handle_geometry_import_results(&mut self) {
+        let completed: Vec<_> = self
+            .geometry_import_worker
+            .as_ref()
+            .map(|worker| worker.result_rx.try_iter().collect())
+            .unwrap_or_default();
+        for completed in completed {
+            let is_current = self.geometry_import_pending.as_ref().is_some_and(|pending| {
+                pending.generation == completed.generation
+                    && pending.request_id == completed.request_id
+            });
+            if !is_current {
+                continue;
+            }
+            self.geometry_import_pending = None;
+            match completed.outcome {
+                Ok(ready) => {
+                    self.apply_geometry_import_ready(
+                        completed.path,
+                        completed.source_name,
+                        completed.source_bytes,
+                        completed.source_sha256,
+                        ready,
+                    );
+                }
+                Err(GeometryImportFailure::ChooseShell(choice)) => {
+                    self.pending_shell_choice = Some(PendingShellChoice {
+                        path: completed.path,
+                        source_name: completed.source_name,
+                        source_bytes: completed.source_bytes,
+                        source_sha256: completed.source_sha256,
+                        declared_unit: choice.declared_unit,
+                        shells: choice.shells,
+                    });
+                    self.project_notice = Some((
+                        "Multiple B-rep solids found. Choose one shell to analyze — occurrence assemblies remain unsupported."
+                            .into(),
+                        false,
+                    ));
+                    self.nav = Nav::Case;
+                }
+                Err(GeometryImportFailure::Message(error)) => {
+                    self.project_notice = Some((
+                        format!(
+                            "Geometry import blocked: {error}. Try exporting a single closed part as STL, STEP, or 3MF."
+                        ),
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn draw_shell_choice_modal(&mut self, ctx: &egui::Context) {
+        if let Some(pending) = self.geometry_import_pending.as_ref() {
+            let elapsed = pending.started_at.elapsed().as_secs();
+            let path_label = pending
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("geometry")
+                .to_owned();
+            let mut cancel = false;
+            egui::Window::new("Importing geometry")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Translating and voxelizing {path_label} · {elapsed}s · request {}",
+                        short_id(&pending.request_id)
+                    ));
+                    ui.label(
+                        egui::RichText::new(
+                            "Work runs off the UI thread. Cancel discards this generation; a late result cannot mutate the project.",
+                        )
+                        .weak(),
+                    );
+                    if ui.button("Cancel import").clicked() {
+                        cancel = true;
+                    }
+                });
+            if cancel {
+                self.geometry_import_generation =
+                    self.geometry_import_generation.wrapping_add(1).max(1);
+                self.geometry_import_pending = None;
+                self.project_notice = Some((
+                    "Geometry import cancelled. Any in-flight worker result will be discarded."
+                        .into(),
+                    false,
+                ));
+                self.engine_status = "○ Geometry import cancelled".into();
+            }
+        }
+        let Some(choice) = self.pending_shell_choice.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut selected = None;
+        let mut cancelled = false;
+        egui::Window::new("Choose solid")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "This STEP file has multiple B-rep shells without an assembly graph. Pick one solid to voxelize. Assemblies with occurrence transforms are still rejected.",
+                    )
+                    .weak(),
+                );
+                ui.label(format!(
+                    "Declared units: {} · {}",
+                    choice.declared_unit, choice.source_name
+                ));
+                ui.add_space(8.0);
+                for shell in &choice.shells {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 28.0],
+                            egui::Button::new(&shell.label),
+                        )
+                        .clicked()
+                    {
+                        selected = Some(shell.entity_id);
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.button("Cancel import").clicked() {
+                    cancelled = true;
+                }
+            });
+        if !open || cancelled {
+            self.pending_shell_choice = None;
+            self.project_notice = Some(("Geometry import cancelled.".into(), false));
+            return;
+        }
+        if let Some(entity_id) = selected {
+            let path = choice.path;
+            let bytes = choice.source_bytes;
+            let _ = choice.source_sha256;
+            self.pending_shell_choice = None;
+            self.enqueue_geometry_import(path, Some(entity_id), Some(bytes));
+        }
+    }
+
+    fn apply_geometry_import_ready(
+        &mut self,
+        path: std::path::PathBuf,
+        name: String,
+        bytes: Vec<u8>,
+        source_sha256: String,
+        ready: GeometryImportReady,
+    ) {
+        let imported = ready.imported;
+        let mesh_diagnostics = ready.diagnostics;
+        let vm = ready.voxel;
         let compatible = |card: &&engine::ModelCard| {
             card.status != "invalid"
                 && engine::is_model_bundle_id(&card.id)
@@ -11504,29 +12269,25 @@ impl ReynApp {
                     .max_by_key(|card| card.grid)
             })
             .cloned();
-        let (model, model_sha256, model_max_steps, model_support, n, model_warning) = if let Some(
-            model_card,
-        ) =
-            model_card
-        {
-            (
-                model_card.id,
-                Some(model_card.checkpoint_sha256),
-                model_card.max_steps,
-                engineering::ModelSupport {
-                    status: model_card.status,
-                    dimension: model_card.dimension,
-                    grid: model_card.grid,
-                    input_channels: model_card.in_channels,
-                    output_channels: model_card.out_channels,
-                    scenario: model_card.scenario,
-                    physics_contract: model_card.physics_contract,
-                },
-                model_card.grid as usize,
-                None,
-            )
-        } else {
-            (
+        let (model, model_sha256, model_max_steps, model_support, model_warning) =
+            if let Some(model_card) = model_card.filter(|card| card.grid as usize == vm.n) {
+                (
+                    model_card.id,
+                    Some(model_card.checkpoint_sha256),
+                    model_card.max_steps,
+                    engineering::ModelSupport {
+                        status: model_card.status,
+                        dimension: model_card.dimension,
+                        grid: model_card.grid,
+                        input_channels: model_card.in_channels,
+                        output_channels: model_card.out_channels,
+                        scenario: model_card.scenario,
+                        physics_contract: model_card.physics_contract,
+                    },
+                    None,
+                )
+            } else {
+                (
                     String::new(),
                     None,
                     0,
@@ -11534,280 +12295,321 @@ impl ReynApp {
                         status: "unavailable".into(),
                         ..Default::default()
                     },
-                    DIAGNOSTIC_PREFLIGHT_GRID,
                     Some(format!(
-                        "MODEL GATE · Geometry was inspected on the model-independent {DIAGNOSTIC_PREFLIGHT_GRID}³ diagnostic grid. Inference remains blocked until a compatible verified 3D .reynmodel bundle with a matching grid is selected."
+                        "MODEL GATE · Geometry was inspected on the model-independent {}³ diagnostic grid. Inference remains blocked until a compatible verified 3D .reynmodel bundle with a matching grid is selected.",
+                        vm.n
                     )),
                 )
-        };
-        match cad::voxelize(&mesh, n) {
-            Ok(vm) => {
-                let mask = std::sync::Arc::new(vm.mask);
-                let source_revision_id = format!("source-{}", uuid::Uuid::new_v4());
-                let case_id = self
-                    .cad
-                    .as_ref()
-                    .map(|case| case.workflow.case_id.clone())
-                    .unwrap_or_else(|| format!("case-{}", uuid::Uuid::new_v4()));
-                let case_revision_id = format!("case-revision-{}", uuid::Uuid::new_v4());
-                let parent_source_revision_id = self
-                    .cad
-                    .as_ref()
-                    .and_then(|case| case.workflow.source_revision_id.clone());
-                let parent_case_revision_id = self
-                    .cad
-                    .as_ref()
-                    .and_then(|case| case.workflow.case_revision_id.clone());
-                let source_revision_number = parent_source_revision_id
-                    .as_ref()
-                    .and_then(|parent| {
-                        self.project
-                            .manifest()
-                            .source_revisions()
-                            .iter()
-                            .find(|source| source.source_revision_id == *parent)
-                            .map(|source| source.revision + 1)
-                    })
-                    .unwrap_or(1);
-                let mut warnings = model_warning.into_iter().collect::<Vec<_>>();
-                if mesh_diagnostics.inconsistent_winding_edges > 0 {
-                    warnings.push(format!(
-                        "{} edges have inconsistent winding.",
-                        mesh_diagnostics.inconsistent_winding_edges
-                    ));
-                }
-                if mesh_diagnostics.self_intersection_pairs > 0 {
-                    warnings.push(format!(
-                        "{} non-adjacent triangle pairs intersect.",
-                        mesh_diagnostics.self_intersection_pairs
-                    ));
-                }
-                if mesh_diagnostics.signed_volume < 0.0 {
-                    warnings.push(
-                        "Source triangle winding is inward. The value is recorded; current diffuse-interface loads derive normals from the occupancy mask and are not sign-flipped by STL winding."
-                            .into(),
-                    );
-                }
-                if mesh_diagnostics.components > 1 {
-                    warnings.push(format!(
-                        "{} disconnected STL components detected.",
-                        mesh_diagnostics.components
-                    ));
-                }
-                if let Some(previous) = &self.cad {
-                    let prior = &previous.workflow.preflight;
-                    if prior.source_sha256 != source_sha256 {
-                        warnings.push(format!(
-                            "REIMPORT CHANGE · source SHA-256 {} → {}.",
-                            short_hash(&prior.source_sha256),
-                            short_hash(&source_sha256)
-                        ));
-                    }
-                    if prior.triangles != mesh_diagnostics.triangles {
-                        warnings.push(format!(
-                            "REIMPORT CHANGE · triangle count {} → {}.",
-                            prior.triangles, mesh_diagnostics.triangles
-                        ));
-                    }
-                    let next_extents = mesh_diagnostics.extents.map(f64::from);
-                    if prior.source_extents != next_extents {
-                        warnings.push(format!(
-                            "REIMPORT CHANGE · source extents {:?} → {:?}; region identity is not preserved for STL.",
-                            prior.source_extents, next_extents
-                        ));
-                    }
-                    if prior.boundary_edges != mesh_diagnostics.boundary_edges
-                        || prior.non_manifold_edges != mesh_diagnostics.non_manifold_edges
-                        || prior.degenerate_triangles != mesh_diagnostics.degenerate_triangles
-                    {
-                        warnings.push(format!(
-                            "REIMPORT CHANGE · defects open/non-manifold/degenerate {}·{}·{} → {}·{}·{}.",
-                            prior.boundary_edges,
-                            prior.non_manifold_edges,
-                            prior.degenerate_triangles,
-                            mesh_diagnostics.boundary_edges,
-                            mesh_diagnostics.non_manifold_edges,
-                            mesh_diagnostics.degenerate_triangles
-                        ));
-                    }
-                }
-                let preflight = engineering::GeometryPreflight {
-                    source_sha256: source_sha256.clone(),
-                    source_bytes: bytes.len() as u64,
-                    triangles: mesh_diagnostics.triangles,
-                    components: mesh_diagnostics.components,
-                    degenerate_triangles: mesh_diagnostics.degenerate_triangles,
-                    boundary_edges: mesh_diagnostics.boundary_edges,
-                    non_manifold_edges: mesh_diagnostics.non_manifold_edges,
-                    inconsistent_winding_edges: mesh_diagnostics.inconsistent_winding_edges,
-                    self_intersection_pairs: mesh_diagnostics.self_intersection_pairs,
-                    source_signed_volume: mesh_diagnostics.signed_volume,
-                    source_extents: mesh_diagnostics.extents.map(f64::from),
-                    proposed_scale: vm.scale,
-                    solver_characteristic_length: vm.char_len as f64,
-                    angle_of_attack_deg: 0.0,
-                    yaw_deg: 0.0,
-                    roll_deg: 0.0,
-                    transform_4x4: vm.transform_4x4,
-                    target_grid: vm.n,
-                    solid_voxels: vm.solid_voxels,
-                    voxel_components: vm.components,
-                    minimum_cells_across: vm.minimum_cells_across,
-                    boundary_clearance_cells: vm.boundary_clearance_cells,
-                    voxel_axis_disagreement_fraction: vm.axis_disagreement_fraction,
-                    voxel_odd_crossing_rows: vm.odd_crossing_rows,
-                    voxel_classification_version: vm.classification_version,
-                    warnings: warnings.clone(),
-                    waivers: Vec::new(),
-                    transform_approved: false,
-                };
-                let reference_length = mesh_diagnostics.extents[1]
-                    .max(mesh_diagnostics.extents[2])
-                    .max(1e-6) as f64;
-                let workflow = engineering::ExternalFlowCase {
-                    stage: engineering::CaseStage::Preflight,
-                    case_id: case_id.clone(),
-                    name: name.trim_end_matches(".stl").to_string(),
-                    source_name: name.clone(),
-                    source_revision_id: Some(source_revision_id.clone()),
-                    case_revision_id: Some(case_revision_id.clone()),
-                    model_id: model.clone(),
-                    model_sha256,
-                    model_max_steps,
-                    model_support,
-                    preflight,
-                    operating: engineering::OperatingPoint {
-                        reference_length,
-                        // Settings › Workflow default, clamped to the model.
-                        horizon_steps: self
-                            .settings
-                            .default_horizon_steps
-                            .clamp(1, model_max_steps.max(1)),
-                        ..Default::default()
-                    },
-                    result: None,
-                    parent_run_id: self
-                        .cad
-                        .as_ref()
-                        .and_then(|case| case.active_run_id.clone()),
-                };
-                if let Err(error) = self.add_project_content(
-                    "Importing a geometry revision",
-                    bytes.clone(),
-                    "model/stl",
-                    &source_sha256,
-                ) {
-                    self.project_notice =
-                        Some((format!("Geometry content was not stored: {error}"), true));
-                    return;
-                }
-                let source = project::SourceRevision {
-                    source_revision_id: source_revision_id.clone(),
-                    source_kind: project::SourceKind::Geometry,
-                    revision: source_revision_number,
-                    imported_utc_unix: now_utc_unix(),
-                    uri_hint: Some(path.display().to_string()),
-                    byte_size: bytes.len() as u64,
-                    content_sha256: source_sha256,
-                    declared_units: None,
-                    frame: Some("source frame; preprocessing transform pending approval".into()),
-                    transform_4x4: vm.transform_4x4,
-                    parent_revision_id: parent_source_revision_id,
-                    warnings,
-                };
-                let revision = project::CaseRevision {
-                    case_revision_id: case_revision_id.clone(),
-                    parent_revision_id: parent_case_revision_id,
-                    created_utc_unix: now_utc_unix(),
-                    source_revision_ids: vec![source_revision_id],
-                    contract: workflow.exact_contract(),
-                    discretization: serde_json::json!({
-                        "grid": [vm.n, vm.n, vm.n],
-                        "solid_voxels": vm.solid_voxels,
-                        "minimum_cells_across": vm.minimum_cells_across,
-                        "boundary_clearance_cells": vm.boundary_clearance_cells,
-                        "axis_disagreement_fraction": vm.axis_disagreement_fraction,
-                        "odd_crossing_rows_xyz": vm.odd_crossing_rows,
-                        "classification_version": vm.classification_version,
-                        "transform_4x4": vm.transform_4x4,
-                    }),
-                    outputs: serde_json::json!({
-                        "velocity": "model_prediction",
-                        "pressure": "recovered",
-                        "surface_loads": engineering::SURFACE_LOAD_METHOD,
-                    }),
-                };
-                let existing_case = self
-                    .project
-                    .manifest()
-                    .cases()
-                    .iter()
-                    .any(|case| case.case_id() == case_id);
-                let persist_result = self.transact_project(
-                    "Importing a geometry revision",
-                    now_utc_unix(),
-                    |manifest| {
-                        manifest.add_source_revision(source, now_utc_unix())?;
-                        if existing_case {
-                            manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
-                        } else {
-                            manifest.create_case(
-                                case_id.clone(),
-                                workflow.name.clone(),
-                                revision,
-                                now_utc_unix(),
-                            )?;
-                        }
-                        Ok(())
-                    },
-                );
-                if let Err(error) = persist_result {
-                    self.project_notice =
-                        Some((format!("Case revision was not recorded: {error}"), true));
-                    return;
-                }
-                self.dependencies_dirty = true;
-                self.invalidate_cad_section();
-                self.cad = Some(CadCase {
-                    mask: mask.clone(),
-                    mask_bounds: cad::mask_bounds(mask.as_ref(), vm.n),
-                    model: model.clone(),
-                    steps: workflow.operating.horizon_steps,
-                    surf: None,
-                    surf_mask_source: None,
-                    name: name.clone(),
-                    workflow,
-                    velocity: Vec::new(),
-                    pressure: Vec::new(),
-                    cp: Vec::new(),
-                    traction: Vec::new(),
-                    result_grid: 0,
-                    dt_frame: 0.0,
-                    active_run_id: None,
-                    pending: false,
-                    pending_request_id: None,
-                    pending_run: None,
-                    playback: HorizonPlayback::default(),
-                });
-                self.case_draft_dirty = false;
-                self.orientation_draft = None;
-                self.orientation_pending = None;
-                self.rebase_case_draft_history();
-                self.nav = Nav::Case;
-                self.engine_status = format!(
-                    "● {name}: {} triangles → {} solid voxels @ {}³ · preflight required",
-                    mesh_diagnostics.triangles, vm.solid_voxels, vm.n
-                );
-                self.project_notice = Some((
-                    "Geometry revision stored. Confirm units, transform, preflight, and operating point before execution."
-                        .into(),
-                    false,
+            };
+            let mask = std::sync::Arc::new(vm.mask);
+            let source_revision_id = format!("source-{}", uuid::Uuid::new_v4());
+            let case_id = self
+                .cad
+                .as_ref()
+                .map(|case| case.workflow.case_id.clone())
+                .unwrap_or_else(|| format!("case-{}", uuid::Uuid::new_v4()));
+            let case_revision_id = format!("case-revision-{}", uuid::Uuid::new_v4());
+            let parent_source_revision_id = self
+                .cad
+                .as_ref()
+                .and_then(|case| case.workflow.source_revision_id.clone());
+            let parent_case_revision_id = self
+                .cad
+                .as_ref()
+                .and_then(|case| case.workflow.case_revision_id.clone());
+            let source_revision_number = parent_source_revision_id
+                .as_ref()
+                .and_then(|parent| {
+                    self.project
+                        .manifest()
+                        .source_revisions()
+                        .iter()
+                        .find(|source| source.source_revision_id == *parent)
+                        .map(|source| source.revision + 1)
+                })
+                .unwrap_or(1);
+            let mut warnings = model_warning.into_iter().collect::<Vec<_>>();
+            warnings.extend(imported.warnings.clone());
+            if imported.format == cad::GeometryFormat::Step {
+                warnings.push(format!(
+                    "STEP TESSELLATION · {} {} · relative chord tolerance {:.6} (absolute {:.6} source units) · face-boundary weld tolerance {:.6} relative · {} B-rep shell(s). The original STEP bytes remain authoritative.",
+                    imported.translator,
+                    imported.translator_version,
+                    crate::cad_step::RELATIVE_CHORD_TOLERANCE,
+                    imported
+                        .tessellation_tolerance_source_units
+                        .unwrap_or_default(),
+                    imported.vertex_weld_relative_tolerance.unwrap_or_default(),
+                    imported.source_shells,
                 ));
             }
-            Err(e) => {
-                self.project_notice = Some((format!("Voxel preflight blocked: {e}"), true));
+            if mesh_diagnostics.inconsistent_winding_edges > 0 {
+                warnings.push(format!(
+                    "{} edges have inconsistent winding.",
+                    mesh_diagnostics.inconsistent_winding_edges
+                ));
             }
-        }
+            if mesh_diagnostics.self_intersection_pairs > 0 {
+                warnings.push(format!(
+                    "{} non-adjacent triangle pairs intersect.",
+                    mesh_diagnostics.self_intersection_pairs
+                ));
+            }
+            if mesh_diagnostics.signed_volume < 0.0 {
+                warnings.push(format!(
+                    "The derived {} triangle winding is inward. The value is recorded; current diffuse-interface loads derive normals from the occupancy mask and are not sign-flipped by source winding.",
+                    imported.format.label()
+                ));
+            }
+            if mesh_diagnostics.components > 1 {
+                warnings.push(format!(
+                    "{} disconnected {} components detected.",
+                    mesh_diagnostics.components,
+                    imported.format.label(),
+                ));
+            }
+            if let Some(previous) = &self.cad {
+                let prior = &previous.workflow.preflight;
+                if prior.source_sha256 != source_sha256 {
+                    warnings.push(format!(
+                        "REIMPORT CHANGE · source SHA-256 {} → {}.",
+                        short_hash(&prior.source_sha256),
+                        short_hash(&source_sha256)
+                    ));
+                }
+                if prior.triangles != mesh_diagnostics.triangles {
+                    warnings.push(format!(
+                        "REIMPORT CHANGE · triangle count {} → {}.",
+                        prior.triangles, mesh_diagnostics.triangles
+                    ));
+                }
+                let next_extents = mesh_diagnostics.extents.map(f64::from);
+                if prior.source_extents != next_extents {
+                    warnings.push(format!(
+                        "REIMPORT CHANGE · source extents {:?} → {:?}; stable face-region identity is not preserved by the current {} import path.",
+                        prior.source_extents,
+                        next_extents,
+                        imported.format.label(),
+                    ));
+                }
+                if prior.boundary_edges != mesh_diagnostics.boundary_edges
+                    || prior.non_manifold_edges != mesh_diagnostics.non_manifold_edges
+                    || prior.degenerate_triangles != mesh_diagnostics.degenerate_triangles
+                {
+                    warnings.push(format!(
+                        "REIMPORT CHANGE · defects open/non-manifold/degenerate {}·{}·{} → {}·{}·{}.",
+                        prior.boundary_edges,
+                        prior.non_manifold_edges,
+                        prior.degenerate_triangles,
+                        mesh_diagnostics.boundary_edges,
+                        mesh_diagnostics.non_manifold_edges,
+                        mesh_diagnostics.degenerate_triangles
+                    ));
+                }
+            }
+            let preflight = engineering::GeometryPreflight {
+                source_sha256: source_sha256.clone(),
+                source_bytes: bytes.len() as u64,
+                source_format: match imported.format {
+                    cad::GeometryFormat::Stl => "stl",
+                    cad::GeometryFormat::Step => "step",
+                    cad::GeometryFormat::ThreeMf => "3mf",
+                }
+                .into(),
+                source_declared_units: imported.declared_unit.clone(),
+                geometry_translator: imported.translator.clone(),
+                geometry_translator_version: imported.translator_version.clone(),
+                tessellation_tolerance_source_units: imported
+                    .tessellation_tolerance_source_units,
+                vertex_weld_relative_tolerance: imported.vertex_weld_relative_tolerance,
+                source_shells: imported.source_shells,
+                triangles: mesh_diagnostics.triangles,
+                components: mesh_diagnostics.components,
+                degenerate_triangles: mesh_diagnostics.degenerate_triangles,
+                boundary_edges: mesh_diagnostics.boundary_edges,
+                non_manifold_edges: mesh_diagnostics.non_manifold_edges,
+                inconsistent_winding_edges: mesh_diagnostics.inconsistent_winding_edges,
+                self_intersection_pairs: mesh_diagnostics.self_intersection_pairs,
+                source_signed_volume: mesh_diagnostics.signed_volume,
+                source_extents: mesh_diagnostics.extents.map(f64::from),
+                proposed_scale: vm.scale,
+                solver_characteristic_length: vm.char_len as f64,
+                angle_of_attack_deg: 0.0,
+                yaw_deg: 0.0,
+                roll_deg: 0.0,
+                transform_4x4: vm.transform_4x4,
+                target_grid: vm.n,
+                solid_voxels: vm.solid_voxels,
+                voxel_components: vm.components,
+                minimum_cells_across: vm.minimum_cells_across,
+                boundary_clearance_cells: vm.boundary_clearance_cells,
+                voxel_axis_disagreement_fraction: vm.axis_disagreement_fraction,
+                voxel_odd_crossing_rows: vm.odd_crossing_rows,
+                voxel_classification_version: vm.classification_version,
+                warnings: warnings.clone(),
+                waivers: Vec::new(),
+                transform_approved: false,
+            };
+            let reference_length = mesh_diagnostics.extents[1]
+                .max(mesh_diagnostics.extents[2])
+                .max(1e-6) as f64;
+            let declared_length_unit = match imported.declared_unit.as_deref() {
+                Some("mm") => engineering::LengthUnit::Millimeter,
+                Some("cm") => engineering::LengthUnit::Centimeter,
+                Some("m") => engineering::LengthUnit::Meter,
+                Some("in") => engineering::LengthUnit::Inch,
+                Some("ft") => engineering::LengthUnit::Foot,
+                _ => engineering::LengthUnit::Unknown,
+            };
+            let workflow = engineering::ExternalFlowCase {
+                stage: engineering::CaseStage::Preflight,
+                case_id: case_id.clone(),
+                name: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Geometry")
+                    .to_string(),
+                source_name: name.clone(),
+                source_revision_id: Some(source_revision_id.clone()),
+                case_revision_id: Some(case_revision_id.clone()),
+                model_id: model.clone(),
+                model_sha256,
+                model_max_steps,
+                model_support,
+                preflight,
+                operating: engineering::OperatingPoint {
+                    // STEP declarations prefill this control but do not
+                    // approve the transform; the operator must still
+                    // confirm it through the existing hard gate.
+                    length_unit: declared_length_unit,
+                    reference_length,
+                    // Settings › Workflow default, clamped to the model.
+                    horizon_steps: self
+                        .settings
+                        .default_horizon_steps
+                        .clamp(1, model_max_steps.max(1)),
+                    ..Default::default()
+                },
+                result: None,
+                parent_run_id: self
+                    .cad
+                    .as_ref()
+                    .and_then(|case| case.active_run_id.clone()),
+                named_regions: Vec::new(),
+                view_state: Default::default(),
+            };
+            if let Err(error) = self.add_project_content(
+                "Importing a geometry revision",
+                bytes.clone(),
+                imported.format.media_type(),
+                &source_sha256,
+            ) {
+                self.project_notice =
+                    Some((format!("Geometry content was not stored: {error}"), true));
+                return;
+            }
+            let source = project::SourceRevision {
+                source_revision_id: source_revision_id.clone(),
+                source_kind: project::SourceKind::Geometry,
+                revision: source_revision_number,
+                imported_utc_unix: now_utc_unix(),
+                uri_hint: Some(path.display().to_string()),
+                byte_size: bytes.len() as u64,
+                content_sha256: source_sha256,
+                declared_units: imported.declared_unit.clone(),
+                frame: Some("source frame; preprocessing transform pending approval".into()),
+                transform_4x4: vm.transform_4x4,
+                parent_revision_id: parent_source_revision_id,
+                warnings,
+            };
+            let revision = project::CaseRevision {
+                case_revision_id: case_revision_id.clone(),
+                parent_revision_id: parent_case_revision_id,
+                created_utc_unix: now_utc_unix(),
+                source_revision_ids: vec![source_revision_id],
+                contract: workflow.exact_contract(),
+                discretization: serde_json::json!({
+                    "grid": [vm.n, vm.n, vm.n],
+                    "solid_voxels": vm.solid_voxels,
+                    "minimum_cells_across": vm.minimum_cells_across,
+                    "boundary_clearance_cells": vm.boundary_clearance_cells,
+                    "axis_disagreement_fraction": vm.axis_disagreement_fraction,
+                    "odd_crossing_rows_xyz": vm.odd_crossing_rows,
+                    "classification_version": vm.classification_version,
+                    "transform_4x4": vm.transform_4x4,
+                }),
+                outputs: serde_json::json!({
+                    "velocity": "model_prediction",
+                    "pressure": "recovered",
+                    "surface_loads": engineering::SURFACE_LOAD_METHOD,
+                }),
+            };
+            let existing_case = self
+                .project
+                .manifest()
+                .cases()
+                .iter()
+                .any(|case| case.case_id() == case_id);
+            let persist_result = self.transact_project(
+                "Importing a geometry revision",
+                now_utc_unix(),
+                |manifest| {
+                    manifest.add_source_revision(source, now_utc_unix())?;
+                    if existing_case {
+                        manifest.append_case_revision(&case_id, revision, now_utc_unix())?;
+                    } else {
+                        manifest.create_case(
+                            case_id.clone(),
+                            workflow.name.clone(),
+                            revision,
+                            now_utc_unix(),
+                        )?;
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(error) = persist_result {
+                self.project_notice =
+                    Some((format!("Case revision was not recorded: {error}"), true));
+                return;
+            }
+            self.dependencies_dirty = true;
+            self.invalidate_cad_section();
+            self.cad = Some(CadCase {
+                mask: mask.clone(),
+                mask_bounds: cad::mask_bounds(mask.as_ref(), vm.n),
+                model: model.clone(),
+                steps: workflow.operating.horizon_steps,
+                surf: None,
+                surf_mask_source: None,
+                name: name.clone(),
+                workflow,
+                velocity: Vec::new(),
+                pressure: Vec::new(),
+                cp: Vec::new(),
+                traction: Vec::new(),
+                result_grid: 0,
+                dt_frame: 0.0,
+                active_run_id: None,
+                pending: false,
+                pending_request_id: None,
+                pending_run: None,
+                playback: HorizonPlayback::default(),
+            });
+            self.case_draft_dirty = false;
+            self.orientation_draft = None;
+            self.orientation_pending = None;
+            self.rebase_case_draft_history();
+            self.nav = Nav::Case;
+            self.engine_status = format!(
+                "● {name}: {} triangles → {} solid voxels @ {}³ · preflight required",
+                mesh_diagnostics.triangles, vm.solid_voxels, vm.n
+            );
+            self.project_notice = Some((
+                "Geometry revision stored. Confirm units, transform, preflight, and operating point before execution."
+                    .into(),
+                false,
+            ));
     }
 
     fn import_model(&mut self) {
@@ -12220,6 +13022,29 @@ impl ReynApp {
                             // Force colormapped textures to rebuild with the
                             // new appearance preferences.
                             self.invalidate_field_textures();
+                            if let Some(case) = self.cad.as_mut() {
+                                case.workflow.view_state.colormap = Some(
+                                    serde_json::to_value(self.settings.colormap)
+                                        .ok()
+                                        .and_then(|value| {
+                                            value.as_str().map(str::to_owned)
+                                        })
+                                        .unwrap_or_else(|| format!("{:?}", self.settings.colormap)),
+                                );
+                                case.workflow.view_state.cp_range_mode = Some(
+                                    serde_json::to_value(self.settings.cp_range_mode)
+                                        .ok()
+                                        .and_then(|value| {
+                                            value.as_str().map(str::to_owned)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            format!("{:?}", self.settings.cp_range_mode)
+                                        }),
+                                );
+                                case.workflow.view_state.cp_pinned_extent =
+                                    Some(self.settings.cp_pinned_extent);
+                                case.workflow.view_state.streamlines = self.streamlines;
+                            }
                         }
                         self.settings_notice =
                             Some((format!("Saved locally to {}", path.display()), false));
@@ -12366,6 +13191,17 @@ impl ReynApp {
                             reduced_motion: reduced_motion(ui.ctx()),
                             research_sandbox: self.nav == Nav::Metrics
                                 && self.settings.developer_research_sandbox,
+                            model_velocity: if self.nav == Nav::Results {
+                                self.cad.as_ref().and_then(|case| {
+                                    let fields = case.display_fields()?;
+                                    Some(viewport::ModelVelocityField {
+                                        n: fields.n,
+                                        vel: std::sync::Arc::<[f32]>::from(fields.velocity.to_vec()),
+                                    })
+                                })
+                            } else {
+                                None
+                            },
                         };
                         let interaction =
                             viewport::show(ui, rect, &mut self.cam, &opts, &self.particles);
@@ -12500,6 +13336,7 @@ impl ReynApp {
                 // Camera stations and zoom-to-fit, mirroring the 1–7 / F keys.
                 if show_3d_controls {
                     self.viewport_camera_controls(ui, rect, banner_offset, camera_readout);
+                    viewport::draw_axis_triad(&p, rect, &self.cam);
                     self.viewport_horizon_controls(ui, rect);
                     self.draw_surface_probe(&p, rect, mono_s().resolve(ui.style()));
                 }
@@ -13223,7 +14060,7 @@ impl ReynApp {
 
         let available = Rect::from_min_max(
             rect.min + Vec2::new(46.0, 88.0),
-            rect.max - Vec2::new(46.0, 102.0),
+            rect.max - Vec2::new(46.0, 168.0),
         );
         let side = available.width().min(available.height()).max(1.0);
         let panel = Rect::from_center_size(available.center(), Vec2::splat(side));
@@ -13235,6 +14072,7 @@ impl ReynApp {
             Stroke::new(1.0, OUTLINE),
             egui::StrokeKind::Outside,
         );
+        draw_section_cp_profile(&painter, rect, panel, section);
         painter.text(
             egui::pos2(panel.center().x, panel.max.y + 12.0),
             Align2::CENTER_TOP,
@@ -17245,6 +18083,7 @@ fn spawn_screenshot_write(
     crop: Option<(Rect, f32)>,
     path: std::path::PathBuf,
     kind: ScreenshotWriteKind,
+    provenance: ViewportShotProvenance,
 ) {
     std::thread::Builder::new()
         .name("reyn-screenshot-write".into())
@@ -17252,15 +18091,247 @@ fn spawn_screenshot_write(
             let result = match crop {
                 Some((rect, pixels_per_point)) => {
                     let cropped = image.region(&rect, Some(pixels_per_point));
-                    color_image_png_bytes(&cropped, 0)
+                    color_image_png_bytes_with_footer(&cropped, 0, &provenance.footer_lines)
                 }
-                None => color_image_png_bytes(image.as_ref(), 0),
+                None => color_image_png_bytes_with_footer(image.as_ref(), 0, &provenance.footer_lines),
             }
             .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
             let _ = result_tx.send(ScreenshotWriteResult { kind, path, result });
             repaint_context.request_repaint();
         })
         .expect("screenshot worker thread should start");
+}
+
+fn color_image_png_bytes_with_footer(
+    image: &egui::ColorImage,
+    min_edge: usize,
+    footer_lines: &[String],
+) -> Result<Vec<u8>, String> {
+    if footer_lines.is_empty() {
+        return color_image_png_bytes(image, min_edge);
+    }
+    let [width, height] = image.size;
+    if width == 0 || height == 0 {
+        return Err("the image is empty".into());
+    }
+    let factor = if min_edge == 0 {
+        1
+    } else {
+        min_edge.div_ceil(width.max(height)).max(1)
+    };
+    let (out_width, body_height) = (width * factor, height * factor);
+    let line_height = 18usize;
+    let footer_height = 12 + footer_lines.len() * line_height + 10;
+    let out_height = body_height + footer_height;
+    let mut rgba = Vec::with_capacity(out_width * out_height * 4);
+    for row in 0..body_height {
+        for column in 0..out_width {
+            let pixel = image.pixels[(row / factor) * width + (column / factor)];
+            rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+        }
+    }
+    // Warm-dark instrument footer: near-black strip with light text baked as
+    // solid pixels (no font rasterizer dependency in the screenshot path).
+    for row in 0..footer_height {
+        for _column in 0..out_width {
+            let edge = row < 1;
+            if edge {
+                rgba.extend_from_slice(&[90, 72, 60, 255]);
+            } else {
+                rgba.extend_from_slice(&[28, 22, 18, 255]);
+            }
+        }
+    }
+    // Stamp a readable monochrome bitmap for each footer line using a 5x7
+    // pattern for ASCII — enough for provenance hashes and labels.
+    for (line_index, line) in footer_lines.iter().enumerate() {
+        let y0 = body_height + 8 + line_index * line_height;
+        stamp_footer_text(&mut rgba, out_width, out_height, 10, y0, line);
+    }
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, out_width as u32, out_height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+        writer
+            .write_image_data(&rgba)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(bytes)
+}
+
+fn stamp_footer_text(
+    rgba: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    text: &str,
+) {
+    // Compact 5×7 glyphs for the provenance digits/letters we actually emit.
+    fn glyph(ch: char) -> Option<[u8; 7]> {
+        Some(match ch {
+            '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+            '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+            '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+            '3' => [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
+            '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+            '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+            '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+            '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+            '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+            '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+            'a'..='z' => return glyph(ch.to_ascii_uppercase()),
+            'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+            'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+            'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+            'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+            'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+            'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+            'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+            'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+            'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+            'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
+            'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+            'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+            'M' => [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001],
+            'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+            'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+            'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+            'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+            'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+            'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+            'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+            'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+            'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+            'W' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b11011, 0b10001],
+            'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+            'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+            'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+            ' ' => [0; 7],
+            '.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
+            '-' => [0, 0, 0, 0b01110, 0, 0, 0],
+            ':' => [0, 0b00100, 0, 0, 0b00100, 0, 0],
+            '/' => [0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0],
+            '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
+            ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
+            '·' | '•' => [0, 0, 0b00100, 0, 0, 0, 0],
+            _ => return None,
+        })
+    }
+    let mut x = x0;
+    for ch in text.chars().take(96) {
+        let Some(rows) = glyph(ch) else {
+            x += 6;
+            continue;
+        };
+        for (row, bits) in rows.iter().enumerate() {
+            for col in 0..5 {
+                if bits & (1 << (4 - col)) != 0 {
+                    let px = x + col;
+                    let py = y0 + row;
+                    if px < width && py < height {
+                        let index = (py * width + px) * 4;
+                        rgba[index..index + 4].copy_from_slice(&[230, 214, 200, 255]);
+                    }
+                }
+            }
+        }
+        x += 6;
+    }
+}
+
+/// Mid-line Cp (or active quantity) profile under the section image.
+fn draw_section_cp_profile(
+    painter: &egui::Painter,
+    viewport: Rect,
+    panel: Rect,
+    section: &engineering_section::SectionPlane,
+) {
+    let plot = Rect::from_min_max(
+        egui::pos2(viewport.min.x + 46.0, panel.max.y + 28.0),
+        egui::pos2(viewport.max.x - 46.0, viewport.max.y - 24.0),
+    );
+    if plot.height() < 48.0 || plot.width() < 160.0 {
+        return;
+    }
+    painter.rect_filled(plot, CornerRadius::same(3), SURFACE);
+    painter.rect_stroke(
+        plot,
+        CornerRadius::same(3),
+        Stroke::new(1.0, OUTLINE_VARIANT),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        plot.min + Vec2::new(10.0, 6.0),
+        Align2::LEFT_TOP,
+        format!(
+            "{} mid-line · {}",
+            section.quantity.label(),
+            section.quantity.source()
+        ),
+        FontId::monospace(10.0),
+        GOLD,
+    );
+    let n = section.n.max(2);
+    let mid = n / 2;
+    let mut series = Vec::with_capacity(n);
+    for i in 0..n {
+        let index = mid * n + i;
+        if section.mask.get(index).copied().unwrap_or(0.0) > 0.5 {
+            series.push((i as f32 / (n - 1) as f32, section.values[index]));
+        }
+    }
+    if series.len() < 2 {
+        painter.text(
+            plot.center(),
+            Align2::CENTER_CENTER,
+            "No fluid samples on the mid-line",
+            FontId::proportional(11.0),
+            TEXT_MUTE,
+        );
+        return;
+    }
+    let mut lo = series
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::INFINITY, f32::min);
+    let mut hi = series
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !lo.is_finite() || !hi.is_finite() || (hi - lo).abs() < 1e-6 {
+        lo -= 1.0;
+        hi += 1.0;
+    }
+    let chart = Rect::from_min_max(
+        plot.min + Vec2::new(36.0, 24.0),
+        plot.max - Vec2::new(12.0, 14.0),
+    );
+    let mut points = Vec::with_capacity(series.len());
+    for (t, value) in &series {
+        let x = chart.min.x + t * chart.width();
+        let y = chart.max.y - ((*value - lo) / (hi - lo)) * chart.height();
+        points.push(egui::pos2(x, y));
+    }
+    for window in points.windows(2) {
+        painter.line_segment([window[0], window[1]], Stroke::new(1.5, BRAND));
+    }
+    painter.text(
+        egui::pos2(chart.min.x, chart.min.y),
+        Align2::LEFT_BOTTOM,
+        format!("{hi:.2}"),
+        FontId::monospace(9.0),
+        TEXT_DIM,
+    );
+    painter.text(
+        egui::pos2(chart.min.x, chart.max.y),
+        Align2::LEFT_TOP,
+        format!("{lo:.2}"),
+        FontId::monospace(9.0),
+        TEXT_DIM,
+    );
 }
 
 /// Encode an egui `ColorImage` as RGBA PNG bytes, nearest-neighbor upscaling
@@ -17479,7 +18550,7 @@ fn drop_target(ui: &mut egui::Ui, width: f32) {
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
-        "Drop an STL or .reynproj file here",
+        "Drop an STL, STEP, or .reynproj file here",
         caption().resolve(ui.style()),
         TEXT_MUTE,
     );
@@ -18239,6 +19310,8 @@ mod tests {
                 warnings: Vec::new(),
             }),
             parent_run_id: None,
+            named_regions: Vec::new(),
+            view_state: Default::default(),
         }
     }
 
@@ -18554,6 +19627,7 @@ mod tests {
             request_id: format!("orientation-{generation}"),
             case_id: "case-1".into(),
             source_sha256: "source-sha".into(),
+            source_name: "body.stl".into(),
             angles: [angle, 0.0, 0.0],
             grid: 32,
             source_bytes: vec![generation as u8],
@@ -18647,6 +19721,7 @@ mod tests {
                 request_id: "orientation-9".into(),
                 case_id: "case-1".into(),
                 source_sha256: "source-sha".into(),
+                source_name: "broken.stl".into(),
                 angles: [12.0, -2.0, 0.5],
                 grid: 32,
                 source_bytes: vec![0; 4],
@@ -18910,6 +19985,9 @@ mod tests {
             )),
             path.clone(),
             ScreenshotWriteKind::Viewport,
+            ViewportShotProvenance {
+                footer_lines: vec!["TEST FOOTER".into()],
+            },
         );
         let completion = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -18918,7 +19996,11 @@ mod tests {
         let bytes = std::fs::read(&path).expect("screenshot bytes");
         let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         let reader = decoder.read_info().unwrap();
-        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+        // Crop is 2×2; provenance footer appends a fixed strip (12 + 18·lines + 10).
+        assert_eq!(
+            (reader.info().width, reader.info().height),
+            (2, 2 + 12 + 18 + 10)
+        );
         std::fs::remove_file(path).unwrap();
     }
 

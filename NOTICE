@@ -6,3 +6,7 @@ This product includes software developed for Reyn.
 The Reyn name, logo, and visual identity are trademarks or product marks of
 Hamza Iraqi Houssaini and are not licensed by the Apache License 2.0 except as
 required for reasonable and customary attribution.
+
+The STEP import path includes the Truck geometry crates and ruststep, developed
+by Yoshinori Tanimura and contributors and distributed under the Apache License
+2.0. Source: https://github.com/ricosjp/truck

@@ -8,7 +8,7 @@ use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{AboutMetadata, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use std::path::PathBuf;
 
-const IMPORT_STL_LABEL: &str = "Import STL Geometry…";
+const IMPORT_STL_LABEL: &str = "Import STL / STEP Geometry…";
 const RUN_ANALYSIS_LABEL: &str = "Run Analysis";
 const EXPORT_FEA_LABEL: &str = "Export Fluid Surface Loads for FEA…";
 const NO_RECENT_PROJECTS_LABEL: &str = "No Recent Projects";

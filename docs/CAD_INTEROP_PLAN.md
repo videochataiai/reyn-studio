@@ -1,5 +1,13 @@
 # CAD interoperability plan for Reyn Studio
 
+> **Implementation update — 2026-07-31:** the 0.1.2 candidate now contains a
+> first pure-Rust, single-part STEP path with explicit units, deterministic
+> tessellation provenance, hard assembly rejection, and unchanged geometry
+> fidelity gates. See [`STEP_IMPORT_REVIEW.md`](STEP_IMPORT_REVIEW.md) for the
+> implemented boundary, fixture results, and remaining production work. The
+> broader kernel, assembly, healing, and region-identity recommendations in
+> this plan remain open.
+
 **Research date:** 2026-07-24
 **Scope:** Engineering interchange formats, what Reyn's voxel pipeline actually requires from geometry, the Rust/native implementation landscape with licence analysis, mesh repair and its provenance, unit handling, and a phased plan.
 **Evidence policy:** External claims cite a primary source (standards body, vendor documentation, package registry, or repository) with the URL checked on 2026-07-24. Internal claims cite `file:line` in this repository as inspected on 2026-07-24. Statements labelled **Reyn recommendation** are synthesis, not sourced claims. No vendor performance or marketing language is treated as a requirement.

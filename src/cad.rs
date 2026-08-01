@@ -1,5 +1,5 @@
-//! CAD import: STL (binary + ASCII) → voxel obstacle mask for the immersed-mask
-//! pipeline, plus recovered-pressure surface analysis. Maxima identify
+//! Geometry import: STL (binary + ASCII) or single-part STEP B-rep → voxel
+//! obstacle mask for the immersed-mask pipeline, plus recovered-pressure surface analysis. Maxima identify
 //! stagnation/load points; minima identify suction/low-pressure points.
 //!
 //! Voxelization uses three independent ray-parity classifications (+X, +Y, +Z)
@@ -15,6 +15,151 @@ use std::collections::{HashMap, VecDeque};
 #[derive(Clone, Debug)]
 pub struct Mesh {
     pub tris: Vec<[[f32; 3]; 3]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeometryFormat {
+    Stl,
+    Step,
+    ThreeMf,
+}
+
+impl GeometryFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stl => "STL",
+            Self::Step => "STEP",
+            Self::ThreeMf => "3MF",
+        }
+    }
+
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::Stl => "model/stl",
+            Self::Step => "model/step",
+            Self::ThreeMf => "model/3mf",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GeometryImport {
+    pub mesh: Mesh,
+    pub format: GeometryFormat,
+    pub declared_unit: Option<String>,
+    pub translator: String,
+    pub translator_version: String,
+    pub tessellation_tolerance_source_units: Option<f64>,
+    pub vertex_weld_relative_tolerance: Option<f64>,
+    pub source_shells: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum GeometryParseError {
+    Message(String),
+    ChooseShell(crate::cad_step::ShellChoiceRequired),
+}
+
+impl From<GeometryParseError> for String {
+    fn from(value: GeometryParseError) -> Self {
+        match value {
+            GeometryParseError::Message(message) => message,
+            GeometryParseError::ChooseShell(choice) => crate::cad_step::StepParseError::ChooseShell(choice).into(),
+        }
+    }
+}
+
+/// Parse a supported geometry source based on its filename extension.
+///
+/// STEP is intentionally restricted to resolved single-part B-rep sources.
+/// Assemblies are rejected by `cad_step` until occurrence transforms and stable
+/// region identity can be preserved in the evidence contract. Multi-shell STEP
+/// files without an assembly graph require an explicit shell selection.
+pub fn parse_geometry(source_name: &str, bytes: &[u8]) -> Result<GeometryImport, String> {
+    parse_geometry_selecting(source_name, bytes, None).map_err(Into::into)
+}
+
+/// Like [`parse_geometry`], with an optional STEP shell entity id for pick-one.
+pub fn parse_geometry_selecting(
+    source_name: &str,
+    bytes: &[u8],
+    selected_shell_entity_id: Option<u64>,
+) -> Result<GeometryImport, GeometryParseError> {
+    let extension = std::path::Path::new(source_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("stl") => {
+            if selected_shell_entity_id.is_some() {
+                return Err(GeometryParseError::Message(
+                    "STL sources are single-body meshes; shell selection does not apply".into(),
+                ));
+            }
+            Ok(GeometryImport {
+                mesh: parse_stl(bytes).map_err(GeometryParseError::Message)?,
+                format: GeometryFormat::Stl,
+                declared_unit: None,
+                translator: "reyn-stl".into(),
+                translator_version: env!("CARGO_PKG_VERSION").into(),
+                tessellation_tolerance_source_units: None,
+                vertex_weld_relative_tolerance: None,
+                source_shells: 1,
+                warnings: Vec::new(),
+            })
+        }
+        Some("stp" | "step") => {
+            let imported = match crate::cad_step::parse_step_selecting(bytes, selected_shell_entity_id)
+            {
+                Ok(imported) => imported,
+                Err(crate::cad_step::StepParseError::ChooseShell(choice)) => {
+                    return Err(GeometryParseError::ChooseShell(choice));
+                }
+                Err(crate::cad_step::StepParseError::Message(message)) => {
+                    return Err(GeometryParseError::Message(message));
+                }
+            };
+            Ok(GeometryImport {
+                mesh: imported.mesh,
+                format: GeometryFormat::Step,
+                declared_unit: imported.declared_unit,
+                translator: crate::cad_step::TRANSLATOR.into(),
+                translator_version: crate::cad_step::TRANSLATOR_VERSION.into(),
+                tessellation_tolerance_source_units: Some(
+                    imported.tessellation_tolerance_source_units,
+                ),
+                vertex_weld_relative_tolerance: Some(imported.vertex_weld_relative_tolerance),
+                source_shells: imported.shell_count,
+                warnings: imported.warnings,
+            })
+        }
+        Some("3mf") => {
+            if selected_shell_entity_id.is_some() {
+                return Err(GeometryParseError::Message(
+                    "3MF pick-one is limited to the primary model body in this release".into(),
+                ));
+            }
+            let imported = crate::cad_3mf::parse_3mf(bytes).map_err(GeometryParseError::Message)?;
+            Ok(GeometryImport {
+                mesh: imported.mesh,
+                format: GeometryFormat::ThreeMf,
+                declared_unit: Some(imported.declared_unit),
+                translator: crate::cad_3mf::TRANSLATOR.into(),
+                translator_version: crate::cad_3mf::TRANSLATOR_VERSION.into(),
+                tessellation_tolerance_source_units: None,
+                vertex_weld_relative_tolerance: None,
+                source_shells: 1,
+                warnings: imported.warnings,
+            })
+        }
+        Some(extension) => Err(GeometryParseError::Message(format!(
+            "unsupported geometry extension .{extension}; choose STL, STP, STEP, or 3MF"
+        ))),
+        None => Err(GeometryParseError::Message(
+            "geometry source has no extension; choose STL, STP, STEP, or 3MF".into(),
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -33,8 +178,9 @@ pub struct MeshDiagnostics {
     pub extents: [f32; 3],
 }
 
-/// Topology and scale checks performed before solver preprocessing. STL has no
-/// unit metadata, so extents are intentionally reported in source units.
+/// Topology and scale checks performed before solver preprocessing. Extents are
+/// intentionally reported in source units; format declarations are recorded
+/// separately and never silently rescale the customer's geometry.
 pub fn diagnose_mesh(mesh: &Mesh) -> MeshDiagnostics {
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for triangle in &mesh.tris {

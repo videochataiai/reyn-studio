@@ -276,7 +276,7 @@ pub enum Cmd {
         steps: u32,
         ic: std::sync::Arc<Vec<f32>>,
     },
-    /// CAD flow analysis: a voxelized `[N³]` STL mask becomes a wind-tunnel
+    /// CAD flow analysis: a voxelized `[N³]` geometry mask becomes a wind-tunnel
     /// case (engine caches the solver warmup per mask, so horizon changes are
     /// one model pass).
     CadPredict {
