@@ -120,7 +120,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Gated run with visible blocking reason (never a dead control) | SHIPPED | Single source of truth `run_gate_reason` `src/app.rs:2953-2974`; gated top-bar button `src/app.rs:3289-3312` |
 | Asynchronous execution, responsive shell | SHIPPED | Engine channel + non-blocking drain (`src/app.rs:329-330`); PERF-AC-01 per PRD |
 | Run start records exact contract | SHIPPED | `run_external_flow` commits the case revision before dispatch `src/app.rs:895-951`; exact contract JSON `src/engineering.rs:542-559` |
-| Progress indication | PARTIAL | Status-bar busy glyph + string only (`src/app.rs:3405-3421`); `PendingCadRun.started_at` exists (`src/app.rs:57-61`) but no elapsed display, no stage breakdown (warmup/predict/derive), no determinate bar |
+| Progress indication | PARTIAL | Status bar and Case Setup show honest elapsed time + Cancel for in-flight runs; the engine is still a blocking single pass so no determinate fraction or warmup/predict stage breakdown is reported |
 | **Cancellation** | SHIPPED | Cancel terminalizes the immutable attempt, terminates the blocking sidecar, replaces the engine, and exposes retry after readiness; stale correlated responses are ignored |
 | Queueing / batch runs | PARTIAL | Small follow-on FIFO (`RunQueue`) drains after the in-flight attempt; no parameter sweeps (P-SWEEP-01 remains post-N6). |
 | Run history with immutable lineage + deep links | SHIPPED | Run ledger `src/app.rs:2695-2729`; rerun-with-parent (N6-PROJ-04) |
@@ -139,7 +139,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | **3D point probe** (click → local velocity/Cp/traction) | SHIPPED | Surface probe on the engineering viewport with source-class chips; section probe remains. |
 | **Streamlines on the model field** | SHIPPED | Results path advects model velocity (`model_streamline_*`); ABC analytic field stays sandbox-quarantined. |
 | XY plots (Cp vs. position, force vs. variant) | PARTIAL | Cp mid-line profile under section view is SHIPPED; force-vs-variant XY remains a numeric delta table. |
-| **Horizon/time scrubbing within model support** | MISSING | Results show one horizon-H field; the engine caches warmup per mask so per-step fields are one model pass each (`src/engine.rs:142-144`) — feasible today, unbuilt |
+| **Horizon/time scrubbing within model support** | SHIPPED | `HorizonPlayback` fetches/caches per-step model fields for scrubbing and play-at-reading-rate; recorded run evidence stays immutable (`request_horizon_step` / `show_horizon_step` in `src/app.rs`). |
 | Convergence/confidence indicators | PARTIAL | Divergence RMS + warnings + applicability banner shipped; honest "spatial error unavailable without reference" notice (`src/app.rs:1999-2004`); no consistency evidence (e.g. semigroup) attached to engineering runs, though the engine computes it for 2D sandbox (`src/engine.rs:105`) |
 | Colormap / legend range control | SHIPPED | Ember/Viridis/Magma + Auto/Pinned Cp range in settings; persisted on case `view_state` for reopen. |
 | Shared-scale run/variant comparison | SHIPPED | Shared-unit parent/current comparison with evidence deep links (`src/app.rs:1850-1887`; N6-COMP-01 candidate per PRD §4.1) |
@@ -150,8 +150,8 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 |---|---|---|
 | FEA surface-load CSV with full provenance columns | SHIPPED | Schema-versioned, provenance-validated, source-frame-mapped (`src/engineering.rs:834-887`; export flow `src/app.rs:2757-2871`; N5X-LOAD-03) |
 | Benchmark evidence: canonical JSON + PNG/PDF + Ed25519 signed sidecars | SHIPPED (sandbox scope) | `src/benchmark_export.rs`; N5X-EXPORT-01 passed; signing slice per PRD §4.1 (production Keychain gate open) |
-| **Engineering-case report (PDF/PNG)** | MISSING | The benchmark path proves the machinery; nothing equivalent exists for the flagship external-flow case |
-| **Viewport image export / screenshot with legend + provenance** | MISSING | No capture path in `src/gpu.rs` or `src/app.rs` |
+| **Engineering-case report (PDF/PNG)** | SHIPPED | HTML + PNG/PDF lab sheets from persisted engineering evidence (`src/engineering_export.rs`); optional Ed25519 sidecar when a Keychain key is configured. |
+| **Viewport image export / screenshot with legend + provenance** | SHIPPED | Viewport PNG capture with provenance footer composition (`src/app.rs` screenshot worker). |
 | Field export (VTK or equivalent) for external post-processing | SHIPPED (automated format/provenance gate; ParaView smoke pending) | `src/vtk_export.rs` streams a legacy VTK `STRUCTURED_GRID` from the completed selected run's persisted `REYNENG1` blob, mapping coordinates and vectors into the approved source frame and embedding units, source classes, methods, transform, and source/case/run/model/field identity. Results and Evidence affordances live in `src/app.rs`; malformed, non-finite, stale/incomplete, unapproved, missing-content, and non-canonical inputs are rejected. External ParaView/manual-open remains a release smoke. |
 | Diagnostics CSV | PARTIAL | `src/app.rs:7100-7118` exports procedural-particle diagnostics — sandbox-grade, not case evidence |
 
