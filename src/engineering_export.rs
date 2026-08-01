@@ -91,6 +91,30 @@ pub fn engineering_report_labsheet_signed(
     Ok(artifact)
 }
 
+/// Sign the immutable engineering-result JSON digest (content-addressed SHA-256).
+///
+/// The result document is both report and payload: one digest is signed, matching
+/// how lab-sheet HTML digests are signed. The immutable JSON bytes stay unsigned;
+/// authenticity is a detached sidecar.
+pub fn sign_engineering_result_digest(
+    provider: &dyn SigningKeyProvider,
+    key: &PublicKeyRecord,
+    key_is_revoked: bool,
+    run_id: &str,
+    content_sha256: &str,
+    created_utc_unix: u64,
+) -> Result<SignedEvidenceArtifact, String> {
+    let lineage = SigningLineage {
+        run_id: run_id.to_owned(),
+        report_schema: crate::engineering::ENGINEERING_RESULT_SCHEMA.into(),
+        canonical_report_sha256: content_sha256.to_owned(),
+        canonical_payload_sha256: content_sha256.to_owned(),
+        created_utc_unix,
+    };
+    signing::sign_canonical_payload(provider, key, key_is_revoked, &lineage)
+        .map_err(|error| error.to_string())
+}
+
 fn lab_sheet_lines(input: &ReportInput<'_>, html_sha256: &str) -> Result<Vec<SheetLine>, String> {
     let case = input.case;
     let result = case
@@ -505,7 +529,7 @@ mod tests {
             run_id: "11111111-1111-1111-1111-111111111111",
             run_created_utc_unix: 1_784_000_000,
             generated_utc_unix: 1_784_000_100,
-            app_version: "0.1.2",
+            app_version: "0.2.0",
             unit_system: UnitSystem::Si,
             format: ValueFormat {
                 significant_digits: 4,
@@ -526,5 +550,35 @@ mod tests {
             .bytes
             .windows(b"ReynAuthenticityStatus: UNSIGNED".len())
             .any(|window| window == b"ReynAuthenticityStatus: UNSIGNED"));
+    }
+
+    #[test]
+    fn engineering_result_digest_signs_identical_report_and_payload_hashes() {
+        let provider = crate::signing::DeterministicTestProvider::new("eng-result");
+        let key = provider.public_key_record();
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let signed = sign_engineering_result_digest(
+            &provider,
+            &key,
+            false,
+            "61f596e7-8414-488e-b764-0a1dfe671d1a",
+            digest,
+            42,
+        )
+        .expect("sign");
+        assert_eq!(
+            signed.source.report_schema,
+            crate::engineering::ENGINEERING_RESULT_SCHEMA
+        );
+        assert_eq!(signed.source.canonical_report_sha256, digest);
+        assert_eq!(signed.source.canonical_payload_sha256, digest);
+        let policy = crate::signing::VerificationPolicy::new(
+            [key.key_fingerprint_sha256.clone()],
+            std::iter::empty::<String>(),
+        );
+        assert_eq!(
+            crate::signing::verify_signed_hash(digest, digest, &signed, &policy).status,
+            crate::signing::VerificationStatus::VerifiedTrustedKey
+        );
     }
 }

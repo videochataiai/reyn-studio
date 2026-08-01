@@ -2179,10 +2179,12 @@ fn validate_signature_artifact(
                 ))
             })
     };
+    let kind = text("kind")?;
+    let accepts_kind = matches!(kind, "benchmark_signature" | "engineering_signature");
     if artifact.media_type != "application/vnd.reyn.evidence-signature+json"
         || artifact.derivation_method.as_deref() != Some("ed25519_canonical_payload_signature")
         || artifact.derivation_version.as_deref() != Some("1")
-        || text("kind")? != "benchmark_signature"
+        || !accepts_kind
         || text("signature_schema")? != "reyn.evidence-signature.v1"
         || text("algorithm")? != "Ed25519"
         || text("verification_at_creation")? != "valid"
@@ -2204,21 +2206,35 @@ fn validate_signature_artifact(
         .find(|candidate| candidate.evidence_id == parent_evidence_id)
         .ok_or_else(|| {
             ProjectError::InvalidLineage(format!(
-                "signature evidence {} must derive from an earlier canonical report artifact",
+                "signature evidence {} must derive from an earlier signed parent artifact",
                 artifact.evidence_id
             ))
         })?;
-    if parent.source_class != EvidenceSourceClass::Derived
-        || parent.content_sha256 != canonical_report_sha256
-        || parent.run_ids != artifact.run_ids
-        || parent
-            .metadata
-            .get("canonical_payload_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some(canonical_payload_sha256)
-    {
+    let parent_ok = match kind {
+        "benchmark_signature" => {
+            parent.source_class == EvidenceSourceClass::Derived
+                && parent.content_sha256 == canonical_report_sha256
+                && parent.run_ids == artifact.run_ids
+                && parent
+                    .metadata
+                    .get("canonical_payload_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(canonical_payload_sha256)
+        }
+        "engineering_signature" => {
+            // The immutable engineering-result JSON is both report and payload:
+            // content_sha256 is the signed digest; no nested payload hash is required.
+            parent.source_class == EvidenceSourceClass::Derived
+                && parent.media_type == "application/vnd.reyn.engineering-result+json"
+                && parent.content_sha256 == canonical_report_sha256
+                && canonical_report_sha256 == canonical_payload_sha256
+                && parent.run_ids == artifact.run_ids
+        }
+        _ => false,
+    };
+    if !parent_ok {
         return Err(ProjectError::InvalidLineage(format!(
-            "signature evidence {} does not match its canonical report lineage",
+            "signature evidence {} does not match its canonical parent lineage",
             artifact.evidence_id
         )));
     }
@@ -3535,6 +3551,84 @@ mod tests {
             Err(ProjectError::DuplicateSignature { .. })
         ));
         assert_eq!(manifest.evidence(), original);
+    }
+
+    #[test]
+    fn engineering_result_signature_appends_and_rejects_duplicates() {
+        const RUN_ID: &str = "61f596e7-8414-488e-b764-0a1dfe671d1a";
+        let mut project = project_with_run();
+        project.cases[0].runs[0].run_id = RUN_ID.into();
+        let result_bytes = br#"{"schema":"engineering_result.v1","fixture":true}"#.to_vec();
+        let result_sha256 = sha256_hex(&result_bytes);
+        let parent_id = format!("evidence-eng-{result_sha256}");
+        project
+            .append_evidence(
+                EvidenceArtifact {
+                    evidence_id: parent_id.clone(),
+                    run_ids: vec![RUN_ID.into()],
+                    created_utc_unix: 40,
+                    source_class: EvidenceSourceClass::Derived,
+                    media_type: "application/vnd.reyn.engineering-result+json".into(),
+                    byte_size: result_bytes.len() as u64,
+                    content_sha256: result_sha256.clone(),
+                    derivation_method: Some(crate::engineering::SURFACE_LOAD_METHOD.into()),
+                    derivation_version: Some("1".into()),
+                    warnings: vec![],
+                    metadata: json!({"schema": "engineering_result.v1", "fixture": true}),
+                    calibrated_views: vec![],
+                },
+                40,
+            )
+            .unwrap();
+        let provider = crate::signing::DeterministicTestProvider::new("eng-project");
+        let key = provider.public_key_record();
+        let signature = crate::engineering_export::sign_engineering_result_digest(
+            &provider,
+            &key,
+            false,
+            RUN_ID,
+            &result_sha256,
+            42,
+        )
+        .unwrap();
+        let signature_json = signature.to_json().unwrap();
+        let signature_sha256 = sha256_hex(signature_json.as_bytes());
+        let signature_evidence = EvidenceArtifact {
+            evidence_id: format!(
+                "engineering-signature-{}-{}",
+                key.key_fingerprint_sha256, result_sha256
+            ),
+            run_ids: vec![RUN_ID.into()],
+            created_utc_unix: 42,
+            source_class: EvidenceSourceClass::AuthenticitySignature,
+            media_type: "application/vnd.reyn.evidence-signature+json".into(),
+            byte_size: signature_json.len() as u64,
+            content_sha256: signature_sha256,
+            derivation_method: Some("ed25519_canonical_payload_signature".into()),
+            derivation_version: Some("1".into()),
+            warnings: vec![],
+            metadata: json!({
+                "kind": "engineering_signature",
+                "signature_schema": crate::signing::SIGNATURE_SCHEMA,
+                "parent_evidence_id": parent_id,
+                "canonical_report_sha256": result_sha256,
+                "canonical_payload_sha256": result_sha256,
+                "algorithm": crate::signing::SIGNATURE_ALGORITHM,
+                "key_id": key.key_id,
+                "key_fingerprint_sha256": key.key_fingerprint_sha256,
+                "verification_at_creation": "valid",
+            }),
+            calibrated_views: vec![],
+        };
+        project
+            .append_evidence(signature_evidence.clone(), 42)
+            .unwrap();
+        let mut duplicate = signature_evidence;
+        duplicate.evidence_id.push_str("-dup");
+        assert!(matches!(
+            project.append_evidence(duplicate, 43),
+            Err(ProjectError::DuplicateSignature { .. })
+        ));
     }
 
     #[test]

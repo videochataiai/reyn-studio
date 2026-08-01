@@ -1574,14 +1574,38 @@ class Engine:
         p_hat[0, 0, 0] = 0.0
         return torch.fft.ifftn(p_hat, dim=(-3, -2, -1)).real
 
-    def predict_cad(self, req, payload):
+    def predict_cad(self, req, payload, progress=None):
         """CAD flow analysis: a voxelized STL mask (`[N³]` f32 payload) becomes a
         wind-tunnel case — smooth the mask (training masks are tanh-smoothed),
         develop the flow with the real Brinkman solver (cached per mask), then
         one model pass at the requested horizon. Returns `[4,N,N,N]`: velocity +
-        spectrally-recovered pressure, for the surface-load view."""
+        spectrally-recovered pressure, for the surface-load view.
+
+        Optional `progress(dict)` emits stage frames (`progress: true`) before the
+        final response. Fractions are stage-based, not wall-clock percentages.
+        """
         import hashlib
         torch = self.torch
+        request_id = str(req.get("request_id", ""))
+        stage_count = 4
+
+        def report(stage, stage_index, detail="", local=0.0):
+            if progress is None:
+                return
+            local = max(0.0, min(1.0, float(local)))
+            fraction = (stage_index - 1 + local) / stage_count
+            progress({
+                "ok": True,
+                "progress": True,
+                "request_id": request_id,
+                "stage": stage,
+                "stage_index": int(stage_index),
+                "stage_count": stage_count,
+                "detail": detail,
+                "fraction": float(fraction),
+            })
+
+        report("preparing", 1, "Validating mask and smoothing edges", 0.0)
         info = self._load(req["model"])
         if not info["is3d"] or info["cfg"]["in_channels"] <= info["cfg"]["out_channels"]:
             raise ValueError("predict_cad needs a geometry-conditioned 3D checkpoint")
@@ -1604,6 +1628,7 @@ class Engine:
         for _ in range(2):
             sm = tF.conv3d(tF.pad(sm, (1,) * 6, mode="replicate"), kernel)
         mask_s = sm.reshape(N, N, N).clamp(0.0, 1.0)
+        report("preparing", 1, "Mask validated", 1.0)
 
         char_len = float(req.get("char_len", 0.6))
         reynolds = float(req.get("reynolds", 150.0))
@@ -1648,16 +1673,33 @@ class Engine:
             from obstacle_solver_3d import ObstacleFlowSolver3D
             solver = ObstacleFlowSolver3D(N=N, dt=ta["dt"], nu=nu, mask=mask_s)
             field = solver.initial_field(seed=int(req.get("seed", 7)))
+            warmup_steps = int(ta["warmup_steps"])
+            report("developing", 2, f"Brinkman warmup 0/{warmup_steps}", 0.0)
             with torch.no_grad():
-                for _ in range(ta["warmup_steps"]):
+                # Emit at most ~10 progress ticks so the UI stays live without
+                # flooding the loopback socket during long warmups.
+                tick_every = max(1, warmup_steps // 10) if warmup_steps else 1
+                for step in range(warmup_steps):
                     field = solver.step(field)
+                    if step + 1 == warmup_steps or (step + 1) % tick_every == 0:
+                        report(
+                            "developing",
+                            2,
+                            f"Brinkman warmup {step + 1}/{warmup_steps}",
+                            (step + 1) / max(warmup_steps, 1),
+                        )
             developed = field.detach().clone()
             self.cad_cache[digest] = developed
+        else:
+            report("developing", 2, "Reusing cached developed flow for this mask", 1.0)
 
+        report("predicting", 3, f"Model horizon step {horizon}", 0.0)
         device = self.device
         with torch.no_grad():
             model_in = torch.cat([developed, mask_s.reshape(1, 1, N, N, N)], dim=1).to(device)
             pred = m(model_in, torch.tensor([[horizon * dt_frame]], device=device)).cpu()
+            report("predicting", 3, f"Model horizon step {horizon} complete", 1.0)
+            report("recovering", 4, "Recovering pressure and surface loads", 0.0)
             p = self.pressure_3d(pred)
 
         velocity = pred[0].numpy()
@@ -1673,6 +1715,7 @@ class Engine:
             density_kg_m3=density_kg_m3,
             reference_pressure_pa=reference_pressure_pa,
         )
+        report("recovering", 4, "Surface loads integrated", 1.0)
         out = np.concatenate(
             [
                 velocity,
@@ -1926,7 +1969,10 @@ def serve(research_dir, device="auto", managed_model_dir=None):
                 field, meta = engine.predict_ic(obj, payload)
                 send(conn, meta, field.tobytes())
             elif op == "predict_cad":
-                field, meta = engine.predict_cad(obj, payload)
+                def progress(frame):
+                    send(conn, frame)
+
+                field, meta = engine.predict_cad(obj, payload, progress=progress)
                 send(conn, meta, field.tobytes())
             elif op == "run_benchmark":
                 send(conn, engine.run_benchmark(obj))

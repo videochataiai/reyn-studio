@@ -262,6 +262,8 @@ struct PendingCadRun {
     started_utc_unix: u64,
     started_at: std::time::Instant,
     manifest: project::RunManifest,
+    /// Latest stage frame from the sidecar (`progress: true`), if any.
+    progress: Option<engine::CadProgress>,
 }
 
 /// Small FIFO of external-flow run requests (Phase 0.4). Only one executes at a
@@ -1541,6 +1543,23 @@ impl eframe::App for ReynApp {
                         self.f2d_dirty = false;
                         self.request_2d();
                     }
+                }
+                engine::Msg::CadProgress(progress) => {
+                    if let Some(case) = self.cad.as_mut() {
+                        if let Some(pending) = case.pending_run.as_mut() {
+                            if pending.request_id == progress.request_id {
+                                pending.progress = Some(progress);
+                                continue;
+                            }
+                        }
+                    }
+                    // Horizon-preview fetches may also stream stages; keep status calm.
+                    self.engine_status = format!(
+                        "◐ {} · stage {}/{}",
+                        cad_progress_stage_label(&progress.stage),
+                        progress.stage_index,
+                        progress.stage_count
+                    );
                 }
                 engine::Msg::CadField(f) => {
                     let disposition = classify_cad_result(
@@ -3515,6 +3534,7 @@ impl ReynApp {
             started_utc_unix,
             started_at: std::time::Instant::now(),
             manifest,
+            progress: None,
         });
         if self.engine.send(request).is_err() {
             let error = "engine request channel unavailable";
@@ -3879,10 +3899,9 @@ impl ReynApp {
         let mut changed_transaction = None;
         let mut active_transaction = None;
         let mut identity_changed = false;
-        // Honest in-flight state: the engine is a blocking single pass, so there
-        // is no true fraction to show. Say what is happening, show elapsed time,
-        // and offer a real Cancel. Rendered before `ui.disable()` so Cancel stays
-        // live while the rest of the contract is locked.
+        // Honest in-flight state: stage frames from the sidecar give a
+        // stage-based fraction (not wall-clock %). Show stage + elapsed + Cancel.
+        // Rendered before `ui.disable()` so Cancel stays live.
         let mut cancel_run = false;
         if case.pending {
             let elapsed = case
@@ -3896,6 +3915,10 @@ impl ReynApp {
                 .map(|pending| pending.workflow.operating.horizon_steps)
                 .unwrap_or(case.steps);
             let request_id = case.pending_request_id.clone();
+            let progress = case
+                .pending_run
+                .as_ref()
+                .and_then(|pending| pending.progress.clone());
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(13.0));
@@ -3909,13 +3932,46 @@ impl ReynApp {
                     });
                 });
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!(
-                        "Developing the flow around this mask, then one model pass at horizon step {horizon}. The engine reports no intermediate progress, so this state is indeterminate — no percentage is shown because none would be real."
-                    ))
-                    .text_style(caption())
-                    .color(TEXT_MUTE),
-                );
+                if let Some(progress) = &progress {
+                    ui.label(
+                        RichText::new(format!(
+                            "Stage {} of {} · {}",
+                            progress.stage_index,
+                            progress.stage_count,
+                            cad_progress_stage_label(&progress.stage)
+                        ))
+                        .text_style(caption())
+                        .color(GOLD),
+                    );
+                    if !progress.detail.is_empty() {
+                        ui.label(
+                            RichText::new(&progress.detail)
+                                .text_style(caption())
+                                .color(TEXT_MUTE),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    let mut bar = egui::ProgressBar::new(progress.fraction.clamp(0.0, 1.0))
+                        .desired_width(ui.available_width())
+                        .animate(true);
+                    bar = bar.text(format!("{:.0}% stage progress", progress.fraction * 100.0));
+                    ui.add(bar);
+                    ui.label(
+                        RichText::new(
+                            "Bar tracks engine stages (prepare → develop → predict → recover), not wall-clock time.",
+                        )
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "Dispatching horizon step {horizon}. Waiting for the first engine stage frame…"
+                        ))
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                }
                 if let Some(request_id) = &request_id {
                     diag(ui, "Request", &short_hash(request_id), TEXT_MUTE);
                 }
@@ -5431,6 +5487,7 @@ impl ReynApp {
         self.horizon_playback_card(ui);
         if let Some((parent_run_id, current_run_id, rows)) = comparison {
             ui.add_space(12.0);
+            let force_series = force_variant_series(&rows);
             card(ui, |ui| {
                 ui.label(caps("Variant comparison · shared units"));
                 ui.label(
@@ -5442,6 +5499,33 @@ impl ReynApp {
                     .text_style(mono_s())
                     .color(TEXT_MUTE),
                 );
+                ui.add_space(6.0);
+                if force_series.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No shared force-coefficient scalars to plot for this parent/current pair.",
+                        )
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Force coefficients · parent vs current")
+                            .text_style(caption())
+                            .color(GOLD),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Gold = parent · ember = current · Δ labeled under each pair",
+                        )
+                        .text_style(caption())
+                        .color(TEXT_MUTE),
+                    );
+                    ui.add_space(4.0);
+                    draw_force_variant_plot(ui, &force_series);
+                }
+                ui.add_space(8.0);
+                ui.label(caps("Scalar deltas"));
                 for (key, parent, current, units) in rows.iter().take(7) {
                     diag(
                         ui,
@@ -5465,6 +5549,69 @@ impl ReynApp {
                         self.select_external_run(&current_run_id);
                     }
                 });
+            });
+        }
+        // Phase 0.4: stop-reason / warning console for the selected immutable run.
+        if let Some((stop_reason, warnings, runtime_ms, run_id)) =
+            self.cad.as_ref().and_then(|active| {
+                let run_id = active.active_run_id.as_deref()?;
+                let case = self
+                    .project
+                    .manifest()
+                    .cases()
+                    .iter()
+                    .find(|case| case.case_id() == active.workflow.case_id)?;
+                let run = case.runs().iter().find(|run| run.run_id() == run_id)?;
+                Some((
+                    run.manifest().stop_reason.clone(),
+                    run.manifest().warnings.clone(),
+                    run.manifest().runtime_ms,
+                    run_id.to_owned(),
+                ))
+            })
+        {
+            ui.add_space(12.0);
+            card(ui, |ui| {
+                ui.label(caps("Run detail"));
+                ui.label(
+                    RichText::new(format!("Attempt {}", short_id(&run_id)))
+                        .text_style(mono_s())
+                        .color(TEXT_MUTE),
+                );
+                ui.add_space(4.0);
+                diag(ui, "Stop reason", &stop_reason, TEXT_DIM);
+                diag(
+                    ui,
+                    "Runtime",
+                    &format!("{:.2} s", runtime_ms as f64 / 1000.0),
+                    TEXT_DIM,
+                );
+                if warnings.is_empty() {
+                    ui.label(
+                        RichText::new("No warnings recorded on this attempt.")
+                            .text_style(caption())
+                            .color(TEXT_MUTE),
+                    );
+                } else {
+                    ui.label(caps("Warnings"));
+                    for warning in warnings.iter().take(8) {
+                        ui.label(
+                            RichText::new(format!("· {warning}"))
+                                .text_style(caption())
+                                .color(WARN),
+                        );
+                    }
+                    if warnings.len() > 8 {
+                        ui.label(
+                            RichText::new(format!(
+                                "… {} more in the evidence ledger",
+                                warnings.len() - 8
+                            ))
+                            .text_style(caption())
+                            .color(TEXT_MUTE),
+                        );
+                    }
+                }
             });
         }
         ui.add_space(12.0);
@@ -5819,6 +5966,9 @@ impl ReynApp {
             let mut export_report = false;
             let mut export_fea = false;
             let mut export_field = false;
+            let mut sign_result = false;
+            let signing_key_ready = matches!(self.settings.configured_signing_key(), Ok(Some(_)))
+                && !self.settings.signing_key_is_revoked();
             let export_menu = ui.add_enabled_ui(has_persisted_run, |ui| {
                 ui.menu_button("Export evidence…", |ui| {
                     ui.label(overline_text("Immutable run artifacts"));
@@ -5856,6 +6006,24 @@ impl ReynApp {
             export_menu
                 .response
                 .on_disabled_hover_text("A durable immutable run is required for provenance.");
+            ui.add_space(6.0);
+            let sign_enabled = has_persisted_run && signing_key_ready;
+            let sign_disabled_hint = if !signing_key_ready {
+                "Configure an Ed25519 Keychain signing key in Settings before signing evidence."
+            } else {
+                "A durable immutable run is required before authenticity evidence can be attached."
+            };
+            if ui
+                .add_enabled(sign_enabled, egui::Button::new("Sign engineering result…"))
+                .on_hover_text(
+                    "Detach an Ed25519 sidecar over the persisted engineering-result digest \
+                     and append it as authenticity evidence. The result JSON stays immutable.",
+                )
+                .on_disabled_hover_text(sign_disabled_hint)
+                .clicked()
+            {
+                sign_result = true;
+            }
             if export_report {
                 self.export_engineering_report();
             }
@@ -5864,6 +6032,9 @@ impl ReynApp {
             }
             if export_field {
                 self.export_vtk_field();
+            }
+            if sign_result {
+                self.sign_engineering_result_evidence();
             }
             ui.add_space(4.0);
             if ui.button("Save project").clicked() {
@@ -8127,19 +8298,31 @@ impl ReynApp {
                         )
                         .on_hover_text(&self.engine_status);
                     });
-                    // Elapsed time is the only honest progress an opaque single
-                    // pass can report, so the run says how long it has waited
-                    // rather than implying a fraction.
-                    let run_elapsed = self.cad.as_ref().filter(|case| case.pending).map(|case| {
-                        case.pending_run
+                    // Stage frames + elapsed: fraction is stage-based when present.
+                    let run_busy = self.cad.as_ref().filter(|case| case.pending).map(|case| {
+                        let elapsed = case
+                            .pending_run
                             .as_ref()
                             .map(|pending| pending.started_at.elapsed().as_secs_f64())
-                            .unwrap_or(0.0)
+                            .unwrap_or(0.0);
+                        let stage = case
+                            .pending_run
+                            .as_ref()
+                            .and_then(|pending| pending.progress.as_ref())
+                            .map(|progress| {
+                                format!(
+                                    " · stage {}/{} {}",
+                                    progress.stage_index,
+                                    progress.stage_count,
+                                    cad_progress_stage_label(&progress.stage)
+                                )
+                            })
+                            .unwrap_or_default();
+                        format!("◐ running immutable attempt · {elapsed:.0} s{stage}")
                     });
-                    let busy = if let Some(elapsed) = run_elapsed {
-                        Some(format!(
-                            "◐ running immutable attempt · {elapsed:.0} s elapsed · no per-step progress reported"
-                        ))
+                    let run_in_flight = run_busy.is_some();
+                    let busy = if let Some(busy) = run_busy {
+                        Some(busy)
                     } else if self.bench_running {
                         Some("◐ benchmark suite running…".to_owned())
                     } else if self.f2d_pending {
@@ -8154,7 +8337,7 @@ impl ReynApp {
                         // Busy is passive status — WARN, never the ember
                         // action accent (QA C6).
                         ui.label(RichText::new(busy).text_style(mono_s()).color(WARN));
-                        if run_elapsed.is_some() {
+                        if run_in_flight {
                             ui.add_space(8.0);
                             cancel_run = ui
                                 .small_button("Cancel")
@@ -15910,6 +16093,234 @@ impl ReynApp {
         ));
     }
 
+    /// Detach an Ed25519 authenticity sidecar over the selected run's
+    /// persisted engineering-result digest and append it to the project ledger.
+    fn sign_engineering_result_evidence(&mut self) {
+        let configured_key = match self.settings.configured_signing_key() {
+            Ok(Some(key)) if !self.settings.signing_key_is_revoked() => key,
+            Ok(Some(_)) => {
+                self.project_notice = Some((
+                    "UNSIGNED · the configured signing key is revoked.".into(),
+                    true,
+                ));
+                return;
+            }
+            Ok(None) => {
+                self.project_notice = Some((
+                    "UNSIGNED · configure an Ed25519 Keychain key in Settings first.".into(),
+                    true,
+                ));
+                return;
+            }
+            Err(error) => {
+                self.project_notice =
+                    Some((format!("UNSIGNED · signing key unavailable: {error}"), true));
+                return;
+            }
+        };
+        let run_id = match self
+            .cad
+            .as_ref()
+            .and_then(|case| case.active_run_id.clone())
+            .or_else(|| self.project.manifest().selection().selected_run_id.clone())
+        {
+            Some(run_id) => run_id,
+            None => {
+                self.project_notice = Some((
+                    "UNSIGNED · select a completed engineering run first.".into(),
+                    true,
+                ));
+                return;
+            }
+        };
+        let parent = match self
+            .project
+            .manifest()
+            .evidence()
+            .iter()
+            .rev()
+            .find(|artifact| {
+                artifact.media_type == "application/vnd.reyn.engineering-result+json"
+                    && artifact.run_ids.iter().any(|id| id == &run_id)
+                    && artifact.source_class == project::EvidenceSourceClass::Derived
+            })
+            .cloned()
+        {
+            Some(parent) => parent,
+            None => {
+                self.project_notice = Some((
+                    "UNSIGNED · this run has no persisted engineering-result evidence.".into(),
+                    true,
+                ));
+                return;
+            }
+        };
+        let created = now_utc_unix();
+        let signature = match engineering_export::sign_engineering_result_digest(
+            &signing::NativeKeychainProvider,
+            &configured_key,
+            self.settings.signing_key_is_revoked(),
+            &run_id,
+            &parent.content_sha256,
+            created,
+        ) {
+            Ok(signature) => signature,
+            Err(error) => {
+                self.project_notice = Some((format!("UNSIGNED · signing failed: {error}"), true));
+                return;
+            }
+        };
+        let signature_json = match signature.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                self.project_notice = Some((
+                    format!("UNSIGNED · sidecar serialization failed: {error}"),
+                    true,
+                ));
+                return;
+            }
+        };
+        match self.persist_engineering_result_signature(&parent, &signature_json, &signature) {
+            Ok(true) => {
+                let fingerprint = short_hash(&configured_key.key_fingerprint_sha256);
+                let digest = short_hash(&parent.content_sha256);
+                self.project_notice = Some((
+                    format!(
+                        "VERIFIED CONFIGURED KEY · engineering result signed · key {fingerprint} · digest {digest}"
+                    ),
+                    false,
+                ));
+                if let Some(path) = self
+                    .export_dialog(&format!(
+                        "engineering_result_{}.sig.json",
+                        short_id(&run_id)
+                    ))
+                    .add_filter("Evidence signature", &["json"])
+                    .save_file()
+                {
+                    if let Err(error) = std::fs::write(&path, &signature_json) {
+                        self.project_notice = Some((
+                            format!(
+                                "Signature was recorded in the project, but the sidecar file was not written: {error}"
+                            ),
+                            true,
+                        ));
+                    }
+                }
+            }
+            Ok(false) => {
+                self.project_notice = Some((
+                    "Matching engineering signature already exists; immutable evidence was not duplicated."
+                        .into(),
+                    false,
+                ));
+            }
+            Err(error) => {
+                self.project_notice = Some((
+                    format!("UNSIGNED · signature was not recorded: {error}"),
+                    true,
+                ));
+            }
+        }
+    }
+
+    fn persist_engineering_result_signature(
+        &mut self,
+        parent: &project::EvidenceArtifact,
+        signature_json: &str,
+        signature: &signing::SignedEvidenceArtifact,
+    ) -> Result<bool, String> {
+        self.project_write_access("Recording engineering signature")?;
+        let signature_sha256 = signing::sha256_hex(signature_json.as_bytes());
+        let canonical_payload_sha256 = &signature.source.canonical_payload_sha256;
+        let key_fingerprint = &signature.authenticity.key_fingerprint_sha256;
+        if self.project.manifest().evidence().iter().any(|artifact| {
+            artifact.source_class == project::EvidenceSourceClass::AuthenticitySignature
+                && artifact
+                    .metadata
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("engineering_signature")
+                && artifact
+                    .metadata
+                    .get("canonical_payload_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(canonical_payload_sha256)
+                && artifact
+                    .metadata
+                    .get("key_fingerprint_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(key_fingerprint)
+        }) {
+            return Ok(false);
+        }
+        self.add_project_content(
+            "Recording engineering signature",
+            signature_json.as_bytes().to_vec(),
+            "application/vnd.reyn.evidence-signature+json",
+            &signature_sha256,
+        )
+        .map_err(|error| format!("signature sidecar bundle: {error}"))?;
+        let run_id = signature.source.run_id.clone();
+        let parent_evidence_id = parent.evidence_id.clone();
+        let report_sha256 = parent.content_sha256.clone();
+        let signature_evidence_id =
+            format!("engineering-signature-{key_fingerprint}-{canonical_payload_sha256}");
+        let created_utc_unix = signature.created_utc_unix;
+        let signature_evidence = project::EvidenceArtifact {
+            evidence_id: signature_evidence_id.clone(),
+            run_ids: vec![run_id.clone()],
+            created_utc_unix,
+            source_class: project::EvidenceSourceClass::AuthenticitySignature,
+            media_type: "application/vnd.reyn.evidence-signature+json".into(),
+            byte_size: signature_json.len() as u64,
+            content_sha256: signature_sha256,
+            derivation_method: Some("ed25519_canonical_payload_signature".into()),
+            derivation_version: Some("1".into()),
+            warnings: vec![
+                "The engineering-result JSON remains immutable and explicitly UNSIGNED; authenticity is carried by this detached signature evidence artifact."
+                    .into(),
+                "Signature validity and organization-key trust are separate; compare the fingerprint independently and apply current revocations."
+                    .into(),
+            ],
+            metadata: serde_json::json!({
+                "kind": "engineering_signature",
+                "signature_schema": signing::SIGNATURE_SCHEMA,
+                "parent_evidence_id": parent_evidence_id,
+                "canonical_report_sha256": report_sha256,
+                "canonical_payload_sha256": canonical_payload_sha256,
+                "algorithm": signing::SIGNATURE_ALGORITHM,
+                "key_id": signature.authenticity.key_id,
+                "key_fingerprint_sha256": key_fingerprint,
+                "verification_at_creation": "valid",
+            }),
+            calibrated_views: Vec::new(),
+        };
+        let now = now_utc_unix();
+        let case_id = self.cad.as_ref().map(|case| case.workflow.case_id.clone());
+        self.transact_project("Recording engineering signature", now, move |manifest| {
+            manifest.append_evidence(signature_evidence, now)?;
+            manifest.set_selection(
+                project::ProjectSelection {
+                    active_case_id: case_id.or_else(|| {
+                        manifest
+                            .cases()
+                            .iter()
+                            .find(|case| case.runs().iter().any(|run| run.run_id() == run_id))
+                            .map(|case| case.case_id().to_owned())
+                    }),
+                    selected_run_id: Some(run_id),
+                    selected_evidence_id: Some(signature_evidence_id),
+                    selected_view_id: None,
+                },
+                now,
+            )?;
+            Ok(())
+        })?;
+        self.dependencies_dirty = true;
+        Ok(true)
+    }
+
     fn persist_signed_report(
         &mut self,
         canonical_report_json: &str,
@@ -18327,6 +18738,140 @@ fn stamp_footer_text(
     }
 }
 
+/// Human labels for CAD engine stage ids (`preparing` / `developing` / …).
+fn cad_progress_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "preparing" => "preparing mask",
+        "developing" => "developing flow",
+        "predicting" => "model prediction",
+        "recovering" => "pressure & loads",
+        _ => "engine stage",
+    }
+}
+
+/// Display labels for force-coefficient scalar keys used in variant plots.
+fn force_coefficient_plot_label(key: &str) -> Option<&'static str> {
+    match key {
+        "force_coefficient_x" => Some("Cd"),
+        "force_coefficient_y" => Some("Cs"),
+        "force_coefficient_z" => Some("Cl"),
+        _ => None,
+    }
+}
+
+/// Parent/current force-coefficient pairs for the variant comparison plot.
+fn force_variant_series(rows: &[(String, f64, f64, String)]) -> Vec<(&'static str, f64, f64)> {
+    let mut series = Vec::with_capacity(3);
+    for key in [
+        "force_coefficient_x",
+        "force_coefficient_y",
+        "force_coefficient_z",
+    ] {
+        let Some(label) = force_coefficient_plot_label(key) else {
+            continue;
+        };
+        if let Some((_, parent, current, _)) = rows.iter().find(|(row_key, _, _, _)| row_key == key)
+        {
+            series.push((label, *parent, *current));
+        }
+    }
+    series
+}
+
+/// Grouped bars: gold = parent, ember = current, for Cd / Cs / Cl.
+fn draw_force_variant_plot(ui: &mut egui::Ui, series: &[(&'static str, f64, f64)]) {
+    if series.is_empty() {
+        return;
+    }
+    let height = 148.0;
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width().max(180.0), height),
+        Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(3), SURFACE);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, OUTLINE_VARIANT),
+        egui::StrokeKind::Inside,
+    );
+    let chart = Rect::from_min_max(
+        rect.min + Vec2::new(36.0, 18.0),
+        rect.max - Vec2::new(12.0, 28.0),
+    );
+    let mut lo = series
+        .iter()
+        .flat_map(|(_, parent, current)| [*parent, *current])
+        .fold(f64::INFINITY, f64::min);
+    let mut hi = series
+        .iter()
+        .flat_map(|(_, parent, current)| [*parent, *current])
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !lo.is_finite() || !hi.is_finite() {
+        return;
+    }
+    // Keep zero in-frame when signs straddle, and pad tiny ranges.
+    if lo > 0.0 {
+        lo = 0.0;
+    }
+    if hi < 0.0 {
+        hi = 0.0;
+    }
+    if (hi - lo).abs() < 1e-9 {
+        lo -= 0.1;
+        hi += 0.1;
+    }
+    let zero_y = chart.max.y - ((0.0 - lo) / (hi - lo)) as f32 * chart.height();
+    painter.line_segment(
+        [
+            egui::pos2(chart.min.x, zero_y),
+            egui::pos2(chart.max.x, zero_y),
+        ],
+        Stroke::new(1.0, OUTLINE_VARIANT),
+    );
+    painter.text(
+        egui::pos2(chart.min.x, chart.min.y),
+        Align2::LEFT_BOTTOM,
+        format!("{hi:.3}"),
+        FontId::monospace(9.0),
+        TEXT_DIM,
+    );
+    painter.text(
+        egui::pos2(chart.min.x, chart.max.y),
+        Align2::LEFT_TOP,
+        format!("{lo:.3}"),
+        FontId::monospace(9.0),
+        TEXT_DIM,
+    );
+    let group_width = chart.width() / series.len().max(1) as f32;
+    let bar_width = (group_width * 0.28).clamp(8.0, 22.0);
+    let gap = 3.0;
+    for (index, (label, parent, current)) in series.iter().enumerate() {
+        let center_x = chart.min.x + (index as f32 + 0.5) * group_width;
+        let map_y = |value: f64| chart.max.y - ((value - lo) / (hi - lo)) as f32 * chart.height();
+        let parent_top = map_y(*parent);
+        let current_top = map_y(*current);
+        let parent_rect = Rect::from_min_max(
+            egui::pos2(center_x - bar_width - gap * 0.5, parent_top.min(zero_y)),
+            egui::pos2(center_x - gap * 0.5, parent_top.max(zero_y)),
+        );
+        let current_rect = Rect::from_min_max(
+            egui::pos2(center_x + gap * 0.5, current_top.min(zero_y)),
+            egui::pos2(center_x + bar_width + gap * 0.5, current_top.max(zero_y)),
+        );
+        painter.rect_filled(parent_rect, CornerRadius::same(1), GOLD);
+        painter.rect_filled(current_rect, CornerRadius::same(1), BRAND);
+        painter.text(
+            egui::pos2(center_x, chart.max.y + 4.0),
+            Align2::CENTER_TOP,
+            format!("{label} Δ{:+.3}", current - parent),
+            FontId::monospace(9.0),
+            TEXT_MUTE,
+        );
+    }
+}
+
 /// Mid-line Cp (or active quantity) profile under the section image.
 fn draw_section_cp_profile(
     painter: &egui::Painter,
@@ -20153,5 +20698,25 @@ mod tests {
                 "legacy shell label returned: {label}"
             );
         }
+    }
+
+    #[test]
+    fn force_variant_series_keeps_cd_cs_cl_order_and_skips_other_scalars() {
+        let rows = vec![
+            ("wake_deficit_peak".into(), 0.2, 0.3, "1".into()),
+            ("force_coefficient_z".into(), -0.04, -0.01, "1".into()),
+            ("force_coefficient_x".into(), 0.71, 0.82, "1".into()),
+            ("force_coefficient_y".into(), 0.02, 0.01, "1".into()),
+        ];
+        let series = force_variant_series(&rows);
+        assert_eq!(
+            series,
+            vec![("Cd", 0.71, 0.82), ("Cs", 0.02, 0.01), ("Cl", -0.04, -0.01)]
+        );
+        assert_eq!(
+            force_coefficient_plot_label("force_coefficient_x"),
+            Some("Cd")
+        );
+        assert!(force_coefficient_plot_label("moment_coefficient_x").is_none());
     }
 }

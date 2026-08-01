@@ -463,6 +463,20 @@ pub struct BenchInspector {
     pub spectrum_truth: Vec<f32>,
 }
 
+/// Honest stage progress for an in-flight `predict_cad` request.
+///
+/// `fraction` is stage-based (ordinal + within-stage local progress), not a
+/// wall-clock percentage. UI copy must say so.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CadProgress {
+    pub request_id: String,
+    pub stage: String,
+    pub detail: String,
+    pub stage_index: u32,
+    pub stage_count: u32,
+    pub fraction: f32,
+}
+
 pub enum Msg {
     Correlated {
         request: RequestContext,
@@ -482,6 +496,7 @@ pub enum Msg {
     Field(Field),
     Field2D(Field2D),
     CadField(CadField),
+    CadProgress(CadProgress),
     Benchmark(BenchResult),
     BenchmarkInspector(BenchInspector),
     Error(String),
@@ -1216,68 +1231,16 @@ fn worker(
                 })
                 .to_string();
                 let bytes: Vec<u8> = mask.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let progress_tx = msg_tx.clone();
+                let progress_request = request_context.clone();
                 guard_model_request(Path::new(&config.research_dir), &model, || {
-                    request(conn, req, &bytes).map(|(j, payload)| {
-                        if !j["ok"].as_bool().unwrap_or(false) {
-                            return Msg::Error(
-                                j["error"].as_str().unwrap_or("predict_cad failed").into(),
-                            );
-                        }
-                        let n = j["shape"][1].as_u64().unwrap_or(0) as usize;
-                        let all: Vec<f32> = payload
-                            .chunks_exact(4)
-                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                            .collect();
-                        let cube = n * n * n;
-                        if all.len() < 9 * cube {
-                            return Msg::Error("short CAD payload".into());
-                        }
-                        let f = |k: &str| j[k].as_f64().unwrap_or(0.0) as f32;
-                        let vector = |key: &str| -> [f32; 3] {
-                            [
-                                j[key][0].as_f64().unwrap_or(0.0) as f32,
-                                j[key][1].as_f64().unwrap_or(0.0) as f32,
-                                j[key][2].as_f64().unwrap_or(0.0) as f32,
-                            ]
-                        };
-                        Msg::CadField(CadField {
-                            request_id: j["request_id"].as_str().unwrap_or("").to_string(),
-                            n,
-                            vel: all[..3 * cube].to_vec(),
-                            pressure: all[3 * cube..4 * cube].to_vec(),
-                            mask: all[4 * cube..5 * cube].to_vec(),
-                            cp: all[5 * cube..6 * cube].to_vec(),
-                            traction: all[6 * cube..9 * cube].to_vec(),
-                            horizon: j["horizon"].as_u64().unwrap_or(0) as u32,
-                            reynolds: f("reynolds"),
-                            characteristic_length_solver: f("char_len"),
-                            solver_dt: f("solver_dt"),
-                            solver_stride: j["solver_stride"].as_u64().unwrap_or(0) as u32,
-                            warmup_steps: j["warmup_steps"].as_u64().unwrap_or(0) as u32,
-                            dt_frame: f("dt_frame"),
-                            force_coefficients: vector("force_coefficients"),
-                            moment_coefficients: vector("moment_coefficients"),
-                            force_newtons: vector("force_newtons"),
-                            moment_newton_meters: vector("moment_newton_meters"),
-                            surface_area_m2: f("surface_area_m2"),
-                            pressure_force_fraction: f("pressure_force_fraction"),
-                            load_hotspot: vector("load_hotspot"),
-                            suction_hotspot: vector("suction_hotspot"),
-                            divergence_rms: f("divergence_rms"),
-                            wake_deficit_peak: f("wake_deficit_peak"),
-                            wake_deficit_mean: f("wake_deficit_mean"),
-                            load_method: j["load_method"].as_str().unwrap_or("unknown").to_string(),
-                            warnings: j["warnings"]
-                                .as_array()
-                                .map(|warnings| {
-                                    warnings
-                                        .iter()
-                                        .filter_map(|warning| warning.as_str().map(str::to_owned))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        })
+                    request_with_progress(conn, req, &bytes, |progress| {
+                        let _ = progress_tx.send(Msg::Correlated {
+                            request: progress_request.clone(),
+                            response: Box::new(Msg::CadProgress(progress)),
+                        });
                     })
+                    .map(|(j, payload)| parse_cad_field(&j, &payload))
                 })
             }
             Cmd::RunBenchmark {
@@ -1919,11 +1882,24 @@ fn managed_model_directory() -> Option<PathBuf> {
         .map(|root| root.join("reyn-studio/models"))
 }
 
-fn request(
-    conn: &mut TcpStream,
-    json: String,
-    payload: &[u8],
-) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
+fn read_frame(conn: &mut TcpStream) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
+    let mut lenb = [0u8; 4];
+    conn.read_exact(&mut lenb)?;
+    let total = u32::from_le_bytes(lenb) as usize;
+    let mut body = vec![0u8; total];
+    conn.read_exact(&mut body)?;
+    let jl = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if jl > body.len().saturating_sub(4) {
+        return Err(std::io::Error::other(
+            "engine frame json length exceeds body",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body[4..4 + jl])
+        .map_err(|e| std::io::Error::other(format!("json: {e}")))?;
+    Ok((value, body[4 + jl..].to_vec()))
+}
+
+fn write_request(conn: &mut TcpStream, json: &str, payload: &[u8]) -> std::io::Result<()> {
     let jb = json.as_bytes();
     let body_len = 4 + jb.len() + payload.len();
     conn.write_all(&(body_len as u32).to_le_bytes())?;
@@ -1932,16 +1908,120 @@ fn request(
     if !payload.is_empty() {
         conn.write_all(payload)?;
     }
-    // read response
-    let mut lenb = [0u8; 4];
-    conn.read_exact(&mut lenb)?;
-    let total = u32::from_le_bytes(lenb) as usize;
-    let mut body = vec![0u8; total];
-    conn.read_exact(&mut body)?;
-    let jl = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
-    let value: serde_json::Value = serde_json::from_slice(&body[4..4 + jl])
-        .map_err(|e| std::io::Error::other(format!("json: {e}")))?;
-    Ok((value, body[4 + jl..].to_vec()))
+    Ok(())
+}
+
+fn request(
+    conn: &mut TcpStream,
+    json: String,
+    payload: &[u8],
+) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
+    write_request(conn, &json, payload)?;
+    read_frame(conn)
+}
+
+/// Write a request, then drain zero or more `progress: true` frames before the
+/// final response. Progress callbacks must not block the engine worker.
+fn request_with_progress(
+    conn: &mut TcpStream,
+    json: String,
+    payload: &[u8],
+    mut on_progress: impl FnMut(CadProgress),
+) -> std::io::Result<(serde_json::Value, Vec<u8>)> {
+    write_request(conn, &json, payload)?;
+    loop {
+        let (value, body) = read_frame(conn)?;
+        if value.get("progress").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(progress) = parse_cad_progress(&value) {
+                on_progress(progress);
+            }
+            continue;
+        }
+        return Ok((value, body));
+    }
+}
+
+pub fn parse_cad_progress(value: &serde_json::Value) -> Option<CadProgress> {
+    if value.get("progress").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let stage_index = value["stage_index"].as_u64()? as u32;
+    let stage_count = value["stage_count"].as_u64()? as u32;
+    if stage_index == 0 || stage_count == 0 || stage_index > stage_count {
+        return None;
+    }
+    let fraction = value["fraction"]
+        .as_f64()
+        .unwrap_or_else(|| (stage_index.saturating_sub(1) as f64 + 0.5) / stage_count as f64)
+        as f32;
+    Some(CadProgress {
+        request_id: value["request_id"].as_str().unwrap_or("").into(),
+        stage: value["stage"].as_str()?.into(),
+        detail: value["detail"].as_str().unwrap_or("").into(),
+        stage_index,
+        stage_count,
+        fraction: fraction.clamp(0.0, 1.0),
+    })
+}
+
+fn parse_cad_field(j: &serde_json::Value, payload: &[u8]) -> Msg {
+    if !j["ok"].as_bool().unwrap_or(false) {
+        return Msg::Error(j["error"].as_str().unwrap_or("predict_cad failed").into());
+    }
+    let n = j["shape"][1].as_u64().unwrap_or(0) as usize;
+    let all: Vec<f32> = payload
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let cube = n * n * n;
+    if all.len() < 9 * cube {
+        return Msg::Error("short CAD payload".into());
+    }
+    let f = |k: &str| j[k].as_f64().unwrap_or(0.0) as f32;
+    let vector = |key: &str| -> [f32; 3] {
+        [
+            j[key][0].as_f64().unwrap_or(0.0) as f32,
+            j[key][1].as_f64().unwrap_or(0.0) as f32,
+            j[key][2].as_f64().unwrap_or(0.0) as f32,
+        ]
+    };
+    Msg::CadField(CadField {
+        request_id: j["request_id"].as_str().unwrap_or("").to_string(),
+        n,
+        vel: all[..3 * cube].to_vec(),
+        pressure: all[3 * cube..4 * cube].to_vec(),
+        mask: all[4 * cube..5 * cube].to_vec(),
+        cp: all[5 * cube..6 * cube].to_vec(),
+        traction: all[6 * cube..9 * cube].to_vec(),
+        horizon: j["horizon"].as_u64().unwrap_or(0) as u32,
+        reynolds: f("reynolds"),
+        characteristic_length_solver: f("char_len"),
+        solver_dt: f("solver_dt"),
+        solver_stride: j["solver_stride"].as_u64().unwrap_or(0) as u32,
+        warmup_steps: j["warmup_steps"].as_u64().unwrap_or(0) as u32,
+        dt_frame: f("dt_frame"),
+        force_coefficients: vector("force_coefficients"),
+        moment_coefficients: vector("moment_coefficients"),
+        force_newtons: vector("force_newtons"),
+        moment_newton_meters: vector("moment_newton_meters"),
+        surface_area_m2: f("surface_area_m2"),
+        pressure_force_fraction: f("pressure_force_fraction"),
+        load_hotspot: vector("load_hotspot"),
+        suction_hotspot: vector("suction_hotspot"),
+        divergence_rms: f("divergence_rms"),
+        wake_deficit_peak: f("wake_deficit_peak"),
+        wake_deficit_mean: f("wake_deficit_mean"),
+        load_method: j["load_method"].as_str().unwrap_or("unknown").to_string(),
+        warnings: j["warnings"]
+            .as_array()
+            .map(|warnings| {
+                warnings
+                    .iter()
+                    .filter_map(|warning| warning.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -2892,5 +2972,39 @@ assert loaded.authenticity["status"] == "development_unsigned_override"
             Some(Msg::Error(e)) => panic!("engine error: {e}"),
             _ => panic!("timed out waiting for benchmark inspector"),
         }
+    }
+
+    #[test]
+    fn parse_cad_progress_accepts_stage_frames_and_rejects_final_payloads() {
+        let progress = parse_cad_progress(&serde_json::json!({
+            "ok": true,
+            "progress": true,
+            "request_id": "req-1",
+            "stage": "developing",
+            "stage_index": 2,
+            "stage_count": 4,
+            "detail": "Brinkman warmup 5/20",
+            "fraction": 0.375,
+        }))
+        .expect("progress frame");
+        assert_eq!(progress.request_id, "req-1");
+        assert_eq!(progress.stage, "developing");
+        assert_eq!((progress.stage_index, progress.stage_count), (2, 4));
+        assert!((progress.fraction - 0.375).abs() < 1e-6);
+
+        assert!(parse_cad_progress(&serde_json::json!({
+            "ok": true,
+            "shape": [9, 32, 32, 32],
+            "request_id": "req-1",
+        }))
+        .is_none());
+        assert!(parse_cad_progress(&serde_json::json!({
+            "ok": true,
+            "progress": true,
+            "stage": "developing",
+            "stage_index": 0,
+            "stage_count": 4,
+        }))
+        .is_none());
     }
 }

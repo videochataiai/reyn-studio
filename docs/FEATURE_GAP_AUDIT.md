@@ -12,7 +12,7 @@ Companions: [`CFD_APP_LANDSCAPE.md`](CFD_APP_LANDSCAPE.md) (lifecycle/CAD strate
 
 1. **Customization in mature CAD/CFD tools is not a preferences page; it is a three-layer architecture.** Every incumbent separates (a) global application options, (b) per-document/per-case authoritative settings, and (c) reusable templates/defaults that seed new documents. SolidWorks makes the split explicit (System Options vs Document Properties saved into templates); Ansys Discovery scopes simulation units "only to new documents"; NX layers Site → Group → User customer defaults; Workbench keeps per-project unit systems above a global default. Reyn has layer (a) only (`src/settings.rs`) and an implicit layer (b) in the case contract (`src/engineering.rs`); layer (c) does not exist.
 
-**Status refresh (0.1.2 candidate, feature/step-import):** R2 cancel/progress, R3 horizon playback, R4 body orientation, R7 fluid presets/templates, and R8 display units/precision are **SHIPPED**. R1 viewport nav is **SHIPPED** including axis triad and Reyn/SolidWorks/Fusion/ParaView schemes. R5 engineering report is **SHIPPED** for HTML + PNG/PDF lab sheets (optional Ed25519 sidecar when a Keychain key is configured). R6 viewport capture is **SHIPPED** with provenance footer. R9 has surface probe **SHIPPED** and Cp mid-line profile **SHIPPED**. R10 colormap presets are **SHIPPED** for app settings + case `view_state` reopen. STEP is **PARTIAL** (single-part Truck + async import worker + multi-shell pick-one; assemblies/OCCT bridge still open). 3MF is **SHIPPED** for Core mesh+units. Model-field streamlines are **SHIPPED** on Results; ABC demo remains sandbox-quarantined. Named regions, small run queue, and eng lab-sheet signing are **SHIPPED** under Scope A.
+**Status refresh (0.2.0, feature/step-import):** R2 cancel/progress, R3 horizon playback, R4 body orientation, R7 fluid presets/templates, and R8 display units/precision are **SHIPPED**. R1 viewport nav is **SHIPPED** including axis triad and Reyn/SolidWorks/Fusion/ParaView schemes. R5 engineering report is **SHIPPED** for HTML + PNG/PDF lab sheets (optional Ed25519 sidecar when a Keychain key is configured). R6 viewport capture is **SHIPPED** with provenance footer. R9 has surface probe, Cp mid-line profile, and force-vs-variant Cd/Cs/Cl bars **SHIPPED**. R10 colormap presets are **SHIPPED** for app settings + case `view_state` reopen. STEP is **PARTIAL** (single-part Truck + async import worker + multi-shell pick-one; assemblies/OCCT bridge still open). 3MF is **SHIPPED** for Core mesh+units. Model-field streamlines are **SHIPPED** on Results; ABC demo remains sandbox-quarantined. Named regions, small run queue, eng lab-sheet signing, Results Run detail, engineering-result digest signing, and determinate CAD stage progress (sidecar `progress` frames) are **SHIPPED** under Scope A. Remaining Scope A polish: consistency evidence on eng runs, STEP/OCCT depth.
 
 2. **Competitor-scheme mouse emulation is a category-standard feature, not a nicety.** Onshape ships SolidWorks/NX/Creo/AutoCAD view-manipulation presets; Fusion ships SolidWorks/Inventor/Alias/Tinkercad/PowerMill presets; Discovery and ParaView expose full per-button rebinding. The vendors treat orbit muscle memory as a switching cost to be neutralized. Reyn now ships Reyn / SolidWorks / Fusion / **ParaView** schemes with pan, fit, and standard views.
 
@@ -20,7 +20,7 @@ Companions: [`CFD_APP_LANDSCAPE.md`](CFD_APP_LANDSCAPE.md) (lifecycle/CAD strate
 
 4. **Units are the sharpest gap between Reyn's input honesty and its output inflexibility.** Reyn's per-case source-unit confirmation gate (`src/engineering.rs:141-143`, N5X-CAD-02) is *stronger* than the category norm on the input side. But every output is fixed SI (`m/s`, `kg/m³`, `Pa·s`, `N`, `N·m` suffixes at `src/app.rs:1444-1509`, `1770-1818`). No incumbent ships a single hardwired display-unit system; a US aero/automotive engineer expects lbf/psf/in on demand.
 
-5. **The day-one essentials audit originally found the solve interaction weakest.** The 0.1.1 corrective release now provides destructive sidecar cancellation with persisted `Cancelled` attempts and retry, horizon playback, 3D probe, viewport image export, and engineering-case report; determinate engine stage progress remains unavailable.
+5. **The day-one essentials audit originally found the solve interaction weakest.** The 0.1.1 corrective release provides cancellation with persisted `Cancelled` attempts and retry, horizon playback, 3D probe, viewport image export, and engineering-case report; later Scope A work adds sidecar stage progress (prepare → develop → predict → recover) with an honest stage-based fraction.
 
 6. **0.1.1 uses the existing request identity and warmup cache.** Horizon previews remain display-only; cancellation terminates the blocking sidecar, persists the terminal attempt, and replaces the engine before retry.
 
@@ -108,7 +108,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Operating point with full validation (units, positivity, Re envelope 60–400, horizon ≤ model support) | SHIPPED | `src/engineering.rs:139-196`; live Reynolds + dynamic pressure readouts `src/app.rs:1512-1535` |
 | Model compatibility filtering + support display | SHIPPED | Picker filters to 3D, grid-matched, geometry-conditioned obstacle checkpoints `src/app.rs:1363-1373`; `ModelSupport::validation` `src/engineering.rs:452-479` (N5X-CAD-04) |
 | Fluid/material presets | SHIPPED | Air/Water presets + case templates seed operating points; gates still apply. |
-| Case templates / duplicate-as-variant with defaults | PARTIAL | Operating-point variant creation exists (`src/app.rs:2024-2027` invalidates and returns to setup; parent lineage recorded); no named templates |
+| Case templates / duplicate-as-variant with defaults | SHIPPED | Named case templates (operating point + preferred view) save/apply/import/export via Settings and Case Setup; duplicate-as-variant keeps parent lineage. Templates seed drafts only — readiness gates still run. |
 | Boundary-condition / turbulence-model editors | N/A-BY-DESIGN | PRD §1.2 non-goal; the locked contract is displayed instead (`src/app.rs:1420-1433`) |
 | Internal-flow case kind | N/A-BY-DESIGN (blocked) | Reference-only contract, execution-blocked with structured blockers (`src/engineering.rs:697-736`); reference card in UI `src/app.rs:11454` |
 | Staleness on contract edit | SHIPPED | Edits invalidate the draft result and notify; completed runs immutable (`src/app.rs:1629-1636`; N6-PROJ-03) |
@@ -120,11 +120,11 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Gated run with visible blocking reason (never a dead control) | SHIPPED | Single source of truth `run_gate_reason` `src/app.rs:2953-2974`; gated top-bar button `src/app.rs:3289-3312` |
 | Asynchronous execution, responsive shell | SHIPPED | Engine channel + non-blocking drain (`src/app.rs:329-330`); PERF-AC-01 per PRD |
 | Run start records exact contract | SHIPPED | `run_external_flow` commits the case revision before dispatch `src/app.rs:895-951`; exact contract JSON `src/engineering.rs:542-559` |
-| Progress indication | PARTIAL | Status bar and Case Setup show honest elapsed time + Cancel for in-flight runs; the engine is still a blocking single pass so no determinate fraction or warmup/predict stage breakdown is reported |
+| Progress indication | SHIPPED | Sidecar streams stage frames during `predict_cad` (prepare → develop → predict → recover); Case Setup and status bar show stage index/count, detail, and a stage-based progress bar plus elapsed time + Cancel. Fraction is ordinal/stage-local, not wall-clock. |
 | **Cancellation** | SHIPPED | Cancel terminalizes the immutable attempt, terminates the blocking sidecar, replaces the engine, and exposes retry after readiness; stale correlated responses are ignored |
 | Queueing / batch runs | PARTIAL | Small follow-on FIFO (`RunQueue`) drains after the in-flight attempt; no parameter sweeps (P-SWEEP-01 remains post-N6). |
 | Run history with immutable lineage + deep links | SHIPPED | Run ledger `src/app.rs:2695-2729`; rerun-with-parent (N6-PROJ-04) |
-| Run log / stop-reason inspection | PARTIAL | Manifests record warnings/stop data; no in-app log or run-detail console beyond ledger + warnings list `src/app.rs:2743-2748` |
+| Run log / stop-reason inspection | SHIPPED | Results Run detail card shows stop reason, runtime, and warnings for the selected attempt; Evidence run ledger deep-links every stored attempt. A dedicated scrolling multi-run console remains optional polish. |
 
 ### 2.4 Post-processing
 
@@ -138,7 +138,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Load/suction hotspots | SHIPPED | Billboarded markers (`src/viewport.rs:44-49`, layer toggle `src/app.rs:1907`) |
 | **3D point probe** (click → local velocity/Cp/traction) | SHIPPED | Surface probe on the engineering viewport with source-class chips; section probe remains. |
 | **Streamlines on the model field** | SHIPPED | Results path advects model velocity (`model_streamline_*`); ABC analytic field stays sandbox-quarantined. |
-| XY plots (Cp vs. position, force vs. variant) | PARTIAL | Cp mid-line profile under section view is SHIPPED; force-vs-variant XY remains a numeric delta table. |
+| XY plots (Cp vs. position, force vs. variant) | SHIPPED | Cp mid-line profile under section view; force-coefficient parent/current grouped bars (Cd/Cs/Cl) above the shared-unit scalar delta table on Results. |
 | **Horizon/time scrubbing within model support** | SHIPPED | `HorizonPlayback` fetches/caches per-step model fields for scrubbing and play-at-reading-rate; recorded run evidence stays immutable (`request_horizon_step` / `show_horizon_step` in `src/app.rs`). |
 | Convergence/confidence indicators | PARTIAL | Divergence RMS + warnings + applicability banner shipped; honest "spatial error unavailable without reference" notice (`src/app.rs:1999-2004`); no consistency evidence (e.g. semigroup) attached to engineering runs, though the engine computes it for 2D sandbox (`src/engine.rs:105`) |
 | Colormap / legend range control | SHIPPED | Ember/Viridis/Magma + Auto/Pinned Cp range in settings; persisted on case `view_state` for reopen. |
@@ -170,7 +170,7 @@ Grades: **SHIPPED** (works today, evidence cited) · **PARTIAL** (exists with ma
 | Item | Grade | Evidence / gap |
 |---|---|---|
 | Local source/case/run revisioning | SHIPPED | Above |
-| Signed, verifiable evidence bundle | PARTIAL | Benchmark reports sign + verify offline (`src/signing.rs`, `src/app.rs:9331-9533`); engineering evidence is hash-linked but unsigned |
+| Signed, verifiable evidence bundle | SHIPPED | Benchmark reports and engineering-result digests sign with detached Ed25519 sidecars (`src/signing.rs`); lab sheets optionally sign on export; Evidence → Sign engineering result appends `engineering_signature` authenticity evidence. Organization-key trust / Keychain provisioning remain operator-side. |
 | Sharing, comments, cloud sync, accounts | N/A-BY-DESIGN | PRD §1.2 / REQ-LOCAL-01; P-COLLAB-01 is deliberately P2 |
 
 ---
@@ -200,7 +200,7 @@ Rank = (engineer-credibility impact on day one of a J1 evaluation) × (feasibili
 `Camera` gains a `target: [f32; 3]` (currently only yaw/pitch/dist, `src/viewport.rs:12-25`); secondary-button or modifier-drag pans by offsetting the target in the view plane; a `fit(bounds)` method sets dist from the domain/geometry bounds. Add +X/−X/±Y/±Z/isometric snaps to the View menu (`src/menubar.rs`) and the ⌘K palette (`src/app.rs:2994-3001`), plus a small axis triad painted in the viewport corner (`src/app.rs:7346+`). Both `project_volume` and the CPU projector already consume the camera in one place each (`src/viewport.rs:57-90`, `277-297`), so target support is a contained change. This is the single cheapest credibility repair in the codebase.
 
 **R2 — Run progress + cancellation. (Implemented in 0.1.1)**
-The app records the attempt before dispatch, shows honest elapsed indeterminate progress, and offers Cancel. Cancel persists `Cancelled`, terminates the blocking sidecar, starts a fresh engine, and permits retry after readiness. Correlated stale responses cannot alter the retry. Genuine per-stage/determinate progress remains future work.
+The app records the attempt before dispatch, shows stage-based progress from sidecar frames (plus elapsed time), and offers Cancel. Cancel persists `Cancelled`, terminates the blocking sidecar, starts a fresh engine, and permits retry after readiness. Correlated stale responses cannot alter the retry.
 
 **R3 — Horizon playback within model support. (P0)**
 The engine caches solver warmup per mask so each horizon is one model pass (`src/engine.rs:142-144`). Extend `CadPredict` to return (or fetch per-step on demand) fields for steps 1..H; add a horizon scrubber to Results labeled with the honest vocabulary — "Model horizon step k of H" — and re-derive the displayed section/volume from the selected step. Loads in the measurement table stay pinned to the run's recorded horizon unless the user explicitly inspects per-step values (each labeled MODEL, per N5X-EV-02). Files: `src/engine.rs` protocol + `engine/` sidecar, `CadCase` field storage (`src/app.rs:38-54`), `controls_engineering_results`.
