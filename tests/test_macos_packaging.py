@@ -33,12 +33,14 @@ from macos_packaging import (  # noqa: E402
     copy_engine_resources,
     copy_research_resources,
     copy_security_resources,
+    developer_id_sign,
     developer_path_leaks,
     deterministic_zip,
     file_manifest,
     info_plist,
     load_config,
     load_macos_release_pins,
+    notarize_and_staple,
     parse_macho_minimum_macos,
     require_executable_architectures,
     require_local_architecture_runtime,
@@ -83,7 +85,7 @@ class MacOSPackagingTests(unittest.TestCase):
     def test_bundle_identity_and_version_are_canonical_cargo_metadata(self):
         self.assertEqual(self.config.bundle_identifier, "com.reyn.studio")
         self.assertEqual(self.config.display_name, "Reyn Studio")
-        self.assertEqual(self.config.version, "0.2.0")
+        self.assertEqual(self.config.version, "0.3.0")
         self.assertEqual(self.config.minimum_system_version, "11.0")
 
     def test_plist_declares_types_without_claiming_broken_finder_open(self):
@@ -153,6 +155,36 @@ class MacOSPackagingTests(unittest.TestCase):
             self.assertIn(
                 "python.bundled=False, expected True",
                 validate_runtime_contract(path),
+            )
+
+    def test_runtime_contract_accepts_signed_apple_distribution_flags(self):
+        contract = runtime_requirements()
+        contract["apple_distribution"] = {
+            "developer_id_signing_performed": True,
+            "notarization_performed": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-requirements.json"
+            write_json(path, contract)
+            self.assertEqual(
+                validate_runtime_contract(
+                    path, developer_id_signed=True, notarized=True
+                ),
+                [],
+            )
+            self.assertTrue(
+                any(
+                    "developer_id_signing_performed=True, expected False" in error
+                    for error in validate_runtime_contract(path)
+                )
+            )
+            contract["apple_distribution"]["notarization_performed"] = False
+            write_json(path, contract)
+            self.assertEqual(
+                validate_runtime_contract(
+                    path, developer_id_signed=True, notarized=False
+                ),
+                [],
             )
 
     def test_macho_minimum_version_parser_handles_current_and_legacy_commands(self):
@@ -460,6 +492,44 @@ class MacOSPackagingTests(unittest.TestCase):
         self.assertNotIn("No authenticated .reynmodel/.sig/.tuf triplet", blockers)
         self.assertIn("Developer ID signing and Apple notarization", blockers)
         self.assertIn("document associations are intentionally not claimed", blockers)
+        signed = "\n".join(
+            standalone_blockers(
+                ROOT, developer_id_signed=True, notarized=True
+            )
+        )
+        self.assertNotIn("Developer ID signing and Apple notarization", signed)
+        self.assertNotIn("notarization was not performed", signed)
+        signed_only = "\n".join(
+            standalone_blockers(
+                ROOT, developer_id_signed=True, notarized=False
+            )
+        )
+        self.assertIn("notarization was not performed", signed_only)
+
+    def test_developer_id_sign_is_opt_in_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "Reyn Studio.app"
+            bundle.mkdir()
+            self.assertFalse(
+                developer_id_sign(bundle, None, entitlements=None)
+            )
+            with self.assertRaisesRegex(RuntimeError, "entitlements file is missing"):
+                developer_id_sign(
+                    bundle,
+                    "Developer ID Application: Example",
+                    entitlements=None,
+                )
+            self.assertFalse(
+                notarize_and_staple(
+                    bundle, keychain_profile=None, source_date_epoch=0
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "not Developer ID signed"):
+                notarize_and_staple(
+                    bundle,
+                    keychain_profile="reyn-notary",
+                    source_date_epoch=0,
+                )
 
     def test_all_lightweight_runtime_modules_copy_without_tests_or_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:

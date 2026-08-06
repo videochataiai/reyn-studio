@@ -170,17 +170,48 @@ at runtime.
 
 ## Apple release boundary
 
-The workflow never invokes Developer ID signing or notarization. A distributable build still needs:
+By default the workflow does **not** invoke Developer ID signing or notarization. Unsigned /
+ad-hoc local ZIPs must not be relabeled as signed releases. A linker-generated ad-hoc Mach-O
+signature is not Developer ID signing.
+
+### Opt-in Developer ID + notarization (fail-closed)
+
+When Apple credentials are available on the build Mac:
+
+```bash
+SOURCE_DATE_EPOCH=315532800 python3 scripts/package_macos.py \
+  --target host \
+  --research-source-dir /path/to/pinned/reyn/reyn-research \
+  --runtime-dir /path/to/arm64/ReynPython \
+  --build-number 1 \
+  --sign-identity "Developer ID Application: Example Corp (TEAMID)" \
+  --notarize-profile "reyn-notary"
+```
+
+- Packaging writes `runtime-requirements.json` and `release-manifest.json` **before**
+  `codesign` / notarization so the Developer ID seal is not invalidated by later
+  Resource rewrites. Stapler is the only approved post-sign mutation.
+- `--sign-identity` (or `REYN_DEVELOPER_ID_IDENTITY`) runs hardened-runtime `codesign` on nested
+  Mach-O files (entitlements only on the main executable and `.app`) then the bundle,
+  using `packaging/macos/ReynStudio.entitlements` unless `--entitlements` overrides it.
+  Missing `codesign`, entitlements, or Team ID fails packaging.
+- `--notarize-profile` (or `REYN_NOTARYTOOL_PROFILE`) runs `notarytool submit --wait` then
+  `stapler staple`. It requires a successful Developer ID sign and fails closed on reject.
+- The sealed runtime contract and release manifest record `developer_id_signed` /
+  `notarized` honestly; `validate_runtime_contract` accepts those true flags when
+  signing was requested. Default packages keep both `false`.
+- In-bundle `files` digests are captured pre-codesign; Mach-O authenticity is the
+  Developer ID signature when signed.
+
+A distributable Gatekeeper build still needs:
 
 1. A Developer ID Application certificate/private key and the intended Team ID.
-2. Hardened-runtime signing of every executable/runtime component with reviewed entitlements.
+2. Hardened-runtime signing of every executable/runtime component with reviewed entitlements
+   (the bundled Python/PyTorch runtime may need entitlement adjustments after clean-machine tests).
 3. Notary submission credentials, successful notarization, and ticket stapling.
 4. Gatekeeper assessment of the exact archived artifact after download/quarantine.
 5. Offline production-root ceremony, independent root metadata review, threshold key custody,
    publisher-key authorization/revocation policy, and a qualified signed model metadata set.
-
-Do not relabel the local ZIP as a signed or notarized release. A linker-generated ad-hoc Mach-O
-signature is not Developer ID signing.
 
 ## Manual release tests still required
 

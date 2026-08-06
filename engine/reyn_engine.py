@@ -1696,7 +1696,11 @@ class Engine:
         report("predicting", 3, f"Model horizon step {horizon}", 0.0)
         device = self.device
         with torch.no_grad():
-            model_in = torch.cat([developed, mask_s.reshape(1, 1, N, N, N)], dim=1).to(device)
+            # Engineering CAD path: one forward only. Semigroup self-consistency
+            # stays in the 2D research sandbox — not on the customer hot path.
+            model_in = torch.cat(
+                [developed, mask_s.reshape(1, 1, N, N, N)], dim=1
+            ).to(device)
             pred = m(model_in, torch.tensor([[horizon * dt_frame]], device=device)).cpu()
             report("predicting", 3, f"Model horizon step {horizon} complete", 1.0)
             report("recovering", 4, "Recovering pressure and surface loads", 0.0)

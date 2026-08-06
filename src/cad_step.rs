@@ -539,6 +539,10 @@ mod tests {
         assert_eq!(first.declared_unit.as_deref(), Some("m"));
         assert_eq!(first.mesh.tris, second.mesh.tris);
         assert_eq!(
+            crate::cad::analyzed_mesh_sha256(&first.mesh),
+            crate::cad::analyzed_mesh_sha256(&second.mesh)
+        );
+        assert_eq!(
             first.tessellation_tolerance_source_units,
             second.tessellation_tolerance_source_units
         );
@@ -549,5 +553,32 @@ mod tests {
         // execution instead of presenting partial tessellation as a closed body.
         assert!(diagnostics.boundary_edges > 0);
         assert_eq!(diagnostics.non_manifold_edges, 0);
+    }
+
+    #[test]
+    fn corpus_rejects_assembly_occurrence_fixture() {
+        let bytes = include_bytes!("../test-geometry/corpus/assembly_occurrence.step");
+        let err = parse_step(bytes).expect_err("assembly occurrence must fail closed");
+        assert!(
+            err.contains("assembl"),
+            "expected assembly reject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn corpus_rejects_conflicting_units_fixture() {
+        let bytes = include_bytes!("../test-geometry/corpus/conflicting_units.step");
+        let err = parse_step(bytes).expect_err("conflicting units must fail closed");
+        assert!(
+            err.contains("multiple length units") || err.contains("unit"),
+            "expected unit conflict reject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn corpus_rejects_malformed_truncated_fixture() {
+        let bytes = include_bytes!("../test-geometry/corpus/malformed_truncated.step");
+        let err = parse_step(bytes).expect_err("truncated STEP must fail closed");
+        assert!(!err.is_empty(), "malformed import must return an error");
     }
 }

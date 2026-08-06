@@ -35,6 +35,7 @@ pub enum MenuCommand {
     RegenerateSandbox,
     ToggleSandboxLive,
     OpenDocs,
+    CheckForUpdates,
 }
 
 pub enum MenuSignal {
@@ -227,11 +228,11 @@ impl MenuBar {
 
         let help_menu = Submenu::new("Help", true);
         help_menu
-            .append_items(&[&item(
-                "Reyn Studio Documentation",
-                None,
-                MenuCommand::OpenDocs,
-            )])
+            .append_items(&[
+                &item("Reyn Studio Documentation", None, MenuCommand::OpenDocs),
+                &PredefinedMenuItem::separator(),
+                &item("Check for Updates…", None, MenuCommand::CheckForUpdates),
+            ])
             .ok()?;
 
         menu.append_items(&[

@@ -1,0 +1,16 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('Reyn corpus synthetic assembly reject'),'2;1');
+FILE_NAME('assembly_occurrence.step','2026-08-05T00:00:00',(''),(''),'Reyn corpus','Reyn','');
+FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));
+ENDSEC;
+DATA;
+#1=PRODUCT('P','P','',(#2));
+#2=PRODUCT_CONTEXT('',#3,'mechanical');
+#3=APPLICATION_CONTEXT('automotive_design');
+#4=NEXT_ASSEMBLY_USAGE_OCCURRENCE('A1','','',#5,#6,$);
+#5=PRODUCT_DEFINITION('','',#1,#7);
+#6=PRODUCT_DEFINITION('','',#1,#7);
+#7=PRODUCT_DEFINITION_CONTEXT('',#3,'design');
+ENDSEC;
+END-ISO-10303-21;

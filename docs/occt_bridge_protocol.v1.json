@@ -1,0 +1,75 @@
+{
+  "schema": "com.reyn.cad-bridge.protocol/1",
+  "transport": "length_prefixed_json_stdio",
+  "byte_order": "little_endian_u32_payload_length",
+  "max_request_bytes": 67108864,
+  "max_response_bytes": 268435456,
+  "timeout_ms_default": 120000,
+  "requests": {
+    "hello": {
+      "required": ["schema", "op", "request_id"],
+      "op": "hello"
+    },
+    "tessellate_step": {
+      "required": [
+        "schema",
+        "op",
+        "request_id",
+        "path",
+        "chord_tolerance",
+        "max_triangles",
+        "max_shells"
+      ],
+      "op": "tessellate_step",
+      "optional": ["occurrence_path", "unit_hint"]
+    },
+    "cancel": {
+      "required": ["schema", "op", "request_id", "target_request_id"],
+      "op": "cancel"
+    }
+  },
+  "responses": {
+    "hello_ok": {
+      "required": ["schema", "ok", "op", "request_id", "bridge_version", "occt_version"]
+    },
+    "mesh_ok": {
+      "required": [
+        "schema",
+        "ok",
+        "op",
+        "request_id",
+        "length_unit",
+        "shell_count",
+        "triangle_count",
+        "positions_f32le_b64",
+        "indices_u32le_b64",
+        "tessellation_param_sha256",
+        "warnings"
+      ]
+    },
+    "error": {
+      "required": ["schema", "ok", "op", "request_id", "code", "message"],
+      "ok": false,
+      "codes": [
+        "unsupported_assembly",
+        "occurrence_required",
+        "timeout",
+        "memory_limit",
+        "malformed_step",
+        "unsupported_surface",
+        "cancelled",
+        "internal"
+      ]
+    }
+  },
+  "fail_closed": [
+    "assemblies without explicit occurrence_path",
+    "bridge panic or non-zero exit",
+    "payload over max_*_bytes",
+    "unknown op"
+  ],
+  "licensing": {
+    "studio": "Apache-2.0 / MIT Rust host; never statically links OCCT",
+    "bridge": "separate process; dynamically linked OCCT with LGPL notices"
+  }
+}

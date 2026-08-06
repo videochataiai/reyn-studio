@@ -300,6 +300,7 @@ pub struct AppSettings {
     pub research_dir: String,
     pub project_directory: String,
     pub autosave_interval_seconds: u32,
+    pub automatic_update_checks: bool,
     pub theme: ThemeMode,
     /// Replace interface transitions with instant state changes (§3.7).
     pub reduced_motion: bool,
@@ -371,6 +372,7 @@ impl Default for AppSettings {
             research_dir: config.research_dir,
             project_directory: default_project_directory(),
             autosave_interval_seconds: 120,
+            automatic_update_checks: true,
             theme: ThemeMode::Instrument,
             reduced_motion: false,
             telemetry: false,
@@ -770,12 +772,13 @@ pub enum SettingsCategory {
     Workflow,
     Shortcuts,
     Storage,
+    Updates,
     Signing,
     Developer,
 }
 
 impl SettingsCategory {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Compute,
         Self::Units,
         Self::Appearance,
@@ -783,6 +786,7 @@ impl SettingsCategory {
         Self::Workflow,
         Self::Shortcuts,
         Self::Storage,
+        Self::Updates,
         Self::Signing,
         Self::Developer,
     ];
@@ -796,6 +800,7 @@ impl SettingsCategory {
             Self::Workflow => "Workflow defaults",
             Self::Shortcuts => "Keyboard shortcuts",
             Self::Storage => "Storage & recovery",
+            Self::Updates => "Updates",
             Self::Signing => "Signing & privacy",
             Self::Developer => "Developer",
         }
@@ -811,6 +816,7 @@ impl SettingsCategory {
             "workflow" => Self::Workflow,
             "shortcuts" => Self::Shortcuts,
             "storage" => Self::Storage,
+            "updates" => Self::Updates,
             "signing" => Self::Signing,
             "developer" => Self::Developer,
             _ => return None,
@@ -895,6 +901,7 @@ pub fn show_settings(
     saved: &AppSettings,
     draft: &mut AppSettings,
     state: &mut SettingsUiState,
+    updater: Option<&crate::updater::Updater>,
 ) -> Option<SettingsAction> {
     // S6/G3: the same centered content column as every other document screen
     // (980 max width, symmetric ≥34px gutters — the founder's margins fix).
@@ -934,7 +941,14 @@ pub fn show_settings(
                     );
                     ui.add_space(14.0);
                     ui.vertical(|ui| {
-                        settings_category_scroll(ui, body_height, draft, state, &mut action);
+                        settings_category_scroll(
+                            ui,
+                            body_height,
+                            draft,
+                            state,
+                            &mut action,
+                            updater,
+                        );
                     });
                 });
             }
@@ -947,6 +961,7 @@ pub fn show_settings(
                     draft,
                     state,
                     &mut action,
+                    updater,
                 );
             }
         }
@@ -1115,6 +1130,7 @@ fn settings_category_scroll(
     draft: &mut AppSettings,
     state: &mut SettingsUiState,
     action: &mut Option<SettingsAction>,
+    updater: Option<&crate::updater::Updater>,
 ) {
     let mut scroll = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -1133,6 +1149,7 @@ fn settings_category_scroll(
             SettingsCategory::Workflow => category_workflow(ui, draft, state, action),
             SettingsCategory::Shortcuts => category_shortcuts(ui, draft),
             SettingsCategory::Storage => category_storage(ui, draft),
+            SettingsCategory::Updates => category_updates(ui, draft, updater),
             SettingsCategory::Signing => category_signing(ui, draft, state, action),
             SettingsCategory::Developer => category_developer(ui, draft),
         }
@@ -1146,6 +1163,16 @@ fn settings_category_scroll(
             16.0
         });
         settings_scope_footnote(ui);
+    });
+}
+
+fn category_updates(
+    ui: &mut egui::Ui,
+    draft: &mut AppSettings,
+    updater: Option<&crate::updater::Updater>,
+) {
+    section(ui, "Application updates", |ui| {
+        crate::updater::show_settings(ui, updater, &mut draft.automatic_update_checks);
     });
 }
 
@@ -3039,6 +3066,7 @@ mod tests {
             "workflow",
             "shortcuts",
             "storage",
+            "updates",
             "signing",
             "developer",
         ];

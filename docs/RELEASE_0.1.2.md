@@ -1,4 +1,7 @@
-# Reyn Studio 0.1.2 release notes (candidate)
+# Reyn Studio 0.1.2 historical candidate notes
+
+This candidate was superseded by the 0.2.0 and 0.3.0 preview releases. Current
+package claims and qualification status live in the newest release notes.
 
 **Branch:** `feature/step-import`  
 **Scope:** Continue the comprehensive package — STEP + 3MF import, viewport triad, evidence lab sheets, Cp profile, model streamlines, ParaView nav scheme, async CAD import, multi-shell pick-one, run queue, named regions.

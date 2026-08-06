@@ -7,7 +7,7 @@
 
 use crate::{
     app::{AppBootstrap, ReynApp},
-    theme,
+    theme, updater,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -71,6 +71,7 @@ pub struct RootApp {
     studio: Option<ReynApp>,
     bootstrap: AppBootstrap,
     gate: Option<AccessGate>,
+    updater: updater::Updater,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,11 +98,16 @@ impl RootApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let gate_required = access_required();
         let bootstrap = AppBootstrap::prepare(cc);
-        let studio = (!gate_required).then(|| bootstrap.start());
+        let updater = updater::Updater::new(cc.egui_ctx.clone());
+        if updater::automatic_checks_enabled_from_disk() {
+            updater.check();
+        }
+        let studio = (!gate_required).then(|| bootstrap.start_with_updater(updater.clone()));
         Self {
             studio,
             bootstrap,
             gate: gate_required.then(AccessGate::new),
+            updater,
         }
     }
 }
@@ -119,7 +125,9 @@ impl eframe::App for RootApp {
         }
         let access_granted = self.gate.as_ref().is_none_or(AccessGate::is_granted);
         match studio_lifecycle_action(gate_required, access_granted, self.studio.is_some()) {
-            StudioLifecycleAction::Start => self.studio = Some(self.bootstrap.start()),
+            StudioLifecycleAction::Start => {
+                self.studio = Some(self.bootstrap.start_with_updater(self.updater.clone()))
+            }
             StudioLifecycleAction::Drop => {
                 // Dropping ReynApp first drops EngineHandle, interrupts an
                 // in-flight sidecar request, joins its worker, and terminates
@@ -131,6 +139,8 @@ impl eframe::App for RootApp {
         if let Some(studio) = self.studio.as_mut() {
             eframe::App::ui(studio, ui, frame);
         } else if let Some(gate) = self.gate.as_mut() {
+            egui::Panel::top("access.update-banner")
+                .show(ui, |ui| updater::show_compact_banner(ui, &self.updater));
             gate.ui(ui);
         }
     }
@@ -529,7 +539,7 @@ fn authenticate(endpoint: &str, request: &LoginRequest) -> Result<Session, Login
         ))
         .tls_config(
             ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
+                .provider(ureq::tls::TlsProvider::Rustls)
                 .build(),
         )
         .build();

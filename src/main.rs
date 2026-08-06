@@ -29,6 +29,7 @@ mod settings;
 mod signing;
 mod theme;
 mod units;
+mod updater;
 mod viewport;
 mod vtk_export;
 

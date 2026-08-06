@@ -1,0 +1,10 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('Reyn corpus synthetic malformed truncate'),'2;1');
+FILE_NAME('malformed_truncated.step','2026-08-05T00:00:00',(''),(''),'Reyn corpus','Reyn','');
+FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));
+ENDSEC;
+DATA;
+#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#3),#4);
+/* Intentionally truncated before ENDSEC / solid completion. */

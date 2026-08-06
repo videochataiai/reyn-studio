@@ -1,6 +1,6 @@
 # CAD interoperability plan for Reyn Studio
 
-> **Implementation update — 2026-07-31:** the 0.1.2 candidate now contains a
+> **Implementation update — 2026-08-06:** Reyn Studio 0.3.0 contains a
 > first pure-Rust, single-part STEP path with explicit units, deterministic
 > tessellation provenance, hard assembly rejection, and unchanged geometry
 > fidelity gates. See [`STEP_IMPORT_REVIEW.md`](STEP_IMPORT_REVIEW.md) for the

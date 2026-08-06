@@ -221,6 +221,21 @@ pub struct SupportIssue {
     pub waivable: bool,
 }
 
+/// One ordered derivation step from source bytes to the analyzed mesh / mask.
+/// Reviewers replay source → translator settings → mesh → voxels without UI state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct GeometryImportStep {
+    /// `translate` | `tessellate` | `weld` | `diagnose` | `voxelize` | `orient`
+    pub evidence_class: String,
+    pub operation: String,
+    pub parameters: Vec<(String, String)>,
+    pub input_mesh_sha256: Option<String>,
+    pub output_mesh_sha256: Option<String>,
+    pub source_signed_volume: Option<f64>,
+    pub source_extents: Option<[f64; 3]>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct GeometryPreflight {
@@ -235,6 +250,11 @@ pub struct GeometryPreflight {
     pub geometry_translator_version: String,
     pub tessellation_tolerance_source_units: Option<f64>,
     pub vertex_weld_relative_tolerance: Option<f64>,
+    /// SHA-256 of the analyzed triangle mesh (`cad::analyzed_mesh_sha256`).
+    /// Empty on legacy records opened before this field existed.
+    pub analyzed_mesh_sha256: String,
+    /// Ordered import/derivation steps for the current analyzed mesh and mask.
+    pub import_steps: Vec<GeometryImportStep>,
     pub source_shells: usize,
     pub triangles: usize,
     pub components: usize,
@@ -372,6 +392,21 @@ impl GeometryPreflight {
                 issue(
                     "source.step_shells_missing",
                     "The STEP import contains no recorded B-rep shells.".into(),
+                    false,
+                );
+            }
+            // New imports always record import_steps + analyzed_mesh_sha256.
+            // Legacy reopen keeps empty steps and must not hard-fail readiness.
+            if !self.import_steps.is_empty()
+                && (self.analyzed_mesh_sha256.len() != 64
+                    || !self
+                        .analyzed_mesh_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit()))
+            {
+                issue(
+                    "source.analyzed_mesh_sha256_missing",
+                    "The STEP-derived analyzed mesh has no canonical SHA-256 identity.".into(),
                     false,
                 );
             }
@@ -686,6 +721,10 @@ pub struct EngineeringResult {
     pub divergence_rms: f64,
     pub wake_deficit_peak: f64,
     pub wake_deficit_mean: f64,
+    /// Legacy optional field. Engineering CAD no longer computes or displays
+    /// semigroup; kept so older evidence JSON still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semigroup: Option<f64>,
     pub warnings: Vec<String>,
 }
 

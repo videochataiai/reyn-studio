@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import tomllib
 import zipfile
 from dataclasses import dataclass
@@ -392,7 +393,12 @@ def runtime_requirements() -> dict[str, object]:
     }
 
 
-def standalone_blockers(root: Path) -> list[str]:
+def standalone_blockers(
+    root: Path,
+    *,
+    developer_id_signed: bool = False,
+    notarized: bool = False,
+) -> list[str]:
     engine = (root / "src/engine.rs").read_text(encoding="utf-8")
     main = (root / "src/main.rs").read_text(encoding="utf-8")
     blockers: list[str] = []
@@ -405,9 +411,14 @@ def standalone_blockers(root: Path) -> list[str]:
         blockers.append(
             "The default research checkout fallback is a developer-specific absolute path."
         )
-    blockers.append(
-        "Developer ID signing and Apple notarization are not performed by this workflow."
-    )
+    if not developer_id_signed:
+        blockers.append(
+            "Developer ID signing and Apple notarization are not performed by this workflow."
+        )
+    elif not notarized:
+        blockers.append(
+            "Developer ID signing succeeded, but Apple notarization was not performed."
+        )
     if "CFBundleDocumentTypes" not in main and "OpenUrls" not in main and "Opened" not in main:
         blockers.append(
             "Startup does not consume Finder/LaunchServices document-open events; "
@@ -1452,7 +1463,12 @@ def validate_release_manifest(contents: Path, manifest_path: Path) -> list[str]:
     return errors
 
 
-def validate_runtime_contract(path: Path) -> list[str]:
+def validate_runtime_contract(
+    path: Path,
+    *,
+    developer_id_signed: bool = False,
+    notarized: bool = False,
+) -> list[str]:
     try:
         contract = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1468,8 +1484,10 @@ def validate_runtime_contract(path: Path) -> list[str]:
         ("model_trust", "failure_mode"): "fail-closed",
         ("documentation", "bundled"): True,
         ("documentation", "network_required"): False,
-        ("apple_distribution", "developer_id_signing_performed"): False,
-        ("apple_distribution", "notarization_performed"): False,
+        ("apple_distribution", "developer_id_signing_performed"): bool(
+            developer_id_signed
+        ),
+        ("apple_distribution", "notarization_performed"): bool(notarized),
     }
     errors = [
         f"{section}.{key}={contract.get(section, {}).get(key)!r}, expected {value!r}"
@@ -1728,18 +1746,214 @@ def signing_state(bundle: Path) -> str:
     return "unsigned"
 
 
+_MACH_O_MAGICS = {
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+}
+
+
+def is_mach_o(path: Path) -> bool:
+    try:
+        with path.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError:
+        return False
+    return magic in _MACH_O_MAGICS
+
+
+def nested_mach_o_paths(bundle: Path) -> list[Path]:
+    """Mach-O files inside the bundle, deepest paths first (sign inside-out)."""
+    paths = [
+        path
+        for path in bundle.rglob("*")
+        if path.is_file() and not path.is_symlink() and is_mach_o(path)
+    ]
+    paths.sort(key=lambda path: (len(path.parts), str(path)), reverse=True)
+    return paths
+
+
+def bundle_main_executable(bundle: Path) -> Path | None:
+    """Return the primary `Contents/MacOS` executable when it can be identified."""
+    macos = bundle / "Contents" / "MacOS"
+    if not macos.is_dir():
+        return None
+    candidates = [
+        path
+        for path in macos.iterdir()
+        if path.is_file() and not path.name.startswith(".")
+    ]
+    if not candidates:
+        return None
+    preferred = macos / "reyn-studio"
+    if preferred.is_file():
+        return preferred
+    return sorted(candidates, key=lambda path: path.name)[0]
+
+
+def developer_id_sign(
+    bundle: Path,
+    identity: str | None,
+    *,
+    entitlements: Path | None,
+) -> bool:
+    """Opt-in Developer ID Application signing. Fail closed when requested."""
+    if identity is None:
+        return False
+    identity = identity.strip()
+    if not identity:
+        raise RuntimeError("Developer ID signing requested but --sign-identity is empty")
+    codesign = shutil.which("codesign")
+    if codesign is None:
+        raise RuntimeError("Developer ID signing requested but codesign is unavailable")
+    if entitlements is None or not entitlements.is_file():
+        raise RuntimeError(
+            "Developer ID signing requested but entitlements file is missing"
+        )
+    main_executable = bundle_main_executable(bundle)
+    # Nested libraries/helpers get hardened-runtime signing without the app
+    # entitlements. Entitlements apply only to the main executable and the .app.
+    for path in nested_mach_o_paths(bundle):
+        command = [
+            codesign,
+            "--force",
+            "--options",
+            "runtime",
+            "--timestamp",
+            "--sign",
+            identity,
+        ]
+        if main_executable is not None and path.resolve() == main_executable.resolve():
+            command.extend(["--entitlements", str(entitlements)])
+        command.append(str(path))
+        subprocess.run(command, check=True)
+    subprocess.run(
+        [
+            codesign,
+            "--force",
+            "--options",
+            "runtime",
+            "--timestamp",
+            "--entitlements",
+            str(entitlements),
+            "--sign",
+            identity,
+            str(bundle),
+        ],
+        check=True,
+    )
+    verify = subprocess.run(
+        [codesign, "--verify", "--deep", "--strict", "--verbose=2", str(bundle)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if verify.returncode != 0:
+        raise RuntimeError(
+            f"codesign --verify failed after Developer ID signing:\n{verify.stdout}"
+        )
+    if signing_state(bundle) != "credential-signed":
+        raise RuntimeError(
+            "Developer ID signing finished but codesign still reports no Team ID "
+            "(identity may be ad-hoc or not a Developer ID Application certificate)"
+        )
+    return True
+
+
+def notarize_and_staple(
+    bundle: Path,
+    *,
+    keychain_profile: str | None,
+    source_date_epoch: int,
+) -> bool:
+    """Opt-in notarytool submit + stapler staple. Fail closed when requested."""
+    if keychain_profile is None:
+        return False
+    profile = keychain_profile.strip()
+    if not profile:
+        raise RuntimeError("Notarization requested but --notarize-profile is empty")
+    if signing_state(bundle) != "credential-signed":
+        raise RuntimeError(
+            "Notarization requested but the bundle is not Developer ID signed"
+        )
+    xcrun = shutil.which("xcrun")
+    if xcrun is None:
+        raise RuntimeError("Notarization requested but xcrun is unavailable")
+    with tempfile.TemporaryDirectory(prefix="reyn-notarize-") as temporary:
+        archive = Path(temporary) / f"{bundle.name}.zip"
+        # notarytool wants a zip of the .app; use ditto for Apple-compatible layout.
+        ditto = shutil.which("ditto")
+        if ditto is None:
+            raise RuntimeError("Notarization requested but ditto is unavailable")
+        subprocess.run(
+            [ditto, "-c", "-k", "--keepParent", str(bundle), str(archive)],
+            check=True,
+        )
+        submit = subprocess.run(
+            [
+                xcrun,
+                "notarytool",
+                "submit",
+                str(archive),
+                "--keychain-profile",
+                profile,
+                "--wait",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if submit.returncode != 0:
+            raise RuntimeError(f"notarytool submit failed:\n{submit.stdout}")
+        if "status: Accepted" not in submit.stdout and "Accepted" not in submit.stdout:
+            raise RuntimeError(
+                "notarytool finished without an Accepted status:\n" + submit.stdout
+            )
+    staple = subprocess.run(
+        [xcrun, "stapler", "staple", str(bundle)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if staple.returncode != 0:
+        raise RuntimeError(f"stapler staple failed:\n{staple.stdout}")
+    _ = source_date_epoch  # reserved: ZIP of notarized app is rebuilt by the caller
+    return True
+
+
 def validate_bundle(
     bundle: Path,
     config: ReleaseConfig,
     *,
     expected_architectures: tuple[str, ...] | None = None,
     require_runnable_architectures: bool = False,
+    developer_id_signed: bool | None = None,
+    notarized: bool | None = None,
 ) -> list[Check]:
     checks: list[Check] = []
     contents = bundle / "Contents"
     plist_path = contents / "Info.plist"
     executable = contents / "MacOS" / config.executable
     resources = contents / "Resources"
+    if developer_id_signed is None or notarized is None:
+        manifest_path = resources / "release-manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                manifest = {}
+            if developer_id_signed is None:
+                developer_id_signed = bool(manifest.get("developer_id_signed"))
+            if notarized is None:
+                notarized = bool(manifest.get("notarized"))
+    developer_id_signed = bool(developer_id_signed)
+    notarized = bool(notarized)
 
     if not plist_path.is_file():
         return [Check("FAIL", "Info.plist", f"missing {plist_path}")]
@@ -1896,7 +2110,11 @@ def validate_bundle(
 
     runtime_path = resources / "runtime-requirements.json"
     runtime_errors = (
-        validate_runtime_contract(runtime_path)
+        validate_runtime_contract(
+            runtime_path,
+            developer_id_signed=developer_id_signed,
+            notarized=notarized,
+        )
         if runtime_path.is_file()
         else ["runtime contract is missing"]
     )
@@ -2007,14 +2225,25 @@ def validate_bundle(
     )
 
     state = signing_state(bundle)
-    checks.append(
-        Check(
-            "INFO",
-            "Apple distribution",
-            f"{state}; Developer ID signing and notarization were not performed by this workflow",
+    if state == "credential-signed":
+        distribution_detail = (
+            f"{state}; Developer ID signature present "
+            "(notarization reported separately in the release manifest)"
         )
-    )
-    for index, blocker in enumerate(standalone_blockers(config.root), start=1):
+    else:
+        distribution_detail = (
+            f"{state}; Developer ID signing and notarization were not performed "
+            "by this workflow unless --sign-identity / --notarize-profile were set"
+        )
+    checks.append(Check("INFO", "Apple distribution", distribution_detail))
+    for index, blocker in enumerate(
+        standalone_blockers(
+            config.root,
+            developer_id_signed=developer_id_signed,
+            notarized=notarized,
+        ),
+        start=1,
+    ):
         checks.append(Check("BLOCKED", f"standalone gate {index}", blocker))
     return checks
 

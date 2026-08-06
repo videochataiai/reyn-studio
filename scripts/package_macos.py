@@ -28,11 +28,13 @@ from macos_packaging import (
     copy_research_resources,
     copy_security_resources,
     deterministic_zip,
+    developer_id_sign,
     file_manifest,
     has_failures,
     info_plist,
     load_macos_release_pins,
     load_config,
+    notarize_and_staple,
     print_checks,
     require_executable_architectures,
     require_local_architecture_runtime,
@@ -370,6 +372,31 @@ def package(args: argparse.Namespace) -> int:
                 "Discard these outputs and retry after the shared source is stable."
             )
 
+        will_sign = bool(args.sign_identity and str(args.sign_identity).strip())
+        will_notarize = bool(
+            args.notarize_profile and str(args.notarize_profile).strip()
+        )
+        if will_notarize and not will_sign:
+            raise RuntimeError(
+                "Notarization requires --sign-identity (Developer ID Application)"
+            )
+        entitlements = (
+            args.entitlements
+            if args.entitlements is not None
+            else root / "packaging/macos/ReynStudio.entitlements"
+        )
+
+        # Write every Resources artifact BEFORE codesign. Post-sign writes would
+        # invalidate the Developer ID seal. Stapler is the only approved
+        # post-sign mutation (notarization ticket). Mach-O authenticity after
+        # signing is codesign, not the pre-sign file_manifest digests.
+        requirements = runtime_requirements()
+        requirements["apple_distribution"] = {
+            "developer_id_signing_performed": will_sign,
+            "notarization_performed": will_notarize,
+        }
+        write_json(resources / "runtime-requirements.json", requirements)
+
         manifest_files = [
             path for path in contents.rglob("*") if path.is_file()
         ]
@@ -400,25 +427,61 @@ def package(args: argparse.Namespace) -> int:
             ],
             "resource_set": resource_metadata(resources),
             "preview_access": access_contract,
-            "apple_credentials_used": False,
-            "developer_id_signed": False,
-            "notarized": False,
+            "apple_credentials_used": will_sign or will_notarize,
+            "developer_id_signed": will_sign,
+            "notarized": will_notarize,
             "standalone": False,
-            "standalone_blockers": standalone_blockers(root),
+            "standalone_blockers": standalone_blockers(
+                root,
+                developer_id_signed=will_sign,
+                notarized=will_notarize,
+            ),
             "files": file_manifest(contents, manifest_files),
+            "file_manifest_notes": (
+                "digests captured before codesign; Mach-O authenticity is the "
+                "Developer ID signature when developer_id_signed is true"
+            ),
         }
         write_json(resources / "release-manifest.json", release_manifest)
+
+        developer_id_signed = developer_id_sign(
+            bundle,
+            args.sign_identity,
+            entitlements=entitlements,
+        )
+        notarized = False
+        if will_notarize:
+            notarized = notarize_and_staple(
+                bundle,
+                keychain_profile=args.notarize_profile,
+                source_date_epoch=args.source_date_epoch,
+            )
+        if will_sign != developer_id_signed:
+            raise RuntimeError(
+                "Developer ID signing outcome does not match the sealed runtime contract"
+            )
+        if will_notarize != notarized:
+            raise RuntimeError(
+                "Notarization outcome does not match the sealed runtime contract"
+            )
 
         checks = validate_bundle(
             bundle,
             config,
             expected_architectures=TARGET_ARCHITECTURES[target],
             require_runnable_architectures=args.require_runnable_architectures,
+            developer_id_signed=developer_id_signed,
+            notarized=notarized,
         )
         print_checks(checks)
         if has_failures(checks):
             return 1
-        if args.require_standalone and standalone_blockers(root):
+        blockers = standalone_blockers(
+            root,
+            developer_id_signed=developer_id_signed,
+            notarized=notarized,
+        )
+        if args.require_standalone and blockers:
             print("\nStandalone release gate remains blocked; bundle was not published.")
             return 2
 
@@ -443,10 +506,17 @@ def package(args: argparse.Namespace) -> int:
         print(f"\nLocal app bundle: {destination}")
         print(f"Deterministic archive: {archive}")
         print(f"SHA-256: {checksum}")
-        print(
-            "Boundary: local development package only — not Developer ID signed, "
-            "not notarized, and not standalone."
-        )
+        if developer_id_signed and notarized:
+            print("Boundary: Developer ID signed and notarized; standalone gate may still be open.")
+        elif developer_id_signed:
+            print(
+                "Boundary: Developer ID signed, not notarized, and not standalone."
+            )
+        else:
+            print(
+                "Boundary: local development package only — not Developer ID signed, "
+                "not notarized, and not standalone."
+            )
         return 0
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
@@ -511,6 +581,27 @@ def parse_args() -> argparse.Namespace:
         help=(
             "on Apple silicon, fail x86_64/universal2 packaging unless Rosetta "
             "is available for follow-up runtime tests"
+        ),
+    )
+    parser.add_argument(
+        "--sign-identity",
+        default=os.environ.get("REYN_DEVELOPER_ID_IDENTITY"),
+        help=(
+            "opt-in Developer ID Application identity for codesign "
+            "(or REYN_DEVELOPER_ID_IDENTITY); fails closed if tools/certs are missing"
+        ),
+    )
+    parser.add_argument(
+        "--entitlements",
+        type=Path,
+        help="Hardened Runtime entitlements plist (default: packaging/macos/ReynStudio.entitlements)",
+    )
+    parser.add_argument(
+        "--notarize-profile",
+        default=os.environ.get("REYN_NOTARYTOOL_PROFILE"),
+        help=(
+            "opt-in notarytool keychain profile (or REYN_NOTARYTOOL_PROFILE); "
+            "requires --sign-identity and fails closed on reject"
         ),
     )
     return parser.parse_args()

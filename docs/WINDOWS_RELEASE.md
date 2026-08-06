@@ -94,7 +94,15 @@ metadata, or if the staged Python closure differs from the hashed lock.
 
 ## Optional Authenticode signing
 
-Signing is opt-in and fails closed:
+Signing is opt-in and fails closed. Readiness checklist before a commercial ZIP:
+
+1. Code-signing PFX (or cloud HSM) issued to the publisher, plus the password in
+   `REYN_AUTHENTICODE_PFX_PASSWORD` (never commit the PFX or password).
+2. Windows SDK `signtool` on the builder PATH.
+3. RFC 3161 timestamp URL reachable from the builder (packager default is used
+   unless overridden).
+4. Post-sign `signtool verify /pa /all` must succeed; SmartScreen reputation still
+   needs clean-machine attestation on the exact artifact hash.
 
 ```powershell
 $env:REYN_AUTHENTICODE_PFX_PASSWORD = "<password>"

@@ -924,6 +924,7 @@ pub struct ReynApp {
     settings_notice: Option<(String, bool)>,
     signing_notice: Option<(String, bool)>,
     settings_ui: settings::SettingsUiState,
+    updater: Option<crate::updater::Updater>,
     /// Session copy of the per-field Case Setup entry units (seeded from
     /// settings; switching a unit here never changes the stored SI value).
     input_units: units::InputUnitPrefs,
@@ -1109,6 +1110,7 @@ impl Default for ReynApp {
             settings_notice: settings_warning.map(|warning| (warning, true)),
             signing_notice: None,
             settings_ui: settings::SettingsUiState::default(),
+            updater: None,
             input_units: units::InputUnitPrefs::default(),
             preset_name_draft: String::new(),
             preset_notice: None,
@@ -1243,8 +1245,10 @@ impl AppBootstrap {
         }
     }
 
-    pub fn start(&self) -> ReynApp {
-        ReynApp::new_from_bootstrap(self)
+    pub fn start_with_updater(&self, updater: crate::updater::Updater) -> ReynApp {
+        let mut app = ReynApp::new_from_bootstrap(self);
+        app.updater = Some(updater);
+        app
     }
 }
 
@@ -1695,6 +1699,7 @@ impl eframe::App for ReynApp {
                             divergence_rms: f.divergence_rms as f64,
                             wake_deficit_peak: f.wake_deficit_peak as f64,
                             wake_deficit_mean: f.wake_deficit_mean as f64,
+                            semigroup: f.semigroup.map(f64::from),
                             warnings: f.warnings,
                         });
                     }
@@ -3095,6 +3100,28 @@ impl ReynApp {
         preflight.voxel_axis_disagreement_fraction = vm.axis_disagreement_fraction;
         preflight.voxel_odd_crossing_rows = vm.odd_crossing_rows;
         preflight.voxel_classification_version = vm.classification_version;
+        if !preflight.analyzed_mesh_sha256.is_empty() {
+            preflight
+                .import_steps
+                .push(engineering::GeometryImportStep {
+                    evidence_class: "orient".into(),
+                    operation: "body_orientation_revoxelize".into(),
+                    parameters: vec![
+                        ("angle_of_attack_deg".into(), format!("{:.6}", applied[0])),
+                        ("yaw_deg".into(), format!("{:.6}", applied[1])),
+                        ("roll_deg".into(), format!("{:.6}", applied[2])),
+                        (
+                            "voxel_classification_version".into(),
+                            vm.classification_version.to_string(),
+                        ),
+                        ("solid_voxels".into(), vm.solid_voxels.to_string()),
+                    ],
+                    input_mesh_sha256: Some(preflight.analyzed_mesh_sha256.clone()),
+                    output_mesh_sha256: Some(preflight.analyzed_mesh_sha256.clone()),
+                    source_signed_volume: Some(preflight.source_signed_volume),
+                    source_extents: Some(preflight.source_extents),
+                });
+        }
         // Approval covers units, orientation, scale, and placement, so a new
         // attitude is a new thing to approve.
         preflight.transform_approved = false;
@@ -3650,6 +3677,8 @@ impl ReynApp {
             units: units.into(),
             abs_tolerance: 1e-6,
         };
+        // divergence_rms stays in the engineering-result JSON for developer
+        // forensics; it is not a customer scalar (variant comparison / Results).
         let scalar_outputs = vec![
             scalar("force_coefficient_x", field.force_coefficients[0], "1"),
             scalar("force_coefficient_y", field.force_coefficients[1], "1"),
@@ -3657,7 +3686,6 @@ impl ReynApp {
             scalar("moment_coefficient_x", field.moment_coefficients[0], "1"),
             scalar("moment_coefficient_y", field.moment_coefficients[1], "1"),
             scalar("moment_coefficient_z", field.moment_coefficients[2], "1"),
-            scalar("divergence_rms", field.divergence_rms, "1/s"),
             scalar("wake_deficit_peak", field.wake_deficit_peak, "1"),
             scalar("wake_deficit_mean", field.wake_deficit_mean, "1"),
         ];
@@ -4088,10 +4116,18 @@ impl ReynApp {
                 diag(ui, "File", &case.workflow.source_name, TEXT);
                 diag(
                     ui,
-                    "SHA-256",
+                    "Source SHA-256",
                     &short_hash(&case.workflow.preflight.source_sha256),
                     TEXT_MUTE,
                 );
+                if !case.workflow.preflight.analyzed_mesh_sha256.is_empty() {
+                    diag(
+                        ui,
+                        "Analyzed mesh SHA-256",
+                        &short_hash(&case.workflow.preflight.analyzed_mesh_sha256),
+                        TEXT_MUTE,
+                    );
+                }
                 let source_format = if case.workflow.preflight.source_format.is_empty() {
                     "STL · legacy record".into()
                 } else {
@@ -5187,6 +5223,7 @@ impl ReynApp {
                 .manifest()
                 .scalar_outputs
                 .iter()
+                .filter(|scalar| scalar.key != "divergence_rms")
                 .filter_map(|scalar| {
                     parent_scalars.get(&scalar.key).and_then(|prior| {
                         (prior.units == scalar.units).then(|| {
@@ -5392,14 +5429,6 @@ impl ReynApp {
             );
             measure_row(
                 ui,
-                "Divergence RMS",
-                &format!("{:.3e}", result.divergence_rms),
-                "–",
-                "DERIVED",
-                TEXT_DIM,
-            );
-            measure_row(
-                ui,
                 "Wake deficit · peak / mean",
                 &format!(
                     "{} / {}",
@@ -5410,6 +5439,8 @@ impl ReynApp {
                 "DERIVED",
                 TEXT_DIM,
             );
+            // Divergence RMS stays in immutable evidence JSON for developer
+            // forensics; it is not a customer Results instrument.
         });
         ui.add_space(8.0);
         // Reference values the coefficients were scaled with — visible next
@@ -7763,6 +7794,13 @@ impl ReynApp {
                                 }
                             },
                         );
+                    }
+                    MenuCommand::CheckForUpdates => {
+                        if let Some(updater) = &self.updater {
+                            updater.check();
+                            self.nav = Nav::Settings;
+                            self.settings_ui.category = settings::SettingsCategory::Updates;
+                        }
                     }
                 },
                 MenuSignal::OpenRecent(path) => self.request_project_action(
@@ -11276,6 +11314,7 @@ impl ReynApp {
                 .get("wake_deficit_mean")
                 .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0),
+            semigroup: summary.get("semigroup").and_then(serde_json::Value::as_f64),
             warnings,
         };
         let shape = [3usize, field.n, field.n, field.n];
@@ -11574,6 +11613,9 @@ impl ReynApp {
                     .get("wake_deficit_mean")
                     .and_then(serde_json::Value::as_f64)
                     .unwrap_or(0.0),
+                semigroup: metadata
+                    .get("semigroup")
+                    .and_then(serde_json::Value::as_f64),
                 warnings: metadata
                     .get("warnings")
                     .and_then(serde_json::Value::as_array)
@@ -12498,6 +12540,14 @@ impl ReynApp {
                     )),
                 )
         };
+        let analyzed_mesh_sha256 = cad::analyzed_mesh_sha256(&imported.mesh);
+        let import_steps = geometry_import_steps(
+            imported.format,
+            &imported,
+            &analyzed_mesh_sha256,
+            &mesh_diagnostics,
+            &vm,
+        );
         let mask = std::sync::Arc::new(vm.mask);
         let source_revision_id = format!("source-{}", uuid::Uuid::new_v4());
         let case_id = self
@@ -12574,6 +12624,15 @@ impl ReynApp {
                     short_hash(&source_sha256)
                 ));
             }
+            if !prior.analyzed_mesh_sha256.is_empty()
+                && prior.analyzed_mesh_sha256 != analyzed_mesh_sha256
+            {
+                warnings.push(format!(
+                    "REIMPORT CHANGE · analyzed mesh SHA-256 {} → {}.",
+                    short_hash(&prior.analyzed_mesh_sha256),
+                    short_hash(&analyzed_mesh_sha256)
+                ));
+            }
             if prior.triangles != mesh_diagnostics.triangles {
                 warnings.push(format!(
                     "REIMPORT CHANGE · triangle count {} → {}.",
@@ -12618,6 +12677,8 @@ impl ReynApp {
             geometry_translator_version: imported.translator_version.clone(),
             tessellation_tolerance_source_units: imported.tessellation_tolerance_source_units,
             vertex_weld_relative_tolerance: imported.vertex_weld_relative_tolerance,
+            analyzed_mesh_sha256: analyzed_mesh_sha256.clone(),
+            import_steps,
             source_shells: imported.source_shells,
             triangles: mesh_diagnostics.triangles,
             components: mesh_diagnostics.components,
@@ -13267,6 +13328,10 @@ impl ReynApp {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
+        if let Some(updater) = &self.updater {
+            egui::Panel::top("studio.update-banner")
+                .show(ui, |ui| crate::updater::show_compact_banner(ui, updater));
+        }
         // C7: the near-black well is for calibrated render viewports only;
         // document screens sit on the BG surface so the elevation ladder
         // (BG → SURFACE → SURFACE_HIGH) stays legible.
@@ -13426,6 +13491,7 @@ impl ReynApp {
                         &self.settings,
                         &mut self.settings_draft,
                         &mut self.settings_ui,
+                        self.updater.as_ref(),
                     );
                     if let Some(action) = action {
                         self.handle_settings_action(ui.ctx(), action);
@@ -18362,6 +18428,134 @@ fn internal_flow_reference_card(ui: &mut egui::Ui) {
     });
 }
 
+fn geometry_import_steps(
+    format: cad::GeometryFormat,
+    imported: &cad::GeometryImport,
+    analyzed_mesh_sha256: &str,
+    diagnostics: &cad::MeshDiagnostics,
+    vm: &cad::VoxelMask,
+) -> Vec<engineering::GeometryImportStep> {
+    let extents = Some(diagnostics.extents.map(f64::from));
+    let volume = Some(diagnostics.signed_volume);
+    let mesh = Some(analyzed_mesh_sha256.to_owned());
+    let mut steps = Vec::new();
+    steps.push(engineering::GeometryImportStep {
+        evidence_class: "translate".into(),
+        operation: match format {
+            cad::GeometryFormat::Stl => "parse_stl",
+            cad::GeometryFormat::Step => "parse_step_brep",
+            cad::GeometryFormat::ThreeMf => "parse_3mf",
+        }
+        .into(),
+        parameters: vec![
+            (
+                "translator".into(),
+                format!("{} {}", imported.translator, imported.translator_version),
+            ),
+            ("source_shells".into(), imported.source_shells.to_string()),
+        ],
+        input_mesh_sha256: None,
+        output_mesh_sha256: if matches!(format, cad::GeometryFormat::Step) {
+            None
+        } else {
+            mesh.clone()
+        },
+        source_signed_volume: if matches!(format, cad::GeometryFormat::Step) {
+            None
+        } else {
+            volume
+        },
+        source_extents: if matches!(format, cad::GeometryFormat::Step) {
+            None
+        } else {
+            extents
+        },
+    });
+    if matches!(format, cad::GeometryFormat::Step) {
+        steps.push(engineering::GeometryImportStep {
+            evidence_class: "tessellate".into(),
+            operation: "truck_meshalgo_tessellate".into(),
+            parameters: vec![
+                (
+                    "relative_chord_tolerance".into(),
+                    format!("{:.8}", crate::cad_step::RELATIVE_CHORD_TOLERANCE),
+                ),
+                (
+                    "absolute_chord_tolerance_source_units".into(),
+                    imported
+                        .tessellation_tolerance_source_units
+                        .map(|value| format!("{value:.8}"))
+                        .unwrap_or_else(|| "missing".into()),
+                ),
+            ],
+            input_mesh_sha256: None,
+            output_mesh_sha256: None,
+            source_signed_volume: None,
+            source_extents: None,
+        });
+        steps.push(engineering::GeometryImportStep {
+            evidence_class: "weld".into(),
+            operation: "face_boundary_vertex_weld".into(),
+            parameters: vec![(
+                "relative_tolerance".into(),
+                imported
+                    .vertex_weld_relative_tolerance
+                    .map(|value| format!("{value:.8}"))
+                    .unwrap_or_else(|| "missing".into()),
+            )],
+            input_mesh_sha256: None,
+            output_mesh_sha256: mesh.clone(),
+            source_signed_volume: volume,
+            source_extents: extents,
+        });
+    }
+    steps.push(engineering::GeometryImportStep {
+        evidence_class: "diagnose".into(),
+        operation: "topology_diagnostics".into(),
+        parameters: vec![
+            ("triangles".into(), diagnostics.triangles.to_string()),
+            ("components".into(), diagnostics.components.to_string()),
+            (
+                "boundary_edges".into(),
+                diagnostics.boundary_edges.to_string(),
+            ),
+            (
+                "non_manifold_edges".into(),
+                diagnostics.non_manifold_edges.to_string(),
+            ),
+            (
+                "degenerate_triangles".into(),
+                diagnostics.degenerate_triangles.to_string(),
+            ),
+        ],
+        input_mesh_sha256: mesh.clone(),
+        output_mesh_sha256: mesh.clone(),
+        source_signed_volume: volume,
+        source_extents: extents,
+    });
+    steps.push(engineering::GeometryImportStep {
+        evidence_class: "voxelize".into(),
+        operation: "three_axis_majority_occupancy".into(),
+        parameters: vec![
+            ("target_grid".into(), vm.n.to_string()),
+            ("solid_voxels".into(), vm.solid_voxels.to_string()),
+            (
+                "classification_version".into(),
+                vm.classification_version.to_string(),
+            ),
+            (
+                "axis_disagreement_fraction".into(),
+                format!("{:.8}", vm.axis_disagreement_fraction),
+            ),
+        ],
+        input_mesh_sha256: mesh,
+        output_mesh_sha256: None,
+        source_signed_volume: volume,
+        source_extents: extents,
+    });
+    steps
+}
+
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) {
     let response = Frame::NONE
         .fill(SURFACE)
@@ -19934,6 +20128,7 @@ mod tests {
                 divergence_rms: 1e-3,
                 wake_deficit_peak: 0.3,
                 wake_deficit_mean: 0.1,
+                semigroup: Some(0.02),
                 warnings: Vec::new(),
             }),
             parent_run_id: None,

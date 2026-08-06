@@ -157,6 +157,9 @@ fn validate_report_input(
         .ok_or_else(|| "Engineering report requires a persisted case revision.".to_string())?;
     validate_required_text("case revision", case_revision)?;
     validate_sha256("source", &case.preflight.source_sha256)?;
+    if !case.preflight.import_steps.is_empty() {
+        validate_sha256("analyzed mesh", &case.preflight.analyzed_mesh_sha256)?;
+    }
     let model_sha256 = case
         .model_sha256
         .as_deref()
@@ -273,6 +276,12 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
     let mut provenance = String::new();
     provenance.push_str(&row("Source file", &case.source_name));
     provenance.push_str(&mono_row("Source SHA-256", &preflight.source_sha256));
+    if !preflight.analyzed_mesh_sha256.is_empty() {
+        provenance.push_str(&mono_row(
+            "Analyzed mesh SHA-256",
+            &preflight.analyzed_mesh_sha256,
+        ));
+    }
     provenance.push_str(&mono_row(
         "Source revision",
         case.source_revision_id
@@ -435,6 +444,20 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
             preflight.voxel_odd_crossing_rows[2],
         ),
     ));
+    for step in &preflight.import_steps {
+        let parameters = step
+            .parameters
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let detail = if parameters.is_empty() {
+            step.operation.clone()
+        } else {
+            format!("{} · {parameters}", step.operation)
+        };
+        geometry_rows.push_str(&row("Import derivation", &detail));
+    }
     for waiver in &preflight.waivers {
         geometry_rows.push_str(&row("Named waiver", waiver));
     }
@@ -488,11 +511,6 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
         "DERIVED · integrated pressure / total fluid-force norms",
     ));
     scalar_rows.push_str(&source_row(
-        "Divergence RMS",
-        &format_plain(result.divergence_rms),
-        "DERIVED · model-predicted velocity",
-    ));
-    scalar_rows.push_str(&source_row(
         "Wake deficit · peak / mean",
         &format!(
             "{} / {}",
@@ -501,7 +519,8 @@ pub fn engineering_report_html(input: &ReportInput<'_>) -> Result<String, String
         ),
         "DERIVED · model-predicted velocity",
     ));
-
+    // Divergence RMS is retained in immutable evidence JSON for developer
+    // forensics; customer lab sheets stay loads/Cp/wake focused.
     let mut warnings_html = String::new();
     if !result.warnings.is_empty() {
         warnings_html.push_str("<h2>Run warnings</h2>\n<ul>\n");
@@ -606,7 +625,8 @@ This report presents <b>model-derived</b> results from a neural fixed-body surro
 mod tests {
     use super::*;
     use crate::engineering::{
-        EngineeringResult, GeometryPreflight, LengthUnit, ModelSupport, OperatingPoint,
+        EngineeringResult, GeometryImportStep, GeometryPreflight, LengthUnit, ModelSupport,
+        OperatingPoint,
     };
     use crate::units::NumberNotation;
 
@@ -624,6 +644,13 @@ mod tests {
             model_support: ModelSupport::default(),
             preflight: GeometryPreflight {
                 source_sha256: "d".repeat(64),
+                analyzed_mesh_sha256: "e".repeat(64),
+                import_steps: vec![GeometryImportStep {
+                    evidence_class: "derived_geometry".into(),
+                    operation: "tessellate".into(),
+                    parameters: vec![("chord_tolerance".into(), "0.001".into())],
+                    ..GeometryImportStep::default()
+                }],
                 source_bytes: 2048,
                 triangles: 1234,
                 components: 1,
@@ -663,6 +690,7 @@ mod tests {
                 divergence_rms: 2.1e-3,
                 wake_deficit_peak: 0.45,
                 wake_deficit_mean: 0.12,
+                semigroup: Some(0.015),
                 warnings: vec!["horizon near support limit".into()],
             }),
             parent_run_id: None,
@@ -692,7 +720,9 @@ mod tests {
         let case = fixture_case();
         let html = engineering_report_html(&input(&case, UnitSystem::Si)).unwrap();
         assert!(html.contains(&"d".repeat(64)), "source hash");
+        assert!(html.contains(&"e".repeat(64)), "analyzed mesh hash");
         assert!(html.contains(&"c".repeat(64)), "model hash");
+        assert!(html.contains("tessellate · chord_tolerance=0.001"));
         assert!(html.contains("run-abc-123"));
         assert!(html.contains("case-rev-1"));
         assert!(html.contains(engineering::SURFACE_LOAD_METHOD));

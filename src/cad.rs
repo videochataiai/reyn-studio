@@ -10,11 +10,31 @@
 //! band the 3D obstacle models were trained on.
 
 use crate::flow::{Insight3D, Insight3DKind};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Debug)]
 pub struct Mesh {
     pub tris: Vec<[[f32; 3]; 3]>,
+}
+
+/// Canonical SHA-256 of the analyzed triangle mesh (source-space, post-weld).
+///
+/// Encoding `reyn.analyzed-mesh.v1` + LE triangle count + each triangle as nine
+/// IEEE-754 f32 bit patterns in triangle/vertex/component order. Distinct from
+/// the source-bytes SHA-256: STEP B-rep identity is not mesh identity.
+pub fn analyzed_mesh_sha256(mesh: &Mesh) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"reyn.analyzed-mesh.v1\0");
+    hasher.update((mesh.tris.len() as u64).to_le_bytes());
+    for triangle in &mesh.tris {
+        for vertex in triangle {
+            for component in vertex {
+                hasher.update(component.to_bits().to_le_bytes());
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1674,5 +1694,28 @@ mod tests {
         let defective_diagnostics = diagnose_mesh(&defective);
         assert_eq!(defective_diagnostics.triangles, 1_680);
         assert_eq!(defective_diagnostics.boundary_edges, 48);
+    }
+
+    #[test]
+    fn analyzed_mesh_sha256_is_stable_and_order_sensitive() {
+        let mesh = Mesh {
+            tris: vec![
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            ],
+        };
+        let again = Mesh {
+            tris: mesh.tris.clone(),
+        };
+        let digest = analyzed_mesh_sha256(&mesh);
+        assert_eq!(
+            digest,
+            "f1af891ccbc624026db7dddba66996d91377db6e74e6062c8eb2f71ed5c3ee57"
+        );
+        assert_eq!(digest, analyzed_mesh_sha256(&again));
+        let swapped = Mesh {
+            tris: vec![mesh.tris[1], mesh.tris[0]],
+        };
+        assert_ne!(digest, analyzed_mesh_sha256(&swapped));
     }
 }

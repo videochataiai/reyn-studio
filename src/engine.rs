@@ -22,6 +22,9 @@ use std::time::Duration;
 const ENGINE_ENTRYPOINT: &str = "engine/reyn_engine.py";
 const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// CAD predicts include Brinkman warmup + one model forward + pressure/loads.
+/// Keep a longer socket bound so slow CPU/MPS hosts do not fail the customer path.
+const ENGINE_CAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(360);
 #[cfg(test)]
 const DEVELOPMENT_UNSIGNED_FIXTURE_MARKER: &str = ".development-unsigned-model-fixture";
 pub const MODEL_BUNDLE_EXTENSION: &str = "reynmodel";
@@ -384,6 +387,9 @@ pub struct CadField {
     pub divergence_rms: f32,
     pub wake_deficit_peak: f32,
     pub wake_deficit_mean: f32,
+    /// Unused on the engineering CAD path (sandbox-only concept). Kept optional
+    /// so older engine metadata still parses.
+    pub semigroup: Option<f32>,
     pub load_method: String,
     pub warnings: Vec<String>,
 }
@@ -1234,13 +1240,17 @@ fn worker(
                 let progress_tx = msg_tx.clone();
                 let progress_request = request_context.clone();
                 guard_model_request(Path::new(&config.research_dir), &model, || {
-                    request_with_progress(conn, req, &bytes, |progress| {
+                    // Widen only for this CAD exchange; restore the default bound after.
+                    configure_request_timeouts(conn, ENGINE_CAD_REQUEST_TIMEOUT)?;
+                    let outcome = request_with_progress(conn, req, &bytes, |progress| {
                         let _ = progress_tx.send(Msg::Correlated {
                             request: progress_request.clone(),
                             response: Box::new(Msg::CadProgress(progress)),
                         });
                     })
-                    .map(|(j, payload)| parse_cad_field(&j, &payload))
+                    .map(|(j, payload)| parse_cad_field(&j, &payload));
+                    let _ = configure_request_timeouts(conn, ENGINE_REQUEST_TIMEOUT);
+                    outcome
                 })
             }
             Cmd::RunBenchmark {
@@ -2011,6 +2021,7 @@ fn parse_cad_field(j: &serde_json::Value, payload: &[u8]) -> Msg {
         divergence_rms: f("divergence_rms"),
         wake_deficit_peak: f("wake_deficit_peak"),
         wake_deficit_mean: f("wake_deficit_mean"),
+        semigroup: j["semigroup"].as_f64().map(|value| value as f32),
         load_method: j["load_method"].as_str().unwrap_or("unknown").to_string(),
         warnings: j["warnings"]
             .as_array()

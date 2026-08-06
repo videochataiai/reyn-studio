@@ -1,7 +1,7 @@
 # STEP import implementation and engineering review
 
-**Status:** implemented on the `feature/step-import` branch for the 0.1.2
-candidate. This is safe single-part STEP support, not universal CAD import.
+**Status:** included in Reyn Studio 0.3.0. This is safe single-part STEP
+support, not universal CAD import.
 
 ## What is implemented
 
@@ -45,18 +45,9 @@ Unit tests also cover millimetre/metre/inch detection, conflicting unit
 contexts, assembly rejection, deterministic repeat import, malformed sources,
 and the existing orientation worker failure boundary.
 
-The full Rust suite passes (268 passed, 4 platform/live tests ignored). A
-Windows x64 `cargo check` passes when the macOS host skips the existing
-Windows-resource compiler step. The macOS arm64 release binary builds
-successfully at 17,598,736 bytes versus 16,376,624 bytes for the 0.1.1
-baseline: a 1,222,112-byte (7.46%) increase before archive compression.
-All Windows packaging tests pass (15 passed, one Windows-host test skipped),
-and the macOS package-version assertion passes for 0.1.2. The full macOS
-packaging suite still has one pre-existing sidecar resource-closure failure
-(`pressure_model_contract_3d` and `pressure_channel_contract_3d` are not in
-`RESEARCH_RESOURCES`); the same test fails on the untouched 0.1.1 baseline.
-Strict `clippy -D warnings` is likewise not yet a release gate because the
-baseline has unrelated existing warnings; the edited files have no IDE lints.
+The 0.3.0 release qualification reruns the Rust, bridge, corpus, macOS, and
+Windows package checks from the tagged source. Package byte counts and hashes
+are recorded from final outputs rather than copied from an earlier candidate.
 
 ## Current support boundary
 
@@ -90,20 +81,25 @@ chooser (operator selects a B-rep shell entity before tessellation).
 
 ## What is still needed before calling STEP production-grade
 
-### 1. A broader qualification corpus
+### 1. A broader qualification corpus — slice 2 started
 
-The current two-file corpus proves the path and one important failure mode; it
-does not qualify the translator. Add real single-part exports from SolidWorks,
-NX, CATIA, Creo, Inventor, Fusion, and Onshape across AP203, AP214, and AP242.
-Include planes, cylinders, cones, spheres, tori, trimmed NURBS, holes, fillets,
-thin features, non-metre units, multiple shells, and deliberately malformed
-files. Record exporter version and expected dimensions for every fixture.
+Automated corpus now covers:
 
-Release criterion: every supported fixture has deterministic triangle identity,
-units, extents, topology diagnostics, and voxel occupancy across repeated runs
-on macOS arm64 and Windows x64.
+- Existing: AP214 cuboid (closed) + Onshape AP242 curved (open seams visible).
+- New fail-closed synthetics under `test-geometry/corpus/`: assembly occurrence,
+  conflicting length units, truncated/malformed STEP (locked in `src/cad_step.rs`).
+- Inventory + vendor slots: `test-geometry/corpus/README.md` (SolidWorks / NX /
+  Fusion / Onshape extras still **pending real exports** — empty slots are not
+  an OCCT ceiling).
 
-### 2. Move expensive translation off the UI thread — DONE for 0.1.2 candidate
+Still needed before calling Truck production-grade: real single-part exports
+from SolidWorks, NX, CATIA, Creo, Inventor, Fusion, and additional Onshape
+parts across AP203/AP214/AP242 with recorded extents. Release criterion: every
+**Supported** fixture has deterministic triangle identity, units, extents,
+topology diagnostics, and voxel occupancy across repeated runs on macOS arm64
+and Windows x64.
+
+### 2. Move expensive translation off the UI thread — DONE
 
 Initial STEP/3MF/STL read → translate → diagnose → voxelize now runs on the
 `reyn-geometry-import` worker with generation IDs and stale-result suppression,
@@ -119,17 +115,20 @@ CAD translation should run in a separate `reyn-cad-bridge` process with a
 versioned IPC contract, wall-clock timeout, memory limit where the OS permits,
 captured stderr, and atomic output.
 
+Wire protocol: `docs/occt_bridge_protocol.v1.json` and
+`docs/OCCT_BRIDGE_SPIKE.md`. Slice 1 is implemented: `reyn-cad-bridge` stub +
+`src/cad_bridge.rs` framing/client with IPC tests (hello, fixture mesh, cancel,
+timeout, oversize). No OCCT in the desktop binary; Truck remains the import
+path until corpus evidence gates a fallback.
+
 Release criterion: crash, timeout, oversized output, malformed IPC, and user
 cancellation all leave the project unchanged and produce a specific error.
 
 ### Packaging honesty (macOS research closure)
 
-The packaging test `test_research_resource_list_is_the_sidecar_import_closure`
-can fail on both the 0.1.1 baseline and this 0.1.2 candidate when the engine
-import graph references `pressure_model_contract_3d` /
-`pressure_channel_contract_3d` that are absent from `RESEARCH_RESOURCES`. That
-failure is **not** caused by STEP import. Fix it in a dedicated packaging/
-research-pin change; do not expand the allowlist without the files present.
+The research-sidecar allowlist remains an exact import closure. Missing
+contract resources fail packaging; release qualification must not expand the
+allowlist unless the pinned research checkout contains and imports those files.
 
 ### 4. A production translator decision
 
@@ -157,16 +156,22 @@ that compares occupancy at two tolerances.
 Release criterion: tightening tessellation leaves the target-grid occupancy
 unchanged, or the case is labeled tessellation-sensitive and blocked.
 
-### 6. Derived-geometry identity
+### 6. Derived-geometry identity — DONE for the 0.3.0 contract
 
-The source SHA-256 identifies the STEP bytes, not the tessellated triangles.
-Add a canonical analyzed-mesh SHA-256 and an ordered import-step record. Any
-weld, degeneracy removal, orientation change, or future healing operation must
-name its evidence class, parameters, before/after diagnostics, and measured
-volume/extent delta.
+`GeometryPreflight` now records:
 
-Release criterion: a reviewer can reproduce source bytes → translator settings
-→ analyzed mesh → voxel mask without relying on UI state.
+- `analyzed_mesh_sha256` — SHA-256 of the source-space triangle mesh
+  (`cad::analyzed_mesh_sha256`, encoding `reyn.analyzed-mesh.v1`)
+- `import_steps` — ordered `translate` → (`tessellate`/`weld` for STEP) →
+  `diagnose` → `voxelize`, plus `orient` on body re-voxelization
+
+Case Setup shows the short analyzed-mesh digest next to the source digest.
+The exact case contract serializes both fields, and HTML/PDF/PNG evidence
+renders the digest and ordered derivation steps before optional signing. A
+known-answer test fixes the little-endian `f32` mesh encoding across targets.
+Legacy projects with empty steps remain readable (no hard fail on reopen).
+Release qualification still compares every Supported corpus fixture on Windows
+x64 and macOS arm64.
 
 ### 7. Assemblies and stable region identity
 
@@ -191,7 +196,7 @@ manifest and produce matching source/mesh/voxel hashes.
 
 ## Release language
 
-Safe wording for the 0.1.2 candidate:
+Safe wording for Reyn Studio 0.3.0:
 
 > Imports STL and supported single-part STEP files. STEP geometry is
 > deterministically tessellated, units and translator settings are recorded,

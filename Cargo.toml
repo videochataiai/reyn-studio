@@ -1,6 +1,6 @@
 [package]
 name = "reyn-studio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Native desktop studio for fluid-flow cases, model results, and evidence"
 
@@ -9,6 +9,14 @@ bundle-identifier = "com.reyn.studio"
 display-name = "Reyn Studio"
 category = "public.app-category.productivity"
 minimum-system-version = "11.0"
+
+[lib]
+name = "reyn_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reyn-cad-bridge"
+path = "src/bin/reyn_cad_bridge.rs"
 
 [dependencies]
 eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
@@ -27,11 +35,12 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 zeroize = "1"
 egui-phosphor = "0.13.0"
-ureq = { version = "3.3.0", default-features = false, features = ["json", "native-tls"] }
+ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 truck-stepio = "0.3.0"
 truck-meshalgo = { version = "0.4.0", default-features = false, features = ["tessellation"] }
 zip = { version = "2", default-features = false, features = ["deflate", "deflate-flate2"] }
 roxmltree = "0.20"
+semver = { version = "1.0.28", features = ["serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.19.3"

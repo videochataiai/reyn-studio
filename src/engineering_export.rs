@@ -141,6 +141,28 @@ fn lab_sheet_lines(input: &ReportInput<'_>, html_sha256: &str) -> Result<Vec<She
         "Source SHA-256".into(),
         case.preflight.source_sha256.clone(),
     ));
+    if !case.preflight.analyzed_mesh_sha256.is_empty() {
+        lines.push(SheetLine::Kv(
+            "Analyzed mesh SHA-256".into(),
+            case.preflight.analyzed_mesh_sha256.clone(),
+        ));
+    }
+    for step in &case.preflight.import_steps {
+        let parameters = step
+            .parameters
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(SheetLine::Kv(
+            "Import derivation".into(),
+            if parameters.is_empty() {
+                step.operation.clone()
+            } else {
+                format!("{} · {parameters}", step.operation)
+            },
+        ));
+    }
     lines.push(SheetLine::Kv(
         "Model SHA-256".into(),
         case.model_sha256
@@ -515,6 +537,7 @@ mod tests {
                 divergence_rms: 2.1e-3,
                 wake_deficit_peak: 0.45,
                 wake_deficit_mean: 0.12,
+                semigroup: Some(0.015),
                 warnings: vec!["horizon near support limit".into()],
             }),
             parent_run_id: None,
